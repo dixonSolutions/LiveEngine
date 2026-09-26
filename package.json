@@ -17,7 +17,7 @@
     "install": "node-gyp rebuild",
     "build": "node-gyp rebuild",
     "build:debug": "node-gyp rebuild --debug",
-    "test": "node --test test/*.test.js",
+    "test": "node --test test/engine.test.js test/math-game.test.js",
     "test:cpp": "mkdir -p build-cpp && g++ -std=c++17 -O2 -Wall -Wextra -I src/core src/core/engine.cpp tests/cpp/engine_test.cpp -o build-cpp/engine_test && ./build-cpp/engine_test",
     "test:all": "npm run test:cpp && npm test",
     "bench": "node bench/bench.js",
