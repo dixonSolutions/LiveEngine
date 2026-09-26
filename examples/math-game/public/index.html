@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LiveEngine math game</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --line:#2a2f3a; --text:#e8eaf0; --muted:#8b93a7; --accent:#5ad19a; --warn:#f0b65a; --bad:#e46a6a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 system-ui, sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px; display: grid; gap: 16px; grid-template-columns: 1fr; }
+  @media (min-width: 760px) { main { grid-template-columns: 3fr 2fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  h1 { grid-column: 1 / -1; margin: 0; font-size: 22px; }
+  h2 { margin: 0 0 10px; font-size: 14px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  input, select, button { font: inherit; border-radius: 6px; border: 1px solid var(--line); background: #0c0e12; color: var(--text); padding: 8px 10px; }
+  button { background: var(--accent); color: #062; border: 0; cursor: pointer; font-weight: 600; }
+  button.secondary { background: #2a2f3a; color: var(--text); }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .question { font-size: 40px; font-weight: 700; margin: 10px 0; min-height: 56px; }
+  .muted { color: var(--muted); }
+  .log { max-height: 240px; overflow: auto; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; }
+  .table { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 6px 0; display: flex; justify-content: space-between; gap: 8px; }
+  .pill { padding: 2px 8px; border-radius: 999px; font-size: 12px; background: #2a2f3a; }
+  .pill.open { background: #1f4d3a; color: var(--accent); } .pill.full { background: #4d3a1f; color: var(--warn); }
+  .bar { height: 6px; background: #2a2f3a; border-radius: 3px; overflow: hidden; } .bar > i { display: block; height: 100%; background: var(--warn); transition: width .2s linear; }
+  #status { font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>LiveEngine · math game <span class="muted" style="font-weight:400;font-size:14px">two seats per table, first correct answer wins the round</span></h1>
+
+  <section id="play">
+    <h2>Play</h2>
+    <form id="join" class="row">
+      <input id="name" placeholder="your name" maxlength="32" required>
+      <select id="level"><option value="easy">easy (+)</option><option value="medium">medium (×, −)</option><option value="hard">hard (× then ±)</option></select>
+      <button type="submit">Join hub</button>
+    </form>
+    <p id="status" class="muted">not joined</p>
+    <div class="question" id="question"></div>
+    <div class="bar"><i id="bar" style="width:0%"></i></div>
+    <form id="answerForm" class="row" style="margin-top:10px">
+      <input id="answer" type="number" placeholder="answer" disabled autocomplete="off">
+      <button id="send" type="submit" disabled>Answer</button>
+      <button id="rematch" type="button" class="secondary" disabled>Find another table</button>
+      <button id="leave" type="button" class="secondary" disabled>Leave</button>
+    </form>
+    <p id="scores" class="muted"></p>
+    <h2 style="margin-top:14px">Advertised tables for you</h2>
+    <div id="advertised" class="muted">join first</div>
+  </section>
+
+  <section>
+    <h2>Hub</h2>
+    <div class="row" style="margin-bottom:8px">
+      <button id="bots1" class="secondary">+1 bot at my level</button>
+      <button id="bots6" class="secondary">+6 random bots</button>
+    </div>
+    <div id="stats" class="muted"></div>
+    <div id="tables"></div>
+    <h2 style="margin-top:14px">Log</h2>
+    <div id="log" class="log"></div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let me = null, es = null, deadline = 0, raf = 0;
+
+const log = (t) => { const el = $('log'); el.textContent = `${new Date().toLocaleTimeString()}  ${t}\n` + el.textContent; };
+const post = (url, body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).then(r => r.json());
+const setStatus = (t) => { $('status').textContent = t; };
+const enable = (playing) => { $('answer').disabled = !playing; $('send').disabled = !playing; };
+
+function tick() {
+  const left = Math.max(0, deadline - Date.now());
+  $('bar').style.width = (left / 12000 * 100) + '%';
+  if (left > 0) raf = requestAnimationFrame(tick);
+}
+
+function renderTables(list, target) {
+  target.innerHTML = list.length ? '' : '<span class="muted">none</span>';
+  for (const t of list) {
+    const div = document.createElement('div');
+    div.className = 'table';
+    const names = t.members.map(m => m.name + (m.bot ? ' 🤖' : '')).join(', ') || '—';
+    div.innerHTML = `<span>${t.id} <span class="pill">${t.level}</span> <span class="pill ${t.status}">${t.status}</span>${t.inGame ? ` <span class="pill">round ${t.round}</span>` : ''}</span><span class="muted">${names}</span>`;
+    if (target.id === 'advertised' && t.status === 'open' && me) {
+      const b = document.createElement('button'); b.textContent = 'sit'; b.className = 'secondary';
+      b.onclick = () => post('/api/seat', { userId: me.id, tableId: t.id }).then(r => log(`seat ${t.id}: ${r.ok ? 'ok' : r.reason}`));
+      div.appendChild(b);
+    }
+    target.appendChild(div);
+  }
+}
+
+async function refreshHub() {
+  const s = await fetch('/api/state').then(r => r.json());
+  $('stats').textContent = `players ${s.stats.users} (waiting ${s.stats.waiting}, seated ${s.stats.paired}) · tables ${s.stats.servers} (open ${s.stats.open}, full ${s.stats.full}) · games ${s.games} · joins ${s.stats.totalJoins}`;
+  renderTables(s.tables, $('tables'));
+}
+setInterval(refreshHub, 1500); refreshHub();
+
+$('join').onsubmit = async (e) => {
+  e.preventDefault();
+  const r = await post('/api/join', { name: $('name').value, level: $('level').value });
+  me = r.player;
+  log(`joined hub as ${me.id} (${me.level}); seat: ${r.seat.ok ? r.seat.serverId : r.seat.reason}`);
+  setStatus(r.seat.ok ? `seated at ${r.seat.serverId}, waiting for an opponent…` : 'waiting for a table…');
+  renderTables(r.tables, $('advertised'));
+  $('rematch').disabled = false; $('leave').disabled = false; $('join').querySelector('button').disabled = true;
+  es = new EventSource(`/api/events?userId=${me.id}`);
+  const on = (type, fn) => es.addEventListener(type, ev => fn(JSON.parse(ev.data)));
+  on('advertised', m => renderTables(m.tables, $('advertised')));
+  on('seated', m => setStatus(`seated at ${m.table.id}, waiting for an opponent…`));
+  on('opponent_joined', m => { log(`${m.player.name} sat down`); setStatus(`${m.player.name} joined — game starting`); });
+  on('game_start', m => { log(`game start at ${m.table.id}`); $('scores').textContent = ''; });
+  on('question', m => { deadline = m.deadline; cancelAnimationFrame(raf); tick(); $('question').textContent = `${m.text} = ?`; setStatus(`round ${m.round}/${m.rounds}`); enable(true); $('answer').value = ''; $('answer').focus(); });
+  on('wrong', () => { setStatus('wrong, try again'); $('answer').select(); });
+  on('round_result', m => {
+    enable(false); deadline = 0;
+    log(`round ${m.round}: ${m.winner ? m.winner.name + ' wins' : 'nobody'} (answer ${m.answer})`);
+    $('scores').textContent = 'scores: ' + Object.entries(m.scores).map(([id, s]) => `${id === me.id ? 'you' : id} ${s}`).join(' · ');
+    setStatus(m.winner ? (m.winner.id === me.id ? 'you won the round!' : `${m.winner.name} won the round`) : 'time is up');
+  });
+  on('opponent_left', m => log(`${m.player.name} left`));
+  on('game_over', m => { enable(false); $('question').textContent = ''; setStatus(`game over (${m.reason}): ${m.winner ? (m.winner.id === me.id ? 'you win 🎉' : m.winner.name + ' wins') : 'draw'} — click "Find another table"`); log('game over'); });
+};
+
+$('answerForm').onsubmit = async (e) => { e.preventDefault(); if (!me) return; await post('/api/answer', { userId: me.id, answer: Number($('answer').value) }); };
+$('rematch').onclick = () => post('/api/seat', { userId: me.id }).then(r => { log(`seat: ${r.ok ? r.serverId : r.reason}`); if (r.ok) setStatus(`seated at ${r.serverId}, waiting for an opponent…`); });
+$('leave').onclick = () => { post('/api/leave', { userId: me.id }); es && es.close(); me = null; setStatus('left'); enable(false); $('join').querySelector('button').disabled = false; $('rematch').disabled = true; $('leave').disabled = true; };
+$('bots1').onclick = () => post('/api/bots', { count: 1, level: me ? me.level : $('level').value }).then(r => log(`bots: ${r.created.join(', ')} (seated ${r.seated.length})`));
+$('bots6').onclick = () => post('/api/bots', { count: 6 }).then(r => log(`bots: ${r.created.length} created, ${r.seated.length} seated`));
+</script>
+</body>
+</html>

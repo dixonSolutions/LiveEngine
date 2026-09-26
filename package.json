@@ -1,0 +1,32 @@
+{
+  "name": "@dixonsolutions/liveengine",
+  "version": "0.1.0",
+  "description": "General-purpose live pairing engine in C++ (N-API): match users to servers by scopes, requirements and capacity — for game lobbies, tournaments, chess pairing, any live matching.",
+  "main": "lib/index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "author": "dixonSolutions",
+  "repository": { "type": "git", "url": "https://github.com/dixonSolutions/LiveEngine.git" },
+  "homepage": "https://github.com/dixonSolutions/LiveEngine#readme",
+  "bugs": { "url": "https://github.com/dixonSolutions/LiveEngine/issues" },
+  "keywords": [ "matchmaking", "pairing", "lobby", "game", "tournament", "chess", "napi", "node-addon-api", "native", "c++" ],
+  "engines": { "node": ">=18" },
+  "gypfile": true,
+  "files": [ "lib", "src", "index.d.ts", "binding.gyp", "README.md", "LICENSE" ],
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "build": "node-gyp rebuild",
+    "build:debug": "node-gyp rebuild --debug",
+    "test": "node --test test/*.test.js",
+    "test:cpp": "mkdir -p build-cpp && g++ -std=c++17 -O2 -Wall -Wextra -I src/core src/core/engine.cpp tests/cpp/engine_test.cpp -o build-cpp/engine_test && ./build-cpp/engine_test",
+    "test:all": "npm run test:cpp && npm test",
+    "bench": "node bench/bench.js",
+    "example": "node examples/math-game/server.js"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.0.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^11.0.0"
+  }
+}

@@ -1,0 +1,8 @@
+build/
+build-cpp/
+node_modules/
+test/
+tests/
+examples/
+bench/
+.github/

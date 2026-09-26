@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install (builds the addon with node-gyp)
+        run: npm ci
+      - name: JS + example tests
+        run: npm test
+      - name: C++ core tests
+        if: runner.os == 'Linux'
+        run: npm run test:cpp
+      - name: Benchmark (smoke, small sizes)
+        if: runner.os == 'Linux' && matrix.node == 22
+        run: node bench/bench.js 500 5000
