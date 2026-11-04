@@ -104,6 +104,10 @@ try {
     assert.ok(chromium, 'PLAYWRIGHT_PATH must resolve to a Playwright module exporting chromium');
     browser = await chromium.launch({headless: true, ...(process.env.CHROMIUM_PATH ? {executablePath: process.env.CHROMIUM_PATH} : {})});
     const page = await browser.newPage();
+    // LAN pages run outside a secure context, where crypto.randomUUID is unavailable.
+    await page.addInitScript(() => {
+      try { Object.defineProperty(Crypto.prototype, 'randomUUID', {value: undefined, configurable: true}); } catch {}
+    });
     const pageErrors = [];
     page.on('pageerror', error => pageErrors.push(error.message));
     await page.goto(`${base}/`, {waitUntil: 'domcontentloaded'});

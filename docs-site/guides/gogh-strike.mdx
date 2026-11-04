@@ -61,10 +61,10 @@ The bridge validates Host and Origin, limits request bodies to 16 KiB, and rate-
 
 ## Hosting on a network
 
-By default the bridge binds to `127.0.0.1`. To serve the game over Tailscale or a trusted LAN, bind an address and keep the allowlist narrow:
+By default the bridge binds to `127.0.0.1`. To serve the game over a trusted LAN, bind the LAN address and keep the allowlist narrow:
 
 ```sh
-HOST=100.115.126.72 PORT=8967 \
+HOST=192.168.1.10 PORT=8967 \
 LIVEENGINE_URL=http://127.0.0.1:8787 \
 LIVEENGINE_TOKEN=your-local-token \
 LIVEENGINE_HUB_ID=gogh-strike \
@@ -76,14 +76,18 @@ A concrete `HOST` is allowed automatically alongside loopback. If you bind `0.0.
 
 ```sh
 HOST=0.0.0.0 \
-GOGH_ALLOWED_HOSTS=100.115.126.72:8967,10.1.1.239:8967 \
+GOGH_ALLOWED_HOSTS=192.168.1.10:8967 \
 GOGH_ALLOWED_ORIGINS=https://gogh.example.net \
 node integrations/gogh-strike/bridge.mjs
 ```
 
 <Warning>
-  The bridge has no player authentication. Expose it only on a private network such as Tailscale or a trusted LAN, or put an authenticated proxy in front of it. Do not publish it directly to the Internet.
+  The bridge has no player authentication. Expose it only on a trusted LAN, or put an authenticated proxy in front of it. Do not publish it directly to the Internet.
 </Warning>
+
+<Note>
+  The lobby generates client IDs with `crypto.getRandomValues`, so matchmaking works over plain HTTP on a LAN where `crypto.randomUUID` is unavailable.
+</Note>
 
 ### Bridge configuration
 

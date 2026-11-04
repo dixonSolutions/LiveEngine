@@ -34,22 +34,32 @@ index 22dacf2..bbcd05f 100644
   canCapture:()=>phase==='playing'&&!paused&&!document.hidden&&document.hasFocus(),
 diff --git a/src/liveengine-matchmaking.js b/src/liveengine-matchmaking.js
 new file mode 100644
-index 0000000..1fcfa41
+index 0000000..fb5c3db
 --- /dev/null
 +++ b/src/liveengine-matchmaking.js
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,41 @@
 +const USER_KEY = 'gogh-strike-liveengine-user';
++
++function randomToken() {
++  try {
++    const bytes = new Uint8Array(12);
++    crypto.getRandomValues(bytes);
++    return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
++  } catch {
++    return Math.random().toString(36).slice(2).padEnd(24, '0').slice(0, 24);
++  }
++}
 +
 +function localUserId() {
 +  try {
 +    let id = localStorage.getItem(USER_KEY);
 +    if (!id) {
-+      id = `gogh-${crypto.randomUUID().replaceAll('-', '').slice(0, 24)}`;
++      id = `gogh-${randomToken()}`;
 +      localStorage.setItem(USER_KEY, id);
 +    }
 +    return id;
 +  } catch {
-+    return `gogh-${crypto.randomUUID().replaceAll('-', '').slice(0, 24)}`;
++    return `gogh-${randomToken()}`;
 +  }
 +}
 +

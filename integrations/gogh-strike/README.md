@@ -31,10 +31,10 @@ The bridge validates the Host and Origin headers on every request, limits reques
 
 ## Hosting on a network
 
-By default the bridge binds to `127.0.0.1`. To serve the game on a private LAN or Tailscale network, bind the address you want and keep the Host/Origin allowlist narrow:
+By default the bridge binds to `127.0.0.1`. To serve the game on a trusted LAN, bind the LAN address and keep the Host/Origin allowlist narrow:
 
 ```sh
-HOST=100.115.126.72 PORT=8967 \
+HOST=192.168.1.10 PORT=8967 \
 LIVEENGINE_URL=http://127.0.0.1:8787 \
 LIVEENGINE_TOKEN=your-local-token \
 LIVEENGINE_HUB_ID=gogh-strike \
@@ -46,12 +46,12 @@ When `HOST` is a concrete address, `HOST:PORT` is allowed automatically alongsid
 
 ```sh
 HOST=0.0.0.0 \
-GOGH_ALLOWED_HOSTS=100.115.126.72:8967,10.1.1.239:8967 \
+GOGH_ALLOWED_HOSTS=192.168.1.10:8967 \
 GOGH_ALLOWED_ORIGINS=https://gogh.example.net \
 node integrations/gogh-strike/bridge.mjs
 ```
 
-The bridge has no player authentication. Expose it only on a private network such as Tailscale or a trusted LAN, or put your own authenticated proxy in front of it. Do not publish it directly to the Internet.
+The bridge has no player authentication. Expose it only on a trusted LAN, or put your own authenticated proxy in front of it. Do not publish it directly to the Internet.
 
 Run the bridge adapter test without installing dependencies:
 
@@ -79,5 +79,7 @@ node integrations/gogh-strike/e2e.mjs
 For the Compose services, set `LIVEENGINE_REMOTE_ADDRESS=http://remote:8787` as well: the test client reaches the remote through loopback port 8788, while the central container forwards through the container hostname.
 
 For optional headless browser coverage, set `PLAYWRIGHT_PATH` to a Playwright `index.mjs` and optionally set `CHROMIUM_PATH` to the browser executable. The runner checks the lobby checkbox, starts a match, verifies the LiveEngine toast and browser user pairing, then saves `/tmp/liveengine-gogh-lobby.png` (override with `GOGH_SCREENSHOT`). It does not install Playwright into either project.
+
+The lobby generates client IDs with `crypto.getRandomValues`, so matchmaking also works over plain HTTP on a LAN where `crypto.randomUUID` is unavailable.
 
 Validated on upstream commit `2285e640097d9b12bcc42af72d5e8d0b37082f51`. `npm test` passed all 168 upstream tests, `npm run build` passed, and `node --test integrations/gogh-strike/bridge.test.mjs` passed. The live external-hub run reported `service join ok`, and optional Playwright reported `phase playing` with zero page errors; the screenshot was saved to `/tmp/liveengine-gogh-lobby.png`. A wrong local bearer returned HTTP 401 with a generic message and no token reflection. The test ran against local central and remote HTTP services, not a remote device.
