@@ -2,6 +2,14 @@
 
 npm package: `@dixonsolutions/liveengine`. Cargo crate/binary: `liveengine` / `liveengine-hub`. Both manifests use the same version. The release workflow verifies that a `v<version>` tag matches both manifests.
 
+## Current registry state
+
+- `0.2.0` is published to npm and crates.io.
+- npm and crates.io trusted publishers are configured for `dixonSolutions/LiveEngine` and `.github/workflows/release.yml`.
+- Tag releases publish future versions through OIDC. The workflow checks both registries first and skips a version that is already present, so a partially completed release can be retried.
+
+The instructions below document how the trust relationships were established and how to rebuild them if the registries ever lose the configuration.
+
 ## npm trusted publishing
 
 The GitHub workflow is `.github/workflows/release.yml`. Configure its trusted publisher on npm with:

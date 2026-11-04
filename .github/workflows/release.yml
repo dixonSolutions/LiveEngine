@@ -74,6 +74,16 @@ jobs:
         run: node scripts/check-release.js
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+      - name: Check whether this npm version is already published
+        id: npm-published
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          if npm view "@dixonsolutions/liveengine@$VERSION" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "npm version $VERSION is already published; skipping publish."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - run: npm pack
       - name: Install and exercise the packed artifact
         run: node scripts/test-package.js
@@ -82,7 +92,7 @@ jobs:
           name: npm-package
           path: "*.tgz"
       - name: Publish through npm OIDC trusted publisher
-        if: github.ref_type == 'tag' || inputs.publish
+        if: (github.ref_type == 'tag' || inputs.publish) && steps.npm-published.outputs.exists != 'true'
         run: npm publish --access public --provenance
       - name: Attach package and host binaries to GitHub release
         if: github.ref_type == 'tag'
@@ -98,14 +108,30 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - uses: dtolnay/rust-toolchain@stable
       - name: Check release version
         run: node scripts/check-release.js
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+      - name: Check whether this crate version is already published
+        id: crate-published
+        run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "liveengine") | .version')"
+          STATUS="$(curl -s -o /dev/null -w '%{http_code}' -A 'LiveEngine release workflow' "https://crates.io/api/v1/crates/liveengine/$VERSION")"
+          if [ "$STATUS" = "200" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "crate version $VERSION is already published; skipping publish."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Authenticate to crates.io using its trusted publisher
+        if: steps.crate-published.outputs.exists != 'true'
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
       - run: cargo publish --locked
+        if: steps.crate-published.outputs.exists != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

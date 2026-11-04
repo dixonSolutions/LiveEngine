@@ -1,6 +1,6 @@
 [package]
 name = "liveengine"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Rust live matchmaking, embedded and standalone hub hosting, and authenticated remote hub registries"
@@ -10,7 +10,7 @@ homepage = "https://github.com/dixonSolutions/LiveEngine"
 readme = "README.md"
 keywords = ["matchmaking", "hub", "registry", "hosting", "network"]
 categories = ["network-programming", "game-development"]
-include = ["src/**/*.rs", "Cargo.toml", "Cargo.lock", "build.rs", "README.md", "LICENSE", "examples/*.rs", "docs/hub-contract.schema.json", "docs/*.md"]
+include = ["src/**/*.rs", "tests/*.rs", "Cargo.toml", "Cargo.lock", "build.rs", "README.md", "LICENSE", "examples/*.rs", "docs/hub-contract.schema.json", "docs/*.md"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]
