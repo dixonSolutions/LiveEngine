@@ -256,6 +256,13 @@ struct RateEntry {
     requests: usize,
 }
 
+enum HandlerCallError {
+    Busy,
+    Unavailable,
+    Preflight(String),
+    Call(String),
+}
+
 struct Inner {
     config: HubConfig,
     hubs: RwLock<HashMap<String, HubRecord>>,
@@ -279,6 +286,7 @@ impl HubService {
             .timeout(config.request_timeout)
             .build()
             .map_err(|e| format!("could not create HTTP client: {e}"))?;
+        let inflight_calls = Arc::new(Semaphore::new(config.max_inflight_calls));
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
@@ -286,7 +294,7 @@ impl HubService {
                 client,
                 rate: Mutex::new(HashMap::new()),
                 boot: Instant::now(),
-            inflight_calls: Arc::new(Semaphore::new(config.max_inflight_calls)),
+                inflight_calls,
             }),
         })
     }
@@ -797,6 +805,10 @@ async fn call_hub(
             return error(StatusCode::BAD_REQUEST, &message);
         }
     }
+    let permit = match state.inflight_calls.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "hub call capacity is busy"),
+    };
     let hop = match headers
         .get("x-liveengine-hop")
         .and_then(|v| v.to_str().ok())
@@ -811,16 +823,43 @@ async fn call_hub(
         return error(StatusCode::LOOP_DETECTED, "forwarding hop limit reached");
     }
     let result = if let Some(handler) = record.handler {
-        match handler.lock() {
-            Ok(mut handler) => {
-                if let Err(message) = handler.preflight(&call.method, &call.args, &state.config) {
-                    return error(StatusCode::PAYLOAD_TOO_LARGE, &message);
+        let config = state.config.clone();
+        let method = call.method;
+        let args = call.args;
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut handler = match handler.try_lock() {
+                Ok(handler) => handler,
+                Err(std::sync::TryLockError::WouldBlock) => return Err(HandlerCallError::Busy),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(HandlerCallError::Unavailable)
                 }
-                handler.call(&call.method, call.args)
+            };
+            handler
+                .preflight(&method, &args, &config)
+                .map_err(HandlerCallError::Preflight)?;
+            handler.call(&method, args).map_err(HandlerCallError::Call)
+        })
+        .await;
+        match task {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(HandlerCallError::Busy)) => {
+                return error(StatusCode::CONFLICT, "hub handler is busy")
             }
-            Err(_) => Err("internal hub handler unavailable".to_string()),
+            Ok(Err(HandlerCallError::Unavailable)) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "hub handler is unavailable",
+                )
+            }
+            Ok(Err(HandlerCallError::Preflight(message))) => {
+                return error(StatusCode::PAYLOAD_TOO_LARGE, &message)
+            }
+            Ok(Err(HandlerCallError::Call(message))) => Err(message),
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "hub handler task failed"),
         }
     } else {
+        let _permit = permit;
         let Some(address) = record.info.address.as_deref() else {
             return error(StatusCode::BAD_GATEWAY, "external hub address is missing");
         };

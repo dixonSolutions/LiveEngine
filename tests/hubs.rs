@@ -269,6 +269,19 @@ impl HubHandler for EchoHandler {
     }
 }
 
+struct BlockingHandler {
+    started: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl HubHandler for BlockingHandler {
+    fn call(&mut self, _method: &str, _args: Vec<Value>) -> Result<Value, String> {
+        let _ = self.started.send(());
+        let _ = self.release.recv();
+        Ok(json!("finished"))
+    }
+}
+
 #[tokio::test]
 async fn custom_internal_handlers_share_http_limits_and_schema_validation() {
     let service = HubService::new(config()).unwrap();
@@ -385,4 +398,85 @@ async fn event_budget_rejects_mutation_before_it_changes_engine_state() {
     .await;
     assert_eq!(status, 200);
     assert!(absent["result"].is_null());
+}
+
+#[tokio::test]
+async fn timed_out_blocking_handler_keeps_its_global_permit_until_finished() {
+    let mut cfg = config();
+    cfg.request_timeout = Duration::from_millis(100);
+    cfg.max_inflight_calls = 1;
+    let service = HubService::new(cfg).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let registration = HubRegistration {
+        id: "slow".into(),
+        mode: HubMode::Internal,
+        address: None,
+        remote_token: None,
+        remote_hub_id: None,
+        scopes: json!({}),
+        scope_schema: None,
+        ttl_seconds: None,
+    };
+    service
+        .register_internal(
+            registration,
+            BlockingHandler {
+                started: started_tx,
+                release: release_rx,
+            },
+        )
+        .await
+        .unwrap();
+
+    let app = service.router();
+    let first = tokio::spawn(request(
+        app.clone(),
+        "POST",
+        "/v1/hubs/slow/call",
+        Some(json!({"method":"block","args":[]})),
+        true,
+    ));
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)).unwrap())
+        .await
+        .unwrap();
+
+    let (status, _) = first.await.unwrap();
+    assert_eq!(
+        status, 504,
+        "the route should time out while its worker continues"
+    );
+    assert_eq!(
+        request(app.clone(), "GET", "/health", None, false).await.0,
+        200
+    );
+    assert_eq!(
+        request(
+            app.clone(),
+            "POST",
+            "/v1/hubs/slow/call",
+            Some(json!({"method":"block","args":[]})),
+            true
+        )
+        .await
+        .0,
+        503,
+        "the timed-out worker must continue holding its permit"
+    );
+
+    release_tx.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (status, response) = request(
+        app,
+        "POST",
+        "/v1/hubs/slow/call",
+        Some(json!({"method":"block","args":[]})),
+        true,
+    )
+    .await;
+    assert_eq!(
+        status, 504,
+        "the handler's second wait should also be bounded"
+    );
+    assert_eq!(response["error"], "request exceeded configured timeout");
 }

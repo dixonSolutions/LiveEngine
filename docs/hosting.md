@@ -19,12 +19,13 @@ Limits are configurable through `HubConfig` when embedding the router. The stand
 | `LIVEENGINE_MAX_ENTITIES` | 100000 |
 | `LIVEENGINE_MAX_EVENTS` | 100000 |
 | `LIVEENGINE_MAX_GENERATE` | 10000 |
+| `LIVEENGINE_MAX_INFLIGHT_CALLS` | 16 |
 | `LIVEENGINE_RATE_LIMIT_REQUESTS` | 120 |
 | `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` | 60 |
 | `LIVEENGINE_RATE_LIMIT_PEERS` | 4096 |
 | `LIVEENGINE_SEED` | 0 |
 
-Limits and windows must be positive. Outbound timeout and maximum registration TTL can also be changed through Rust `HubConfig`. Request, response, hub, entity and event limits apply to the hosted service; direct local `Engine` use is controlled by the embedding application.
+Limits and windows must be positive. Internal handlers run on blocking workers so they do not stall the API runtime. Capacity remains occupied until the handler finishes, even if its HTTP request times out. A timeout does not roll back a handler that already started; reconcile state before retrying a mutation. Outbound timeout and maximum registration TTL can also be changed through Rust `HubConfig`. Request, response, hub, entity and event limits apply to the hosted service; direct local `Engine` use is controlled by the embedding application.
 
 The host uses actual socket peers for request budgets. It ignores arbitrary `X-Forwarded-For` headers. A reverse proxy therefore shares its peer budget across clients; apply public-client limits at the proxy as well when required by your deployment.
 

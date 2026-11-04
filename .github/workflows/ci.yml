@@ -32,6 +32,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t liveengine:test .
-      - run: bash scripts/test-containers.sh docker liveengine:test
       - name: Package a standalone custom hub
         run: docker build -f Dockerfile.custom -t liveengine-custom:test .
+      - run: bash scripts/test-containers.sh docker liveengine:test liveengine-custom:test
