@@ -1,0 +1,47 @@
+---
+title: "Framework recipes"
+description: "Runnable LiveEngine examples for Express, Fastify, NestJS, Next.js, Axum, and Actix Web."
+---
+
+LiveEngine has two integration shapes. Pick the one that matches where your state lives.
+
+| Shape | Use it when | State |
+| --- | --- | --- |
+| In-process `LiveEngine` | One Node or Rust process owns matchmaking | In that process |
+| `HubClient` to a hub | Multiple instances or languages need one registry | In the hub process |
+| Embedded `HubService` | A Rust API already owns the Axum router | In that API process |
+| Standalone `liveengine-hub` | You want a separate central registry or remote service | In the hub process |
+
+<Warning>
+  In-process engines are process-local. Two web instances with their own `LiveEngine` will not see each other's users or servers. For horizontal scaling, point every instance at one central hub with `HubClient`, or run one hub per matchmaking shard.
+</Warning>
+
+## Runnable examples in the repository
+
+- [`examples/frameworks/express-server.js`](https://github.com/dixonSolutions/LiveEngine/blob/main/examples/frameworks/express-server.js)
+- [`examples/frameworks/fastify-server.mjs`](https://github.com/dixonSolutions/LiveEngine/blob/main/examples/frameworks/fastify-server.mjs)
+- [`examples/frameworks/nestjs`](https://github.com/dixonSolutions/LiveEngine/tree/main/examples/frameworks/nestjs)
+- [`examples/axum-service.rs`](https://github.com/dixonSolutions/LiveEngine/blob/main/examples/axum-service.rs)
+
+The pages in this section reproduce the examples and explain the decisions behind them.
+
+<CardGroup cols={2}>
+  <Card title="Express" icon="node" href="/frameworks/express">
+    Local engine, HTTP routes and SSE event draining.
+  </Card>
+  <Card title="Fastify" icon="bolt" href="/frameworks/fastify">
+    Fastify calling an internal hub through `HubClient`.
+  </Card>
+  <Card title="NestJS" icon="layer-group" href="/frameworks/nestjs">
+    Injectable provider, module and controller.
+  </Card>
+  <Card title="Next.js" icon="arrow-up-right-from-square" href="/frameworks/nextjs">
+    Route handler backed by a central hub.
+  </Card>
+  <Card title="Axum" icon="rust" href="/frameworks/axum">
+    Merge `HubService::router` into an existing Axum app.
+  </Card>
+  <Card title="Actix Web" icon="rust" href="/frameworks/actix">
+    Use the engine directly or run the hub beside Actix.
+  </Card>
+</CardGroup>

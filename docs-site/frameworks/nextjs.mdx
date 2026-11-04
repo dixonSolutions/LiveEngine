@@ -1,0 +1,76 @@
+---
+title: "Next.js route handlers"
+description: "Call a central LiveEngine hub from a Next.js App Router route handler."
+---
+
+Next.js route handlers run in a Node.js or edge runtime and should not own matchmaking state. Use a central hub and the HTTP-only `HubClient`, which does not load the native addon.
+
+<Warning>
+  The edge runtime does not provide Node's `Buffer`, which `HubClient` uses internally to read bounded responses. Use `export const runtime = 'nodejs'` for these routes.
+</Warning>
+
+## Route handler
+
+`app/api/liveengine/match/route.ts`
+
+```ts
+import { NextResponse } from 'next/server';
+import { HubClient } from '@dixonsolutions/liveengine/hubs';
+
+export const runtime = 'nodejs';
+
+const hub = new HubClient(process.env.LIVEENGINE_URL!, {
+  token: process.env.LIVEENGINE_TOKEN!,
+  timeoutMs: 10_000,
+});
+
+export async function POST(request: Request) {
+  const body = await request.json().catch(() => null);
+  const userId = body?.userId;
+  if (typeof userId !== 'string' || !userId) {
+    return NextResponse.json({ error: 'userId is required' }, { status: 400 });
+  }
+
+  // Verify the session in your app before trusting userId.
+  await hub.call('ranked', 'upsertUser', [
+    { id: userId, scopes: body.scopes ?? {}, requirements: body.requirements },
+  ]);
+  const result = await hub.call('ranked', 'autoJoin', [userId]);
+
+  if (!result.ok) {
+    return NextResponse.json(result, { status: 409 });
+  }
+  const server = await hub.call('ranked', 'getServer', [result.serverId]);
+  return NextResponse.json({ ...result, server });
+}
+```
+
+## Health check
+
+`app/api/liveengine/health/route.ts`
+
+```ts
+import { NextResponse } from 'next/server';
+import { HubClient } from '@dixonsolutions/liveengine/hubs';
+
+export const runtime = 'nodejs';
+
+export async function GET() {
+  const hub = new HubClient(process.env.LIVEENGINE_URL!, {
+    token: process.env.LIVEENGINE_TOKEN!,
+  });
+  try {
+    const contract = await hub.contract();
+    return NextResponse.json({ ok: true, contract });
+  } catch (error) {
+    return NextResponse.json({ ok: false, error: (error as Error).message }, { status: 502 });
+  }
+}
+```
+
+## Serverless notes
+
+- A central hub is required. Do not instantiate `LiveEngine` in a route handler: each serverless invocation may get a fresh process.
+- The hub token is an **administrative** credential. Keep it in server-side environment variables; never expose it through `NEXT_PUBLIC_*`.
+- Configure the hub with a reachable HTTPS ingress in production. `HubClient` rejects redirects and requires a plain base URL without credentials, query, or fragment.
+- Long-running calls are bounded by `timeoutMs`; return a useful `502`/`504` to the browser instead of hanging.

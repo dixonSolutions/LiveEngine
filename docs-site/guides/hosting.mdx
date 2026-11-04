@@ -1,0 +1,165 @@
+---
+title: "Host an internal hub"
+description: "Run liveengine-hub, configure the token and bind address, register internal hubs, and use TTL and limits."
+---
+
+A host process owns its registry and every internal engine registered through HTTP. This guide covers a single host. To connect two hosts, continue with [Register an external hub](/guides/remote-hubs).
+
+## Start the host
+
+```sh
+export LIVEENGINE_TOKEN="$(openssl rand -hex 32)"
+export LIVEENGINE_BIND=127.0.0.1:8787
+
+# From a Cargo checkout:
+cargo run --locked --release --bin liveengine-hub
+
+# From an installed crate:
+liveengine-hub
+
+# From the npm package:
+npx liveengine-hub
+```
+
+The binary prints the bound address to stderr:
+
+```text
+liveengine-hub listening on 127.0.0.1:8787
+```
+
+`LIVEENGINE_BIND` defaults to `127.0.0.1:8787`. Bind a LAN or Tailscale address only when another device should connect. For the public Internet, bind a private interface and terminate HTTPS at an ingress.
+
+## Inspect the service
+
+```sh
+curl --fail --silent http://127.0.0.1:8787/health
+```
+
+```json
+{ "status": "ok", "protocol": "liveengine.hub/v1", "uptimeSeconds": 8 }
+```
+
+```sh
+curl --silent \
+  -H "Authorization: Bearer $LIVEENGINE_TOKEN" \
+  http://127.0.0.1:8787/v1/contract
+```
+
+```json
+{
+  "protocol": "liveengine.hub/v1",
+  "version": 1,
+  "endpoints": [
+    "/health",
+    "/v1/contract",
+    "/v1/hubs",
+    "/v1/hubs/{id}",
+    "/v1/hubs/{id}/call",
+    "/v1/registries/import"
+  ],
+  "schema": "/v1/contract/schema"
+}
+```
+
+`/health` is the only unauthenticated endpoint. All `/v1/*` routes require the bearer token.
+
+## Register an internal hub
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+
+const hub = new HubClient(process.env.LIVEENGINE_URL, {
+  token: process.env.LIVEENGINE_TOKEN,
+});
+
+await hub.contract();
+const info = await hub.register({
+  id: 'ranked-au',
+  mode: 'internal',
+  scopes: { game: 'chess', region: 'au' },
+  scopeSchema: {
+    type: 'object',
+    required: ['region'],
+    properties: { region: { type: 'string', enum: ['au', 'nz'] } },
+    additionalProperties: false,
+  },
+  ttlSeconds: 3600,
+});
+
+console.log(info);
+```
+
+The response is the public `HubInfo` for the new hub. If `scopeSchema` is present, user and server upserts are validated against it before dispatch, and `generateUsers` is rejected for that hub.
+
+```js
+await hub.call('ranked-au', 'upsertServer', [
+  { id: 'room-1', capacity: 2, scopes: { region: 'au' } },
+]);
+await hub.call('ranked-au', 'upsertUser', [
+  { id: 'alice', scopes: { region: 'au' } },
+]);
+console.log(await hub.call('ranked-au', 'autoJoin', ['alice']));
+```
+
+Each HTTP registration of an internal hub creates a **separate engine**. Two hubs do not share users, servers, or events.
+
+## TTL
+
+`ttlSeconds` creates an expiring registration:
+
+- Minimum 1 second.
+- Maximum is `HubConfig.max_ttl`, default 24 hours. The standalone binary does not expose an environment variable for `max_ttl`; embedding code can change it.
+- Expired hubs disappear from discovery and calls when the registry is next accessed.
+- Re-registering the same ID after expiry is allowed.
+- TTL state is in memory; a restart clears it.
+
+```sh
+# 10-minute disposable test hub
+# { "id": "smoke", "mode": "internal", "ttlSeconds": 600 }
+```
+
+## Limits
+
+The standalone host reads the limits from the environment. See [Environment reference](/reference/environment) and [Limits](/reference/limits) for the complete tables.
+
+```sh
+export LIVEENGINE_MAX_HUBS=256
+export LIVEENGINE_MAX_BODY_BYTES=1048576
+export LIVEENGINE_MAX_RESPONSE_BYTES=4194304
+export LIVEENGINE_MAX_ARGS=256
+export LIVEENGINE_MAX_ENTITIES=100000
+export LIVEENGINE_MAX_EVENTS=100000
+export LIVEENGINE_MAX_GENERATE=10000
+export LIVEENGINE_MAX_INFLIGHT_CALLS=16
+export LIVEENGINE_RATE_LIMIT_REQUESTS=120
+export LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS=60
+export LIVEENGINE_RATE_LIMIT_PEERS=4096
+export LIVEENGINE_SEED=0
+```
+
+Limits and windows must be positive. Invalid values fail startup with a message naming the variable.
+
+## Drain events
+
+Internal engines queue events. If your service consumes them, call `drainEvents` as part of your delivery loop. The host enforces `max_events` before mutations; a full queue causes `413` rather than silently dropping events.
+
+```js
+const events = await hub.call('ranked-au', 'drainEvents');
+```
+
+Calling `drainEvents` through the HTTP contract is a mutating engine method; the result is the event array that was removed.
+
+<Warning>
+Registry and engine state are in memory. Restarting the host loses every registration, user, membership, and queued event. Add application persistence before relying on restart recovery.
+</Warning>
+
+## Container connectivity check
+
+The repository includes an end-to-end check for two independent hosts:
+
+```sh
+docker build -t liveengine:local .
+bash scripts/test-containers.sh docker liveengine:local
+```
+
+The test starts central and remote containers with different secrets, performs the handshake, forwards matchmaking, imports the remote registry live, verifies pairing, and confirms unauthenticated access is denied. It removes its containers, network, and secrets on exit. See [Docker](/guides/docker).

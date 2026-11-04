@@ -1,0 +1,247 @@
+---
+title: "Registration and call DTOs"
+description: "Exact JSON shapes for internal and external registrations, discovery, calls, imports, and errors."
+---
+
+All DTOs use camelCase. Registration, call, and import bodies reject unknown fields.
+
+## HubRegistration
+
+```ts
+interface HubRegistration {
+  id: string;
+  mode: 'internal' | 'external';
+  address?: string;
+  remoteHubId?: string;
+  remoteToken?: string;
+  scopes?: object;       // default {}
+  scopeSchema?: object;
+  ttlSeconds?: number;
+}
+```
+
+### Internal example
+
+```json
+{
+  "id": "ranked-au",
+  "mode": "internal",
+  "scopes": {
+    "game": "chess",
+    "region": "au"
+  },
+  "scopeSchema": {
+    "type": "object",
+    "required": ["region"],
+    "properties": {
+      "region": { "type": "string", "enum": ["au", "nz"] }
+    },
+    "additionalProperties": false
+  },
+  "ttlSeconds": 3600
+}
+```
+
+Internal registrations must **not** contain `address`, `remoteHubId`, or `remoteToken`. Supplying any of them returns `400`.
+
+### External example
+
+```json
+{
+  "id": "remote-ranked",
+  "mode": "external",
+  "address": "https://remote.example.net",
+  "remoteHubId": "ranked-au",
+  "remoteToken": "a-separate-remote-secret-at-least-24-bytes",
+  "scopes": {
+    "region": "au"
+  },
+  "ttlSeconds": 3600
+}
+```
+
+External requirements:
+
+| Field | Requirement |
+| --- | --- |
+| `address` | Required; absolute HTTP(S), no credentials/query/fragment, at most 2048 bytes |
+| `remoteToken` | Required; at least 24 bytes |
+| `remoteHubId` | Optional; defaults to `id`; same ID rules |
+| Remote host | Must match `LIVEENGINE_ALLOWED_REMOTE_HOSTS` before connection |
+
+## Field rules
+
+| Field | Rules |
+| --- | --- |
+| `id` | 1–128 chars of `A-Z a-z 0-9 . _ -`; not `.` or `..`; no surrounding whitespace |
+| `mode` | `internal` or `external` |
+| `scopes` | Must be a JSON object; must fit `max_request_bytes`; validated by `scopeSchema` when present |
+| `scopeSchema` | Supported subset only; see below |
+| `ttlSeconds` | Integer at least 1; at most `max_ttl` (default 86400) |
+
+`remoteToken` is write-only and is omitted from every response.
+
+## HubInfo
+
+```ts
+interface HubInfo {
+  id: string;
+  mode: 'internal' | 'external';
+  address?: string;
+  remoteHubId: string;
+  scopes: object;
+  scopeSchema?: object;
+  expiresInSeconds?: number;
+}
+```
+
+`expiresInSeconds` is recomputed when the record is read. It is omitted for permanent registrations. `remoteToken` never appears.
+
+## Discovery
+
+`GET /v1/hubs`:
+
+```json
+{
+  "hubs": [
+    {
+      "id": "ranked-au",
+      "mode": "internal",
+      "remoteHubId": "ranked-au",
+      "scopes": { "region": "au" },
+      "expiresInSeconds": 3540
+    }
+  ]
+}
+```
+
+`GET /v1/hubs/{id}` returns a single `HubInfo` object rather than a wrapper.
+
+## CallRequest
+
+```ts
+interface CallRequest {
+  method: string;    // 1–128 bytes
+  args?: unknown[];  // default []
+}
+```
+
+```json
+{
+  "method": "upsertUsers",
+  "args": [
+    [
+      { "id": "alice", "scopes": { "region": "au" } },
+      { "id": "bob", "scopes": { "region": "au" } }
+    ]
+  ]
+}
+```
+
+Method arguments follow the engine method signatures. Custom handlers may accept arbitrary JSON.
+
+## CallResponse
+
+```ts
+interface CallResponse {
+  result: unknown;
+}
+```
+
+```json
+{ "result": true }
+```
+
+```json
+{ "result": { "ok": true, "reason": null, "userId": "alice", "serverId": "room-1" } }
+```
+
+Application failures are still `200`; inspect `result.ok` and `result.reason`.
+
+## RegistryImport
+
+```ts
+interface RegistryImport {
+  address: string;
+  token: string;    // at least 24 bytes
+  prefix?: string;  // at most 64 chars of A-Z a-z 0-9 . _ -
+}
+```
+
+```json
+{
+  "address": "https://remote.example.net",
+  "token": "a-remote-administrative-token",
+  "prefix": "partner-"
+}
+```
+
+Response:
+
+```json
+{
+  "hubs": [
+    {
+      "id": "partner-ranked-au",
+      "mode": "external",
+      "address": "https://remote.example.net",
+      "remoteHubId": "ranked-au",
+      "scopes": { "region": "au" }
+    }
+  ]
+}
+```
+
+## Error
+
+```ts
+interface ErrorResponse {
+  error: string;
+}
+```
+
+```json
+{ "error": "hub id already registered" }
+```
+
+## scopeSchema subset
+
+```json
+{
+  "type": "object",
+  "required": ["region"],
+  "properties": {
+    "region": { "type": "string", "enum": ["au", "nz"] },
+    "rating": { "type": "integer" },
+    "premium": { "type": "boolean" }
+  },
+  "additionalProperties": false
+}
+```
+
+Supported property `type` values: `string`, `number`, `integer`, `boolean`, `array`, `object`, `null`.
+
+Behavior:
+
+- `type` at the schema root, if present, must be `object`.
+- `required` must be an array of strings; each must be present in scopes.
+- `properties` must be an object when present.
+- Unknown scopes are rejected only when `additionalProperties` is exactly `false`.
+- `enum` is exact JSON equality.
+- Unsupported property types or malformed keywords return `400`.
+- `generateUsers` is rejected for a hub with a schema.
+- Validation applies to `upsertUser`, `upsertUsers`, `upsertServer`, `upsertServers`. Other methods, including custom handler methods, are not schema-validated.
+
+## Forwarding header
+
+`x-liveengine-hop` is an unsigned integer header:
+
+| Value | Behavior |
+| --- | --- |
+| absent | Treated as `0` |
+| `0`, `1`, `2` | Accepted |
+| anything else, or `> 2` | `400 invalid forwarding hop` |
+| external hub receiving `2` | `508 forwarding hop limit reached` |
+| forwarded request | Sends `hop + 1` |
+
+The header is for the host's forwarding chain, not for application logic. Do not set it on client requests unless you are implementing a compatible forwarder.

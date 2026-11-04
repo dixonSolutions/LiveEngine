@@ -1,0 +1,141 @@
+---
+title: "Hub protocol overview"
+description: "Versioned HTTP contract, authentication, JSON envelope, route map, scopeSchema subset, and error format."
+---
+
+LiveEngine hosts and external hubs share one protocol: **`liveengine.hub/v1`**. The machine-readable schema is served at `GET /v1/contract/schema` and checked into the repository as `docs/hub-contract.schema.json`.
+
+## Base URL and versioning
+
+A hub address is an absolute HTTP(S) base URL with no credentials, query, or fragment. The client appends routes:
+
+```text
+http://127.0.0.1:8787/health
+http://127.0.0.1:8787/v1/contract
+http://127.0.0.1:8787/v1/hubs
+```
+
+`GET /v1/contract` is the handshake:
+
+```json
+{
+  "protocol": "liveengine.hub/v1",
+  "version": 1,
+  "endpoints": [
+    "/health",
+    "/v1/contract",
+    "/v1/hubs",
+    "/v1/hubs/{id}",
+    "/v1/hubs/{id}/call",
+    "/v1/registries/import"
+  ],
+  "schema": "/v1/contract/schema"
+}
+```
+
+Clients should verify `protocol` before using the service. LiveEngine's `HubClient.contract()` does this automatically and throws `Incompatible hub protocol` on a mismatch.
+
+## Authentication
+
+- `GET /health` is unauthenticated.
+- Every other endpoint requires `Authorization: Bearer <token>`.
+- The token is the host's `LIVEENGINE_TOKEN` and must be at least 24 bytes at startup.
+- Authentication is administrative, not per-player.
+- Requests without a valid token return `401` with `{"error":"unauthorized"}`.
+
+The host rate-limits by socket peer **before** checking the token. An unauthenticated request still consumes a rate slot.
+
+## Content type and JSON
+
+Request bodies use `Content-Type: application/json`. Responses are JSON except `204 No Content` on delete. Unknown fields in registration, call, and import DTOs are rejected because the Rust types use `deny_unknown_fields`.
+
+```json
+{ "method": "upsertUser", "args": [ { "id": "alice" } ] }
+```
+
+```json
+{ "result": true }
+```
+
+Application method results are wrapped in `result`; the Node `HubClient.call` unwraps it for you.
+
+## Route map
+
+| Method | Route | Auth | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/health` | no | Liveness, protocol, uptime |
+| `GET` | `/v1/contract` | yes | Capability handshake |
+| `GET` | `/v1/contract/schema` | yes | Embedded JSON schema |
+| `GET` | `/v1/hubs` | yes | Discover attached hubs |
+| `POST` | `/v1/hubs` | yes | Register an internal or external hub |
+| `GET` | `/v1/hubs/{id}` | yes | Inspect one hub |
+| `DELETE` | `/v1/hubs/{id}` | yes | Remove a registration |
+| `POST` | `/v1/hubs/{id}/call` | yes | Exchange method/args for a result |
+| `POST` | `/v1/registries/import` | yes | Snapshot a remote registry |
+
+See [Endpoints](/protocol/endpoints) for bodies and status codes, and [Registration DTOs](/protocol/registration) for field rules.
+
+## Error format
+
+Errors are always:
+
+```json
+{ "error": "human-readable message" }
+```
+
+Validation messages are intended for diagnostics. Do not depend on exact wording across versions; branch on HTTP status and, for engine results, on the structured `ok` and `reason` fields.
+
+## Hub IDs
+
+IDs and remote hub IDs:
+
+- 1–128 characters
+- ASCII letters, digits, `.`, `_`, `-`
+- not `.` or `..`
+- no leading or trailing whitespace
+
+The prefix for registry imports is at most 64 characters of the same character set.
+
+## TTL
+
+`ttlSeconds` is optional, at least 1, and at most `max_ttl` (default 24 hours). Expired registrations are dropped lazily when the registry is accessed. They can be re-registered after expiry. TTL state is in memory.
+
+## scopeSchema subset
+
+When a registration includes `scopeSchema`, the host validates scopes for `upsertUser`, `upsertUsers`, `upsertServer`, and `upsertServers`. Supported keys:
+
+```json
+{
+  "type": "object",
+  "required": ["region"],
+  "properties": {
+    "region": { "type": "string", "enum": ["au", "nz"] },
+    "rating": { "type": "integer" }
+  },
+  "additionalProperties": false
+}
+```
+
+| Keyword | Behavior |
+| --- | --- |
+| `type` | If present, must be `object`; property types may be `string`, `number`, `integer`, `boolean`, `array`, `object`, or `null` |
+| `required` | Array of scope names that must be present |
+| `properties` | Object mapping scope names to `{ type?, enum? }` |
+| `additionalProperties: false` | Rejects scopes not listed in `properties` |
+| `enum` | Exact JSON membership test |
+
+It is **not** a complete JSON Schema validator. `generateUsers` is rejected for hubs with a schema; generate locally and submit through `upsertUsers`.
+
+## Forwarding
+
+Calls to external hubs are forwarded with `x-liveengine-hop`:
+
+- absent = `0`
+- allowed values are `0`, `1`, `2`
+- other values return `400`
+- an external hub receiving hop `2` returns `508`
+- forwarded calls use `hop + 1`
+
+## State model
+
+The registry, engines, TTLs, rate budgets, and credentials are in memory. The protocol has no persistence or replication semantics. Restarting a host loses its registrations and state.

@@ -1,0 +1,138 @@
+---
+title: "Docker and Podman"
+description: "Build the image, run a single host, start the Compose central/remote pair, and test custom hub containers."
+---
+
+One OCI image can run a central registry, an ordinary hub host, or an independently hosted remote service. The binary is the same; only its environment and registrations differ. No hub IDs are baked into the image.
+
+## Build and run
+
+```sh
+docker build -t liveengine:local .
+
+export LIVEENGINE_TOKEN="$(openssl rand -hex 32)"
+docker run --rm -p 8787:8787 \
+  -e LIVEENGINE_TOKEN="$LIVEENGINE_TOKEN" \
+  liveengine:local
+```
+
+The image:
+
+- uses a `rust:1.92-bookworm` build stage and a `debian:bookworm-slim` runtime
+- installs `ca-certificates` and `curl`
+- runs as UID/GID `65532:65532` (non-root)
+- sets `LIVEENGINE_BIND=0.0.0.0:8787`
+- exposes `8787`
+- defines a health check against `http://127.0.0.1:8787/health`
+
+Podman uses the same image:
+
+```sh
+podman build -t liveengine:local .
+podman run --rm -p 8787:8787 -e LIVEENGINE_TOKEN="$LIVEENGINE_TOKEN" liveengine:local
+```
+
+## Compose: central plus remote
+
+```sh
+cp .env.example .env
+# Replace both placeholder secrets before starting.
+docker compose up --build -d
+```
+
+The example defines:
+
+| Service | Host port | Host variable | Purpose |
+| --- | --- | --- | --- |
+| `central` | `${LIVEENGINE_LISTEN_IP:-127.0.0.1}:8787` | `LIVEENGINE_TOKEN`; allowlist is `remote` | Central registry |
+| `remote` | `127.0.0.1:8788` | `LIVEENGINE_REMOTE_TOKEN`, passed into the container as `LIVEENGINE_TOKEN` | Independent remote host |
+
+Both services use `read_only: true`, drop all capabilities, set `no-new-privileges`, and restart unless stopped.
+
+The central container reaches the remote by service name:
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+
+const remote = new HubClient('http://127.0.0.1:8788', {
+  token: process.env.LIVEENGINE_REMOTE_TOKEN,
+});
+await remote.register({
+  id: 'gogh',
+  mode: 'internal',
+  scopes: { game: 'gogh-strike' },
+});
+
+const central = new HubClient('http://127.0.0.1:8787', {
+  token: process.env.LIVEENGINE_TOKEN,
+});
+await central.register({
+  id: 'gogh-remote',
+  mode: 'external',
+  address: 'http://remote:8787',
+  remoteHubId: 'gogh',
+  remoteToken: process.env.LIVEENGINE_REMOTE_TOKEN,
+  scopes: { game: 'gogh-strike' },
+});
+```
+
+From the host, the remote management port is `8788`; inside the Compose network it is `remote:8787`. The central service allowlists the hostname `remote`.
+
+```sh
+docker compose ps
+docker compose logs -f central
+docker compose down
+```
+
+<Warning>
+The Compose services keep all registry and matchmaking state in memory. `docker compose restart` or `down` loses registrations, users, memberships, and events. Re-create runtime registrations after a restart.
+</Warning>
+
+## Custom hub container
+
+```sh
+docker build -f Dockerfile.custom -t liveengine-counter .
+docker run --rm -p 8787:8787 \
+  -e LIVEENGINE_TOKEN="$LIVEENGINE_TOKEN" \
+  liveengine-counter
+```
+
+`Dockerfile.custom` builds `examples/custom-hub.rs` and copies the resulting binary into a minimal runtime image. See [Host a custom in-process handler](/guides/custom-handler).
+
+## Container integration test
+
+```sh
+bash scripts/test-containers.sh docker liveengine:local
+```
+
+With a custom image:
+
+```sh
+docker build -f Dockerfile.custom -t liveengine-custom:test .
+bash scripts/test-containers.sh docker liveengine:test liveengine-custom:test
+```
+
+Podman:
+
+```sh
+bash scripts/test-containers.sh podman liveengine:local
+```
+
+The script:
+
+1. Creates an isolated container network and two token files.
+2. Starts a remote and a central container with independent tokens.
+3. Waits for both health endpoints.
+4. Runs `scripts/test-container-hubs.js`, which performs the contract handshake, registers an internal remote hub and an external alias, forwards server/user/join calls, checks the remote's paired state, verifies unauthenticated access returns `401`, imports the remote registry live, and checks detach semantics.
+5. If a custom image is supplied, attaches it as an external hub and exchanges arbitrary DTOs.
+6. Removes its containers, network, and secrets on exit.
+
+This test proves process and network isolation inside a container network. It does not prove a physical device on a different network connected; use [Network testing](/guides/network-testing) for that.
+
+## Production notes
+
+- The image is a single process with in-memory state. Do not scale it horizontally without a routing/persistence design.
+- Terminate TLS at an ingress or reverse proxy. The image serves plain HTTP.
+- A shared reverse proxy shares one socket-peer rate budget across its clients; apply public limits at the proxy too.
+- Keep `LIVEENGINE_TOKEN` in a secret store, not in the image or a committed compose file.
+- Pin the image digest and the token rotation procedure in your deployment system.

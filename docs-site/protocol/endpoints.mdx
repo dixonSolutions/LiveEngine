@@ -1,0 +1,335 @@
+---
+title: "HTTP endpoints"
+description: "Method, authentication, body, response, and status codes for every liveengine.hub/v1 route."
+---
+
+All examples assume:
+
+```sh
+export HUB=http://127.0.0.1:8787
+export TOKEN="$LIVEENGINE_TOKEN"
+```
+
+Every route except `/health` requires:
+
+```http
+Authorization: Bearer <token>
+```
+
+Request bodies use `application/json`. Error responses use `{"error":"..."}`.
+
+## GET /health
+
+Unauthenticated liveness check. It does not consume a rate slot.
+
+```sh
+curl --fail --silent "$HUB/health"
+```
+
+```json
+{
+  "status": "ok",
+  "protocol": "liveengine.hub/v1",
+  "uptimeSeconds": 42
+}
+```
+
+| Status | Meaning |
+| --- | --- |
+| `200` | Running |
+
+## GET /v1/contract
+
+Capability handshake.
+
+```sh
+curl --silent -H "Authorization: Bearer $TOKEN" "$HUB/v1/contract"
+```
+
+```json
+{
+  "protocol": "liveengine.hub/v1",
+  "version": 1,
+  "endpoints": [
+    "/health",
+    "/v1/contract",
+    "/v1/hubs",
+    "/v1/hubs/{id}",
+    "/v1/hubs/{id}/call",
+    "/v1/registries/import"
+  ],
+  "schema": "/v1/contract/schema"
+}
+```
+
+| Status | Meaning |
+| --- | --- |
+| `200` | Contract |
+| `401` | Missing or invalid token |
+| `429` | Peer rate budget exhausted |
+| `504` | Request timeout |
+
+## GET /v1/contract/schema
+
+Returns the embedded `docs/hub-contract.schema.json`.
+
+```sh
+curl --silent -H "Authorization: Bearer $TOKEN" "$HUB/v1/contract/schema"
+```
+
+| Status | Meaning |
+| --- | --- |
+| `200` | JSON schema |
+| `500` | Embedded schema could not be parsed (should not occur in a normal build) |
+| `401` / `429` / `504` | As above |
+
+## GET /v1/hubs
+
+Lists public metadata for live registrations, sorted by hub ID.
+
+```sh
+curl --silent -H "Authorization: Bearer $TOKEN" "$HUB/v1/hubs"
+```
+
+```json
+{
+  "hubs": [
+    {
+      "id": "ranked-au",
+      "mode": "internal",
+      "remoteHubId": "ranked-au",
+      "scopes": { "game": "chess", "region": "au" },
+      "scopeSchema": {
+        "type": "object",
+        "required": ["region"],
+        "properties": { "region": { "type": "string" } }
+      },
+      "expiresInSeconds": 3540
+    },
+    {
+      "id": "remote-ranked",
+      "mode": "external",
+      "address": "https://remote.example.net",
+      "remoteHubId": "ranked-au",
+      "scopes": { "game": "chess" }
+    }
+  ]
+}
+```
+
+`address` and `scopeSchema` are omitted when absent. `expiresInSeconds` is omitted for permanent registrations. `remoteToken` is never returned.
+
+| Status | Meaning |
+| --- | --- |
+| `200` | Hub list |
+| `401` / `429` / `504` | Auth, rate, timeout |
+
+## POST /v1/hubs
+
+Registers an internal or external hub.
+
+```sh
+curl --silent -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "ranked-au",
+    "mode": "internal",
+    "scopes": { "game": "chess", "region": "au" }
+  }' \
+  "$HUB/v1/hubs"
+```
+
+```json
+{
+  "id": "ranked-au",
+  "mode": "internal",
+  "remoteHubId": "ranked-au",
+  "scopes": { "game": "chess", "region": "au" }
+}
+```
+
+Returns `201 Created` with public `HubInfo`.
+
+| Status | Meaning |
+| --- | --- |
+| `201` | Registered |
+| `400` | Invalid DTO, ID, scopes, schema, TTL, address, or disallowed remote host |
+| `401` | Unauthorized |
+| `409` | Hub ID already registered |
+| `429` | Rate limit |
+| `502` | External handshake failed |
+| `504` | Request timeout |
+| `507` | Registry is full |
+
+An internal registration creates a new engine. An external registration performs health, contract, and remote-hub presence checks before it is stored. See [Registration DTOs](/protocol/registration).
+
+## GET /v1/hubs/{id}
+
+Returns one public hub record.
+
+```sh
+curl --silent -H "Authorization: Bearer $TOKEN" "$HUB/v1/hubs/ranked-au"
+```
+
+| Status | Meaning |
+| --- | --- |
+| `200` | Hub info |
+| `401` | Unauthorized |
+| `404` | Hub not found or expired |
+| `429` | Rate limit |
+| `504` | Request timeout |
+
+## DELETE /v1/hubs/{id}
+
+Removes a registration.
+
+```sh
+curl --silent -X DELETE -H "Authorization: Bearer $TOKEN" "$HUB/v1/hubs/ranked-au"
+```
+
+| Status | Meaning |
+| --- | --- |
+| `204` | Removed; no body |
+| `401` | Unauthorized |
+| `404` | Hub not found |
+| `429` | Rate limit |
+| `504` | Request timeout |
+
+Deleting an external registration does not stop or delete the remote hub. It detaches the local route only.
+
+## POST /v1/hubs/{id}/call
+
+Invokes a method on a hub.
+
+```sh
+curl --silent -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "method": "autoJoin", "args": ["alice"] }' \
+  "$HUB/v1/hubs/ranked-au/call"
+```
+
+```json
+{
+  "result": {
+    "ok": true,
+    "reason": null,
+    "userId": "alice",
+    "serverId": "room-1"
+  }
+}
+```
+
+Request:
+
+```ts
+interface CallRequest {
+  method: string;      // 1–128 bytes
+  args?: unknown[];    // default []
+}
+```
+
+The host checks, in order:
+
+1. JSON body parses and uses known fields.
+2. `method` is 1–128 bytes.
+3. Serialized call size is within `max_request_bytes`.
+4. `args.length <= max_args`.
+5. `generateUsers` count is within `max_generates_per_call`.
+6. Argument nesting depth is at most 64.
+7. The hub exists.
+8. If the hub has `scopeSchema`, upsert scopes are valid and `generateUsers` is rejected.
+9. An in-flight slot is available.
+10. `x-liveengine-hop` is valid and within the forwarding limit.
+11. The internal handler or remote call runs.
+12. The result is within response size, entity, and event limits.
+
+| Status | Meaning |
+| --- | --- |
+| `200` | Method returned; `result` may itself describe an application failure |
+| `400` | Invalid call, invalid method, deep nesting, schema violation, handler error, invalid hop |
+| `401` | Unauthorized |
+| `404` | Hub not found or expired |
+| `409` | Internal handler is busy |
+| `413` | Request/response size, argument count, generate count, or entity/event budget exceeded |
+| `429` | Rate limit |
+| `500` | Handler task failed |
+| `502` | Remote request/handshake/JSON failure |
+| `503` | In-flight capacity busy or handler unavailable |
+| `504` | Request timeout |
+| `508` | Forwarding hop limit reached |
+
+An application failure is a `200` with a result such as:
+
+```json
+{
+  "result": {
+    "ok": false,
+    "reason": "no_fit",
+    "userId": "alice",
+    "serverId": null
+  }
+}
+```
+
+## POST /v1/registries/import
+
+Imports a snapshot of another registry.
+
+```sh
+curl --silent -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "address": "https://remote.example.net",
+    "token": "'"$REMOTE_TOKEN"'",
+    "prefix": "partner-"
+  }' \
+  "$HUB/v1/registries/import"
+```
+
+```json
+{
+  "hubs": [
+    {
+      "id": "partner-ranked-au",
+      "mode": "external",
+      "address": "https://remote.example.net",
+      "remoteHubId": "ranked-au",
+      "scopes": { "game": "chess" }
+    }
+  ]
+}
+```
+
+| Status | Meaning |
+| --- | --- |
+| `200` | Imported or already attached |
+| `400` | Invalid body, token, prefix, address, or disallowed host |
+| `401` | Unauthorized |
+| `409` | ID mapped to a different target, or concurrent registration |
+| `413` | Remote hub list exceeds `max_hubs` |
+| `429` | Rate limit |
+| `502` | Remote health/contract/list/handshake failure, malformed registry, duplicate remote IDs |
+| `504` | Request timeout |
+| `507` | Local registry would exceed `max_hubs` |
+
+Imports are not subscriptions. Run the request again to discover hubs registered remotely after the previous snapshot.
+
+## Common statuses
+
+| Status | Name | Typical cause |
+| --- | --- | --- |
+| `400` | Bad Request | Invalid DTO, ID, scopes, address, prefix, method, or hop |
+| `401` | Unauthorized | Missing or wrong bearer token |
+| `404` | Not Found | Unknown route or hub |
+| `409` | Conflict | Duplicate ID, busy handler, import mapping conflict |
+| `413` | Payload Too Large | Body/response size, args, generate count, entity/event budget |
+| `429` | Too Many Requests | Peer rate budget exhausted |
+| `500` | Internal Server Error | Handler task failure or schema load failure |
+| `502` | Bad Gateway | Remote handshake, request, JSON, or registry failure |
+| `503` | Service Unavailable | In-flight capacity or unavailable handler |
+| `504` | Gateway Timeout | Request exceeded `request_timeout` |
+| `507` | Insufficient Storage | Hub registry is full |
+| `508` | Loop Detected | External forwarding at hop `2` |

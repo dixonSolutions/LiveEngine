@@ -1,0 +1,189 @@
+---
+title: "Rust engine reference"
+description: "Use Engine::new and dispatch, call the same methods as the Node SDK, and choose feature flags."
+---
+
+## Dependency
+
+```toml
+[dependencies]
+liveengine = "0.2"
+serde_json = "1"
+```
+
+Rust 1.88 or newer is required. The crate exports:
+
+```rust
+pub mod engine;
+#[cfg(feature = "host")] pub mod hub;
+pub mod rules;
+pub use engine::Engine;
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+```
+
+## Feature flags
+
+| Feature | Default | Enables |
+| --- | --- | --- |
+| `host` | yes | `hub` module, Axum, Tokio, reqwest, URL, futures, subtle, tower; the `liveengine-hub` binary |
+| `node` | no | N-API bindings used by the npm package |
+
+Engine-only dependency:
+
+```toml
+[dependencies]
+liveengine = { version = "0.2", default-features = false }
+```
+
+With `default-features = false`, only `Engine`, `rules`, and `VERSION` are available. There is no Node or hosting dependency.
+
+## Engine
+
+```rust
+pub struct Engine { /* private */ }
+
+impl Engine {
+    pub fn new(seed: u64) -> Self;
+    pub fn dispatch(&mut self, method: &str, args: Vec<serde_json::Value>)
+        -> Result<serde_json::Value, String>;
+}
+```
+
+```rust
+use liveengine::Engine;
+use serde_json::json;
+
+let mut engine = Engine::new(42);
+
+let added = engine.dispatch(
+    "upsertServer",
+    vec![json!({
+        "id": "room-au",
+        "capacity": 2,
+        "minMembers": 2,
+        "scopes": { "game": "chess", "region": "au" },
+        "requirements": { "rating": { "between": [1300, 1700] } }
+    })],
+)?;
+assert_eq!(added, json!(true));
+
+engine.dispatch(
+    "upsertUser",
+    vec![json!({
+        "id": "alice",
+        "scopes": { "game": "chess", "region": "au", "rating": 1450 },
+        "requirements": { "game": "chess", "region": "au" }
+    })],
+)?;
+
+let result = engine.dispatch("autoJoin", vec![json!("alice")])?;
+println!("{result}");
+```
+
+`dispatch` returns `Ok(Value)` for a successful method call, including application-level failures such as `{ "ok": false, "reason": "no_fit" }`. It returns `Err(String)` for malformed input, unknown methods, invalid requirements, invalid generators, and invalid statuses.
+
+## Methods
+
+The method names, argument order, and result shapes match the [Node engine reference](/node/engine). Every Node method maps directly to `dispatch`:
+
+| Method | Arguments |
+| --- | --- |
+| `upsertUser` | `user` |
+| `upsertUsers` | `[users]` |
+| `removeUser` | `id` |
+| `getUser` | `id` |
+| `listUsers` | optional `status` |
+| `setUserStatus` | `id`, `status` |
+| `upsertServer` | `server` |
+| `upsertServers` | `[servers]` |
+| `removeServer` | `id` |
+| `getServer` | `id` |
+| `listServers` | optional `status` |
+| `setServerStatus` | `id`, `status` |
+| `findServersForUser` | `userId`, optional options |
+| `findUsersForServer` | `serverId`, optional options |
+| `fits` | `userId`, `serverId` |
+| `advertise` | `userId`, optional options |
+| `advertiseAll` | optional options |
+| `join` | `userId`, `serverId` |
+| `leave` | `userId` |
+| `autoJoin` | `userId`, optional options |
+| `matchAll` | optional options |
+| `generateUsers` | `count`, optional spec |
+| `drainEvents` | none |
+| `pendingEvents` | none |
+| `stats` | none |
+| `clear` | none |
+| `reseed` | `seed` |
+
+```rust
+let stats = engine.dispatch("stats", vec![])?;
+let events = engine.dispatch("drainEvents", vec![])?;
+let pending = engine.dispatch("pendingEvents", vec![])?;
+engine.dispatch("reseed", vec![json!(99)])?;
+```
+
+## Rules module
+
+`rules` exposes the requirement parser and evaluator directly:
+
+```rust
+use liveengine::rules;
+
+let requirements = rules::parse_requirements(Some(&json!({
+    "region": ["au", "nz"],
+    "rating": { "between": [1200, 1800] }
+})))?;
+
+let scopes = json!({ "region": "au", "rating": 1500 });
+assert!(rules::evaluate(&requirements, &scopes));
+```
+
+- `parse_requirements(Option<&Value>) -> Result<Value, String>` normalizes shorthand, arrays, and rule sets.
+- `scopes(Option<&Value>) -> Value` normalizes a scope map (arrays become string arrays).
+- `evaluate(&Value, &Value) -> bool` applies the rule set to scopes.
+
+The internal representation is `{ "rules": [...], "match": "all" | "any" }`. See [Requirements](/concepts/requirements).
+
+## Determinism and generation
+
+The engine uses a seeded ChaCha8 RNG. `Engine::new(seed)` and `reseed(seed)` control generated users and the `random` strategy. Generation specs follow the same schema as Node:
+
+```rust
+let users = engine.dispatch(
+    "generateUsers",
+    vec![
+        json!(100),
+        json!({
+            "idPrefix": "bot-",
+            "scopes": {
+                "rating": { "type": "int", "min": 1000, "max": 2000 },
+                "region": ["eu", "us", "apac"],
+                "tags": { "type": "tags", "values": ["a", "b", "c"], "count": 2 }
+            },
+            "requirements": { "game": "chess" }
+        }),
+    ],
+)?;
+```
+
+Generation validates every generator before inserting users. Invalid ranges, probabilities, empty pools, unknown types, or output above 64 MiB return `Err` without partial mutation.
+
+## Errors
+
+```rust
+match engine.dispatch("join", vec![json!("alice"), json!("room")]) {
+    Ok(result) => {
+        if result["ok"] == false {
+            eprintln!("application result: {}", result["reason"]);
+        }
+    }
+    Err(message) => eprintln!("invalid call: {message}"),
+}
+```
+
+Error strings are stable enough for diagnostics but are not a typed error enum. Do not branch on exact message text in production; branch on the structured `ok`/`reason` fields for application results.
+
+## Threading
+
+`Engine` is `Send` and uses `&mut self` for every operation. It is not internally synchronized. Wrap it in your own `Mutex` if multiple tasks need access. The hosted `HubService` already wraps each engine in a mutex and runs calls on blocking workers.

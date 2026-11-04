@@ -1,0 +1,149 @@
+---
+title: "Actix Web"
+description: "Use the LiveEngine engine directly in Actix Web, or run the Axum hub beside an Actix service."
+---
+
+LiveEngine's HTTP host is built on Axum, so an Actix application cannot merge its `Router` directly. You have two accurate options.
+
+## Option 1: use the engine in Actix handlers
+
+This is the simplest option when one Actix process owns matchmaking.
+
+```toml
+[dependencies]
+actix-web = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+liveengine = { version = "0.2", default-features = false }
+```
+
+```rust
+use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use liveengine::Engine;
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::Mutex;
+
+#[derive(Deserialize)]
+struct MatchRequest {
+    user_id: String,
+    scopes: Option<serde_json::Value>,
+    requirements: Option<serde_json::Value>,
+}
+
+async fn match_user(
+    engine: web::Data<Mutex<Engine>>,
+    body: web::Json<MatchRequest>,
+) -> impl Responder {
+    let mut engine = engine.lock().unwrap();
+    let user = json!({
+        "id": body.user_id,
+        "scopes": body.scopes.clone().unwrap_or_else(|| json!({})),
+        "requirements": body.requirements.clone(),
+    });
+    if let Err(message) = engine.dispatch("upsertUser", vec![user]) {
+        return HttpResponse::BadRequest().json(json!({ "error": message }));
+    }
+    match engine.dispatch("autoJoin", vec![json!(body.user_id)]) {
+        Ok(result) if result.get("ok") == Some(&json!(true)) => {
+            HttpResponse::Ok().json(result)
+        }
+        Ok(result) => HttpResponse::Conflict().json(result),
+        Err(message) => HttpResponse::BadRequest().json(json!({ "error": message })),
+    }
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let engine = web::Data::new(Mutex::new(Engine::new(0)));
+    HttpServer::new(move || {
+        App::new()
+            .app_data(engine.clone())
+            .route("/api/match", web::post().to(match_user))
+    })
+    .bind(("127.0.0.1", 8080))?
+    .run()
+    .await
+}
+```
+
+<Note>
+  `Engine` is not `Sync` by itself. The `Mutex` serializes access, matching the single-writer model of an internal hub. A poisoned lock means a handler panicked; return `503` rather than unwrapping in production.
+</Note>
+
+## Option 2: run the hub beside Actix
+
+Use this when you need the full HTTP contract, external hubs, registry import, or custom `HubHandler` methods. Start the Axum host on a loopback port in a background runtime, then call it from Actix over HTTP.
+
+```toml
+[dependencies]
+actix-web = "4"
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+liveengine = "0.2" # default features include the host
+```
+
+```rust
+use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use liveengine::hub::{HubConfig, HubRegistration, HubService};
+use serde_json::json;
+use std::net::SocketAddr;
+
+fn start_hub() {
+    std::thread::spawn(|| {
+        let runtime = tokio::runtime::Runtime::new().expect("hub runtime");
+        runtime.block_on(async {
+            let service = HubService::new(HubConfig::from_env()?).expect("hub config");
+            let registration: HubRegistration = serde_json::from_value(json!({
+                "id": "ranked",
+                "mode": "internal",
+                "scopes": { "game": "chess" }
+            }))
+            .expect("registration");
+            service
+                .register_internal(registration, liveengine::Engine::new(0))
+                .await
+                .expect("register hub");
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:8787")
+                .await
+                .expect("bind hub");
+            axum::serve(
+                listener,
+                service
+                    .router()
+                    .into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .expect("serve hub");
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })
+        .expect("hub stopped");
+    });
+}
+
+async fn health() -> impl Responder {
+    HttpResponse::Ok().json(json!({ "app": "ok" }))
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    start_hub();
+    HttpServer::new(|| App::new().route("/api/health", web::get().to(health)))
+        .bind(("127.0.0.1", 8080))?
+        .run()
+        .await
+}
+```
+
+Actix handlers can then call the hub with `reqwest` or any HTTP client using `Authorization: Bearer <token>` and the `/v1/hubs/{id}/call` route. Keep the hub port on loopback or a private network.
+
+## Which option?
+
+| Need | Option |
+| --- | --- |
+| One process, local matchmaking only | 1: `Engine` in Actix state |
+| Full hub contract, registry, external hubs | 2: hub beside Actix |
+| Multiple Actix instances sharing state | A separate central hub + HTTP calls |
+| Custom in-process methods with hub limits | `HubService::register_internal` in option 2 |

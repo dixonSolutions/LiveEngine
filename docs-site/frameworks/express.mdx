@@ -1,0 +1,109 @@
+---
+title: "Express"
+description: "A complete Express matchmaking API backed by an in-process LiveEngine."
+---
+
+This example keeps matchmaking in the Express process. It exposes server creation, matching, leaving, stats, and a server-sent events stream.
+
+## Install and run
+
+```sh
+npm install express @dixonsolutions/liveengine
+node examples/frameworks/express-server.js
+```
+
+```sh
+curl -X POST http://127.0.0.1:3000/api/servers \
+  -H 'content-type: application/json' \
+  -d '{"id":"room-1","capacity":2,"scopes":{"region":"au"}}'
+
+curl -X POST http://127.0.0.1:3000/api/match \
+  -H 'content-type: application/json' \
+  -d '{"userId":"alice","scopes":{"region":"au"}}'
+```
+
+## Server
+
+```js
+'use strict';
+
+const express = require('express');
+const { LiveEngine } = require('@dixonsolutions/liveengine');
+
+const app = express();
+app.use(express.json({ limit: '256kb' }));
+
+const engine = new LiveEngine({
+  seed: Number(process.env.LIVEENGINE_SEED || 0),
+  autoEmit: false,
+});
+
+app.post('/api/servers', (req, res) => {
+  const { id, capacity = 2, minMembers = 0, scopes = {}, requirements } = req.body || {};
+  if (!id) return res.status(400).json({ error: 'id is required' });
+  const created = engine.upsertServer({ id, capacity, minMembers, scopes, requirements });
+  res.status(created ? 201 : 200).json({ id, created });
+});
+
+app.post('/api/match', (req, res) => {
+  const { userId, scopes = {}, requirements } = req.body || {};
+  if (!userId) return res.status(400).json({ error: 'userId is required' });
+  engine.upsertUser({ id: userId, scopes, requirements });
+  const result = engine.pair(userId);
+  if (!result.ok) return res.status(409).json(result);
+  res.json(result);
+});
+
+app.post('/api/leave', (req, res) => {
+  const { userId } = req.body || {};
+  if (!userId) return res.status(400).json({ error: 'userId is required' });
+  res.json(engine.leave(userId));
+});
+
+app.get('/api/stats', (_req, res) => {
+  res.json(engine.stats());
+});
+
+app.get('/api/events', (req, res) => {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  });
+  const timer = setInterval(() => {
+    for (const event of engine.drainEvents()) {
+      res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    }
+  }, 250);
+  req.on('close', () => clearInterval(timer));
+});
+
+const port = Number(process.env.PORT || 3000);
+app.listen(port, '127.0.0.1', () => {
+  console.log(`Express matchmaking API on http://127.0.0.1:${port}`);
+});
+```
+
+## Why `autoEmit: false`?
+
+With the default `autoEmit: true`, each mutating call drains the native queue and emits Node events immediately. This example drains manually so one SSE endpoint owns delivery:
+
+```js
+const engine = new LiveEngine({ autoEmit: false });
+engine.on('event', event => {
+  // Not called while autoEmit is false.
+});
+
+// Later, in the delivery loop:
+for (const event of engine.drainEvents()) {
+  res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+}
+```
+
+If you already have an event bus, keep `autoEmit: true` (the default) and subscribe to `'event'` or individual event names.
+
+## Scale-out warning
+
+The engine lives in this Express process. Two Express instances do not share users or servers. For multiple instances, start a central hub and call it with `HubClient`; see [Fastify](/frameworks/fastify) for that shape.
+
+Application authentication belongs in Express. The local engine has no concept of authenticated players; `userId` is whatever your application verifies and supplies.

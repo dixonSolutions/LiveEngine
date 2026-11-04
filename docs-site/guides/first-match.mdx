@@ -1,0 +1,155 @@
+---
+title: "Your first matchmaking session"
+description: "Build a small chess matchmaking session, inspect matches, apply a strategy, and follow the lifecycle events."
+---
+
+This tutorial uses the Node.js SDK. The same method names, options, and result shapes apply through the Rust `dispatch` API.
+
+## Set up
+
+```sh
+mkdir liveengine-demo && cd liveengine-demo
+npm init -y
+npm install @dixonsolutions/liveengine
+```
+
+Create `index.js`:
+
+```js
+const { LiveEngine } = require('@dixonsolutions/liveengine');
+
+const engine = new LiveEngine({ seed: 7 });
+
+const events = [];
+engine.on('event', ev => events.push(ev));
+
+engine.upsertServers([
+  {
+    id: 'room-au',
+    capacity: 2,
+    minMembers: 2,
+    scopes: { game: 'chess', region: 'au', rating: 1500 },
+    requirements: { game: 'chess', region: 'au', rating: { between: [1300, 1700] } },
+  },
+  {
+    id: 'room-nz',
+    capacity: 2,
+    minMembers: 2,
+    scopes: { game: 'chess', region: 'nz', rating: 1600 },
+    requirements: { game: 'chess', region: ['au', 'nz'], rating: { between: [1400, 1800] } },
+  },
+]);
+
+engine.upsertUsers([
+  { id: 'alice', scopes: { game: 'chess', region: 'au', rating: 1450 }, requirements: { game: 'chess' } },
+  { id: 'bob', scopes: { game: 'chess', region: 'nz', rating: 1650 }, requirements: { game: 'chess', region: ['au', 'nz'] } },
+  { id: 'carol', scopes: { game: 'chess', region: 'au', rating: 2100 }, requirements: { game: 'chess' } },
+]);
+
+console.log('alice candidates:', engine.findServersForUser('alice'));
+console.log('bob candidates:', engine.findServersForUser('bob'));
+console.log('carol candidates:', engine.findServersForUser('carol'));
+
+console.log('pair alice:', engine.pair('alice'));
+console.log('pair bob:', engine.pair('bob'));
+console.log('pair carol:', engine.pair('carol'));
+
+console.log('server:', engine.getServer('room-au'));
+console.log('stats:', engine.stats());
+console.log('events:', events.map(ev => ev.type));
+```
+
+Run it:
+
+```sh
+node index.js
+```
+
+Expected shape:
+
+```text
+alice candidates: [ { id: 'room-au', score: 1, load: 0 }, { id: 'room-nz', score: 2, load: 0 } ]
+carol candidates: []
+pair carol: { ok: false, reason: 'no_fit', userId: 'carol', serverId: null }
+```
+
+Exact scores depend on insertion order. Alice fits both rooms because each room accepts her region and rating; Carol fits neither because both rooms require a rating range that excludes 2100.
+
+## Why Alice and Bob pair
+
+- `room-au` accepts region `au` and rating 1300–1700. Alice is `au` / 1450. Alice has no server preference beyond `game: chess`. Fit.
+- `room-nz` accepts either `au` or `nz` and rating 1400–1800. Bob is `nz` / 1650. Fit.
+- After both joins, `room-au` and `room-nz` each have two members and transition to `full`.
+
+## Choose a strategy
+
+Query results default to `first` (arrival order). Try the alternatives:
+
+```js
+console.log(engine.findServersForUser('alice', { strategy: 'leastLoaded' }));
+console.log(engine.findServersForUser('alice', { strategy: 'mostLoaded', limit: 1 }));
+console.log(engine.findServersForUser('alice', { affinity: ['rating'] }));
+console.log(engine.findServersForUser('alice', { strategy: 'random' }));
+```
+
+`limit: 0` returns all matches. The default limit is 10. See [Matching strategies](/concepts/strategies).
+
+## Use autoJoin instead of pair
+
+`pair` is a Node convenience that calls `autoJoin` and attaches the full server object on success. Server code can call `autoJoin` directly:
+
+```js
+const result = engine.autoJoin('alice', { strategy: 'affinity', affinity: ['rating'] });
+if (!result.ok) {
+  console.log('not matched:', result.reason);
+}
+```
+
+`autoJoin` enforces a limit of one. Possible reasons are `user_not_found`, `already_paired`, and `no_fit`.
+
+## Release a slot
+
+```js
+console.log(engine.leave('alice'));
+// { ok: true, reason: null, userId: 'alice', serverId: 'room-au' }
+console.log(engine.getServer('room-au').status); // open
+```
+
+Leaving emits `unpaired` with `reason: 'left'` and returns the user to `waiting`.
+
+## Drain events manually
+
+For a service that delivers events on its own schedule:
+
+```js
+const engine = new LiveEngine({ seed: 7, autoEmit: false });
+
+engine.upsertServer({ id: 'room', capacity: 2 });
+engine.upsertUser({ id: 'player' });
+engine.autoJoin('player');
+
+for (const event of engine.drainEvents()) {
+  console.log(event.seq, event.type, event.userId, event.serverId);
+}
+```
+
+See [Events](/concepts/events) for the full event list and ordering.
+
+## Promote it to a hosted hub
+
+The engine above can also live behind the HTTP contract:
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+
+const hub = new HubClient('http://127.0.0.1:8787', {
+  token: process.env.LIVEENGINE_TOKEN,
+});
+
+await hub.register({ id: 'chess', mode: 'internal', scopes: { game: 'chess' } });
+await hub.call('chess', 'upsertServers', [[
+  { id: 'room-au', capacity: 2, scopes: { game: 'chess', region: 'au' } },
+]]);
+```
+
+Continue with [Hosting a hub](/guides/hosting).

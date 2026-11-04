@@ -1,0 +1,253 @@
+---
+title: "HubClient reference"
+description: "Constructor options, every method, return shapes, limits, and error behavior for the HTTP client."
+---
+
+`HubClient` talks to any host that implements `liveengine.hub/v1`. It has no native dependency and is available from both the package root and the `hubs` subpath.
+
+```js
+const { HubClient, HUB_PROTOCOL } = require('@dixonsolutions/liveengine/hubs');
+```
+
+## Constructor
+
+```ts
+interface HubClientOptions {
+  token: string;
+  timeoutMs?: number;          // default 5000
+  maxResponseBytes?: number;   // default 1048576 (1 MiB)
+  fetch?: typeof globalThis.fetch;
+}
+
+new HubClient(address: string, options: HubClientOptions);
+```
+
+```js
+const client = new HubClient('https://hub.example.net', {
+  token: process.env.LIVEENGINE_TOKEN,
+  timeoutMs: 10_000,
+  maxResponseBytes: 2 * 1024 * 1024,
+});
+```
+
+Constructor validation:
+
+- `address` must be an absolute `http:` or `https:` base URL.
+- It must not contain a username, password, query, or fragment.
+- A trailing slash is removed from `client.address`.
+- `token` must be a non-empty string.
+- `timeoutMs` must be finite and at least `1`.
+- `maxResponseBytes` must be a safe integer at least `1`.
+
+Violations throw `TypeError`. The token is stored in a non-enumerable property and is not visible in `JSON.stringify(client)`.
+
+## Request behavior
+
+Every request:
+
+- sends `Authorization: Bearer <token>` and `Content-Type: application/json`
+- uses `redirect: 'error'`
+- enforces `timeoutMs` with an abort signal
+- caps the response body at `maxResponseBytes`
+- parses JSON; an empty body becomes `null`
+- throws on invalid JSON with `Hub returned invalid JSON (HTTP <status>)`
+- throws on a non-2xx status with the server's `error` message when present, otherwise `Hub request failed (HTTP <status>)`; the thrown error has a numeric `.status`
+
+An optional `AbortSignal` can be passed to `call` and is combined with the timeout.
+
+## Methods
+
+### contract()
+
+```ts
+contract(): Promise<{ protocol: 'liveengine.hub/v1'; [key: string]: unknown }>
+```
+
+Calls `GET /v1/contract`. Throws `Incompatible hub protocol` unless the response `protocol` is `liveengine.hub/v1`.
+
+```js
+await client.contract();
+```
+
+### list()
+
+```ts
+list(): Promise<{ hubs: HubInfo[] }>
+```
+
+Calls `GET /v1/hubs`.
+
+```js
+const { hubs } = await client.list();
+```
+
+### register(hub)
+
+```ts
+register(hub: HubDefinition): Promise<HubInfo>
+```
+
+Calls `POST /v1/hubs` and returns the created public metadata (`201`).
+
+```js
+const info = await client.register({
+  id: 'ranked-au',
+  mode: 'internal',
+  scopes: { game: 'chess', region: 'au' },
+});
+```
+
+`HubDefinition`:
+
+```ts
+interface HubDefinition {
+  id: string;
+  mode: 'internal' | 'external';
+  address?: string;
+  remoteHubId?: string;
+  remoteToken?: string;
+  scopes?: Record<string, unknown>;
+  scopeSchema?: Record<string, unknown>;
+  ttlSeconds?: number;
+}
+```
+
+The client does not validate the DTO beyond serialization; the host returns `400` with a message for an invalid registration.
+
+### get(id)
+
+```ts
+get(id: string): Promise<HubInfo>
+```
+
+Calls `GET /v1/hubs/{id}`. The ID is URL-encoded. A missing hub throws with `.status === 404`.
+
+### remove(id)
+
+```ts
+remove(id: string): Promise<null>
+```
+
+Calls `DELETE /v1/hubs/{id}`. A successful delete returns `204` with no body, so the resolved value is `null`. A missing hub throws with `.status === 404`.
+
+### call(id, method, args?, options?)
+
+```ts
+call<T = unknown>(
+  id: string,
+  method: string,
+  args?: unknown[],
+  options?: { signal?: AbortSignal },
+): Promise<T>
+```
+
+Calls `POST /v1/hubs/{id}/call` with `{ method, args }` and resolves the **unwrapped `result` field**.
+
+```js
+const pair = await client.call('ranked-au', 'autoJoin', ['alice']);
+if (pair.ok) {
+  console.log('joined', pair.serverId);
+}
+
+const stats = await client.call('ranked-au', 'stats');
+
+const controller = new AbortController();
+const events = await client.call('ranked-au', 'drainEvents', [], {
+  signal: controller.signal,
+});
+```
+
+`args` defaults to `[]` and must be an array; otherwise `call` throws `TypeError: args must be an array`. Method names are validated by the host (`1–128` bytes).
+
+### importRegistry(registry)
+
+```ts
+importRegistry(registry: {
+  address: string;
+  token: string;
+  prefix?: string;
+}): Promise<{ hubs: HubInfo[] }>
+```
+
+Calls `POST /v1/registries/import` and returns the imported public records.
+
+```js
+await client.importRegistry({
+  address: 'https://remote.example.net',
+  token: process.env.REMOTE_HUB_TOKEN,
+  prefix: 'partner-',
+});
+```
+
+## Properties
+
+| Property | Type | Notes |
+| --- | --- | --- |
+| `address` | `string` | Normalized base URL without a trailing slash |
+| `timeoutMs` | `number` | Request timeout |
+| `maxResponseBytes` | `number` | Response size cap |
+
+The token is intentionally not a public property.
+
+## Errors
+
+| Error | Cause |
+| --- | --- |
+| `TypeError` | Invalid address, missing token, invalid limits, or non-array `args` |
+| `Error: Incompatible hub protocol` | Contract protocol mismatch |
+| `Error: Hub response exceeds configured limit` | Response exceeded `maxResponseBytes` |
+| `Error: Hub returned invalid JSON (HTTP n)` | Non-JSON response |
+| `Error` with `.status` | Non-2xx HTTP response |
+| `AbortError` / timeout error | Request timed out or caller aborted |
+
+```js
+try {
+  await client.list();
+} catch (error) {
+  if (error.status === 401) {
+    console.error('check LIVEENGINE_TOKEN');
+  } else {
+    throw error;
+  }
+}
+```
+
+## Custom fetch
+
+The `fetch` option is useful for tests, instrumentation, or a runtime-specific transport. It must match `globalThis.fetch` semantics.
+
+```js
+const client = new HubClient('https://hub.example', {
+  token: 'test-token',
+  fetch: async (url, init) => {
+    console.log(init.method, url);
+    return fetch(url, init);
+  },
+});
+```
+
+The client sets `redirect: 'error'`; a custom fetch should honor it.
+
+## TypeScript
+
+```ts
+import { HubClient, HUB_PROTOCOL, type HubDefinition } from '@dixonsolutions/liveengine/hubs';
+
+const definition: HubDefinition = {
+  id: 'ranked-au',
+  mode: 'internal',
+  scopes: { region: 'au' },
+};
+
+const client = new HubClient('http://127.0.0.1:8787', {
+  token: process.env.LIVEENGINE_TOKEN!,
+});
+await client.register(definition);
+```
+
+`call<T>` is generic so you can type application results:
+
+```ts
+interface Counter { count: number; }
+const counter = await client.call<Counter>('counter', 'increment', [1]);
+```

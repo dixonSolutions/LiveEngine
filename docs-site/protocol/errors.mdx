@@ -1,0 +1,148 @@
+---
+title: "Errors, status codes, and result reasons"
+description: "What each HTTP status means and the exact engine reasons returned by join, leave, and autoJoin."
+---
+
+There are two layers of failure:
+
+1. **Transport/contract failures** use HTTP status codes and `{"error":"..."}`.
+2. **Application results** return HTTP `200` with `{ "ok": false, "reason": "..." }`.
+
+Do not treat every non-OK application result as an exception, and do not treat every HTTP `4xx` as an engine reason.
+
+## HTTP status codes
+
+| Status | Name | Where it appears |
+| --- | --- | --- |
+| `200` | OK | Successful read, call, or import; application failure inside `result` |
+| `201` | Created | Hub registration |
+| `204` | No Content | Hub deletion |
+| `400` | Bad Request | Invalid JSON/DTO, ID, scopes, schema, TTL, address, prefix, method, hop, or handler call error |
+| `401` | Unauthorized | Missing or invalid bearer token |
+| `404` | Not Found | Unknown hub, expired hub, or unknown route |
+| `409` | Conflict | Duplicate hub ID, busy internal handler, import ID mapped elsewhere |
+| `413` | Payload Too Large | Request/response size, argument count, generate count, entity or event budget |
+| `429` | Too Many Requests | Peer request budget exhausted |
+| `500` | Internal Server Error | Handler task failed, or embedded schema could not be loaded |
+| `502` | Bad Gateway | Remote handshake, request, response, JSON, or registry failure |
+| `503` | Service Unavailable | In-flight call capacity busy, or handler unavailable |
+| `504` | Gateway Timeout | Request exceeded the configured timeout |
+| `507` | Insufficient Storage | Hub registry is full |
+| `508` | Loop Detected | External forwarding reached the hop limit |
+
+### 400 vs 413
+
+- `400` means the request is malformed or fails validation.
+- `413` means the request or result is valid in shape but exceeds a configured size or count budget.
+
+A preflight entity/event budget violation is `413`, even though it happens before mutation. An invalid `scopeSchema` is `400`.
+
+### 409 vs 503
+
+- `409` means the specific hub handler could not be locked because another call is using it.
+- `503` means the global in-flight semaphore is full or the handler lock is poisoned.
+
+Both are retryable in principle, but reconcile state first if a previous mutation may have started.
+
+### 504 does not cancel work
+
+A timeout returns `504` to the caller while the blocking handler may still be running and holding a permit. Retrying immediately can produce overlapping mutations. Read the state and reconcile before retrying.
+
+### 502 is remote-only
+
+`502` is used for failures while talking to an external hub or registry:
+
+- health/contract protocol mismatch
+- missing remote hub
+- remote HTTP error
+- invalid remote JSON or oversized remote response
+- malformed remote registry list
+- duplicate remote IDs after prefixing
+
+The local request may have been valid.
+
+### 508 is the hop guard
+
+An external hub that receives `x-liveengine-hop: 2` refuses to forward again. This prevents loops and unbounded chains. It is not a rate limit.
+
+## Engine result reasons
+
+`join`, `leave`, and `autoJoin` return a structured result:
+
+```json
+{ "ok": false, "reason": "no_fit", "userId": "alice", "serverId": null }
+```
+
+| Reason | Methods | Meaning |
+| --- | --- | --- |
+| `user_not_found` | `join`, `leave`, `autoJoin` | The user ID is not registered |
+| `server_not_found` | `join` | The server ID is not registered |
+| `already_paired` | `join`, `autoJoin` | The user is already in a room; `serverId` is that room |
+| `closed` | `join` | The server status is `closed` |
+| `full` | `join` | The server has no free capacity |
+| `no_fit` | `join`, `autoJoin` | Bidirectional requirements or availability reject the pair |
+| `not_paired` | `leave` | The user is not currently paired |
+
+On success, `reason` is `null` and `ok` is `true`. `leave` returns the room it left in `serverId`.
+
+```js
+const result = engine.autoJoin('alice');
+switch (result.reason) {
+  case null:
+    console.log('joined', result.serverId);
+    break;
+  case 'already_paired':
+    console.log('already in', result.serverId);
+    break;
+  case 'no_fit':
+    console.log('no room currently fits');
+    break;
+  default:
+    console.log('failed:', result.reason);
+}
+```
+
+`matchAll` returns only successful join results. `advertise` and `advertiseAll` return counts rather than result objects.
+
+## Dispatch errors
+
+Malformed input returns an error (Node throws; Rust returns `Err(String)`). Common messages:
+
+| Message | Cause |
+| --- | --- |
+| `user.id is required` | User object lacks `id` |
+| `server.id is required` | Server object lacks `id` |
+| `user must be an object` / `server must be an object` | Wrong input type |
+| `id must be a string` / `userId must be a string` | Non-string ID argument |
+| `unknown user status` / `unknown server status` | Invalid status string |
+| `unknown strategy` | Invalid match strategy |
+| `options must be an object` | Match options are not an object |
+| `requirements must be an array or object` | Invalid requirement form |
+| `unknown requirement op: ...` | Unsupported operator |
+| `op '...' on '...' needs an array value` | List operator with a non-array value |
+| `expected an array of users` / `servers` | Bulk upsert input is not an array |
+| `count must be a number` | Invalid `generateUsers` count |
+| `count exceeds the maximum of 100000` | Generate count too large |
+| `generator '...' bounds must be numbers` | Non-numeric generator bound |
+| `invalid integer range for generator '...'` | `min > max` or out of range |
+| `invalid float range for generator '...'` | Non-finite or `min > max` |
+| `invalid probability for generator '...'` | Probability outside `0..=1` |
+| `generator for '...' has no choices` | Empty choice pool |
+| `unknown generator type: ...` | Unsupported generator |
+| `generated users would exceed the 64 MiB output budget` | Projected output too large |
+| `seed must be a number` | Invalid reseed |
+| `unknown method: ...` | Unsupported dispatch method |
+
+These are programming or validation errors, not matchmaking outcomes.
+
+## Debugging sequence
+
+1. Check `GET /health` without a token.
+2. Check the token with `GET /v1/contract`.
+3. Check the hub exists with `GET /v1/hubs/{id}`.
+4. For an external hub, re-run the registration to see the handshake error.
+5. For application failures, inspect `result.reason` and the current `stats`/`getUser`/`getServer`.
+6. For `413`, inspect `pendingEvents`, entity counts, argument sizes, and generation counts.
+7. For `504`/`503`, wait for the in-flight work to finish and reconcile state.
+
+See [Limits](/reference/limits) for the default budgets and [Troubleshooting](/troubleshooting) for symptom-based fixes.

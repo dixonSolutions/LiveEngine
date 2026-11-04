@@ -1,0 +1,166 @@
+---
+title: "Gogh Strike integration"
+description: "Add optional LiveEngine matchmaking to the Gogh Strike lobby through a loopback bridge, and run the bridge and e2e checks."
+---
+
+The integration adds an optional matchmaking lobby to [petergpt/gogh-strike](https://github.com/petergpt/gogh-strike). The browser talks only to a local Node bridge. The LiveEngine administrative token and any remote credential stay in the Node process and never reach browser code or URLs.
+
+Successful matchmaking selects a hub room, then starts Gogh Strike's existing **local** match simulation. It does **not** replicate player movement, combat, or match state between browsers.
+
+## What it does
+
+- Applies an optional lobby patch to an upstream Gogh Strike checkout.
+- Serves the game and a small matchmaking API from one loopback bridge.
+- Verifies `/v1/contract`, creates the configured hub if missing, registers a 12-seat room, upserts the player, and calls `autoJoin`.
+- Optionally routes through an external hub registered on a central service.
+- Keeps administrative credentials server-side.
+
+## What it does not do
+
+- No multiplayer game-state synchronization.
+- No browser-facing LiveEngine token.
+- No remote device claim; the recorded tests ran against local central/remote services.
+- No automatic installation of the upstream game or Playwright.
+
+## Prerequisites
+
+Clone the upstream game beside the LiveEngine repository:
+
+```sh
+git clone https://github.com/petergpt/gogh-strike ../gogh-strike
+```
+
+The validated upstream commit is `2285e640097d9b12bcc42af72d5e8d0b37082f51`.
+
+Apply the patch once:
+
+```sh
+patch="$PWD/integrations/gogh-strike/gogh-strike.patch"
+if git -C ../gogh-strike apply --check "$patch"; then
+  git -C ../gogh-strike apply "$patch"
+else
+  git -C ../gogh-strike apply --reverse --check "$patch"
+fi
+```
+
+The `else` branch accepts a checkout where the patch is already applied.
+
+## Run the bridge
+
+```sh
+LIVEENGINE_URL=http://127.0.0.1:8787 \
+LIVEENGINE_TOKEN=your-local-token \
+LIVEENGINE_HUB_ID=gogh-strike \
+GOGH_STRIKE_ROOT=../gogh-strike \
+node integrations/gogh-strike/bridge.mjs
+```
+
+Open `http://127.0.0.1:8967/`, select **Find a LiveEngine match**, then press **Play**.
+
+The bridge binds only to `127.0.0.1`. Do not expose it on a network interface. The upstream game's own `npm start` does not include the proxy; use the bridge command so credentials are not placed in browser storage.
+
+### Bridge configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `LIVEENGINE_URL` | none (required for matchmaking) | HTTP base URL of the hub service |
+| `LIVEENGINE_TOKEN` | none (required for matchmaking) | Administrative token for the hub service |
+| `LIVEENGINE_HUB_ID` | `gogh-strike` | Local hub ID to create or use |
+| `LIVEENGINE_HUB_MODE` | `internal` | `internal` or `external` |
+| `LIVEENGINE_REMOTE_ADDRESS` | empty | Remote base URL for an external registration |
+| `LIVEENGINE_REMOTE_HUB_ID` | `LIVEENGINE_HUB_ID` | Remote hub ID |
+| `LIVEENGINE_REMOTE_TOKEN` | empty | Remote credential (at least 24 bytes) |
+| `GOGH_STRIKE_ROOT` | `../gogh-strike` relative to repo | Game checkout |
+| `PORT` | `8967` | Bridge listen port on loopback |
+| `GOGH_MATCH_SERVER_ID` | `gogh-strike-local` | Room ID |
+| `GOGH_MATCH_CAPACITY` | `12` | Room capacity |
+
+For an external hub:
+
+```sh
+LIVEENGINE_URL=http://127.0.0.1:8787 \
+LIVEENGINE_TOKEN="$LIVEENGINE_TOKEN" \
+LIVEENGINE_HUB_ID=gogh-strike \
+LIVEENGINE_HUB_MODE=external \
+LIVEENGINE_REMOTE_ADDRESS=http://127.0.0.1:8788 \
+LIVEENGINE_REMOTE_HUB_ID=gogh-strike \
+LIVEENGINE_REMOTE_TOKEN="$LIVEENGINE_REMOTE_TOKEN" \
+GOGH_STRIKE_ROOT=../gogh-strike \
+node integrations/gogh-strike/bridge.mjs
+```
+
+The central service must allow the remote host and use matching credentials on the remote service.
+
+## Bridge endpoints and limits
+
+| Route | Behavior |
+| --- | --- |
+| `GET /health` | `{ app, hubId }` |
+| `GET /api/liveengine/status` | Configuration status; does not require a working hub |
+| `POST /api/liveengine/join` | Validates `userId`, handles already-paired users, registers and joins |
+
+The bridge:
+
+- validates the `Host` header against `127.0.0.1:PORT` and `localhost:PORT`
+- validates the `Origin` header on join requests
+- limits request bodies to 16 KiB
+- rate-limits joins to 10 per 60 seconds per socket peer
+- returns `503` when `LIVEENGINE_URL` or `LIVEENGINE_TOKEN` is missing
+- returns `409` when matchmaking returns `ok: false`, and `400` for invalid input
+- propagates an upstream HTTP status (for example `401`) when one is available, otherwise returns `502`
+
+`userId` must match `^[a-zA-Z0-9_-]{1,64}$`. Team is `0` or `1`; role is truncated to 40 characters.
+
+## Adapter test
+
+No dependencies are needed:
+
+```sh
+node --test integrations/gogh-strike/bridge.test.mjs
+```
+
+The test uses a fake local HTTP hub and verifies the contract handshake, internal and external registration, the matchmaking call sequence, and rejection of hostile Host and Origin headers.
+
+## Live end-to-end check
+
+`e2e.mjs` is an opt-in, replayable check against running HTTP services. It reads `LIVEENGINE_TOKEN` or `LIVEENGINE_TOKEN_FILE`. For an external run it also reads `LIVEENGINE_REMOTE_TOKEN` or `LIVEENGINE_REMOTE_TOKEN_FILE`.
+
+```sh
+LIVEENGINE_URL=http://127.0.0.1:8787 \
+LIVEENGINE_TOKEN_FILE=/path/to/central-token \
+LIVEENGINE_HUB_MODE=external \
+LIVEENGINE_REMOTE_URL=http://127.0.0.1:8788 \
+LIVEENGINE_REMOTE_TOKEN_FILE=/path/to/remote-token \
+node integrations/gogh-strike/e2e.mjs
+```
+
+With Compose, also set:
+
+```sh
+LIVEENGINE_REMOTE_ADDRESS=http://remote:8787
+```
+
+The test client reaches the remote through loopback port `8788`, while the central container forwards through the container hostname.
+
+Additional e2e variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `GOGH_BRIDGE_PORT` | Fixed bridge port; otherwise an ephemeral port |
+| `PLAYWRIGHT_PATH` | Path to a Playwright `index.mjs`; enables headless browser coverage |
+| `CHROMIUM_PATH` | Optional browser executable |
+| `GOGH_SCREENSHOT` | Screenshot path; default `/tmp/liveengine-gogh-lobby.png` |
+
+The e2e runner creates unique hub/room IDs and removes test hubs afterward. It asserts the remote user is `paired` and the server membership includes the user. With Playwright it checks the lobby checkbox, starts a match, verifies the LiveEngine toast, checks browser user pairing, and records page errors.
+
+## Recorded validation
+
+The repository's validation record reports:
+
+- Upstream `npm test` passed all 168 tests and `npm run build` passed.
+- The bridge adapter test passed.
+- A real central-to-remote join passed and reported `service join ok`.
+- Optional Playwright reported `phase playing` with zero page errors.
+- A wrong local bearer returned HTTP `401` with a generic message and no token reflection.
+
+The test ran against local central and remote HTTP services, not a remote physical device. The game remains locally simulated.

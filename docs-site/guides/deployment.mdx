@@ -1,0 +1,149 @@
+---
+title: "Deployment patterns"
+description: "Choose standalone, container, embedded, or external-hub deployment and plan for TLS, proxies, and in-memory state."
+---
+
+There are four common shapes. They use the same protocol and can be mixed.
+
+## 1. Standalone binary
+
+Best for a central registry or a dedicated hub host.
+
+```sh
+cargo install liveengine --bin liveengine-hub
+export LIVEENGINE_TOKEN="$(openssl rand -hex 32)"
+export LIVEENGINE_BIND=0.0.0.0:8787
+liveengine-hub
+```
+
+Or from npm:
+
+```sh
+npx liveengine-hub
+```
+
+Run it under a process supervisor, expose only the intended interface, and keep the token in a secret store. Health probe:
+
+```sh
+curl --fail --silent http://127.0.0.1:8787/health
+```
+
+## 2. Container
+
+Best for reproducible deployments and isolated central/remote pairs.
+
+```sh
+docker build -t liveengine:local .
+docker run --rm -p 127.0.0.1:8787:8787 \
+  -e LIVEENGINE_TOKEN="$LIVEENGINE_TOKEN" \
+  liveengine:local
+```
+
+The image is non-root and includes a health check. Compose examples and the custom-hub image are in [Docker and Podman](/guides/docker).
+
+## 3. Embedded in a Rust/Axum API
+
+Mount `HubService::router()` beside your application routes:
+
+```rust
+use liveengine::hub::{HubConfig, HubService};
+use std::net::SocketAddr;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let hubs = HubService::new(HubConfig::from_env()?)?;
+    let app = axum::Router::new().merge(hubs.router());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8787").await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+    Ok(())
+}
+```
+
+Use `into_make_service_with_connect_info::<SocketAddr>()` so the peer rate budget sees the real socket address. If you nest the router below a prefix, advertise that prefix in the external base address.
+
+You can also register custom handlers:
+
+```rust
+hubs.register_internal(registration, MyHandler).await?;
+```
+
+See [Embed the hub service](/rust/hub).
+
+## 4. External hub behind a central registry
+
+Run a central registry and one or more independent remote hosts. The central host forwards calls; the remote owns its state.
+
+```text
+clients ──► central registry ──► remote hub A
+                              └─► remote hub B
+```
+
+Register remotes with `mode: "external"`, an allowlisted `address`, a `remoteHubId`, and a separate `remoteToken`. See [Register an external hub](/guides/remote-hubs).
+
+## TLS and ingress
+
+The host serves plain HTTP. For anything beyond a private network:
+
+- Terminate TLS at a reverse proxy, load balancer, or ingress.
+- Forward to the host over a private network.
+- Do not trust client-supplied identity headers for authorization; the host does not trust proxy headers for its peer identity either.
+- If the proxy strips or rewrites `Authorization`, configure it to preserve the bearer token.
+
+```nginx
+location / {
+  proxy_pass http://127.0.0.1:8787;
+  proxy_set_header Host $host;
+  proxy_http_version 1.1;
+}
+```
+
+<Warning>
+The host rate-limits by the actual socket peer and ignores `X-Forwarded-For`. Behind a shared proxy, every client shares the proxy's budget. Add public-client rate limits at the proxy or give the service a dedicated address.
+</Warning>
+
+## Reverse-proxy peer-budget caveat
+
+The peer budget table has a fixed size (`LIVEENGINE_RATE_LIMIT_PEERS`, default `4096`) and refuses new peers at capacity rather than evicting active ones. With a reverse proxy in front, the table may only ever contain the proxy address. That is intentional security behavior, but it changes capacity planning: size `LIVEENGINE_RATE_LIMIT_REQUESTS` for aggregate proxy traffic, or apply per-client limits upstream.
+
+## State and restarts
+
+All of the following are in memory:
+
+- registrations and TTL state
+- users, servers, memberships
+- event queues
+- remote credentials and allowlist configuration
+
+Restarting a process loses them. If you need recovery:
+
+1. Keep the source of truth in your application database.
+2. Re-register internal hubs and external aliases at startup.
+3. Re-create rooms and players from your own records.
+4. Drain events into durable delivery before acknowledging application work.
+
+Do not assume a timed-out mutation rolled back. A handler that started continues on a blocking worker; reconcile state before retrying.
+
+## Concurrency and capacity
+
+- `LIVEENGINE_MAX_INFLIGHT_CALLS` bounds concurrent hub calls. Excess calls get `503`.
+- Internal handlers run on blocking workers; they do not block the async runtime.
+- A single process is not a horizontally scalable database. Route different hubs to different processes or add an external coordination layer if you need more capacity.
+- The registry lock is in-process. Two central replicas do not share registrations.
+
+## Deployment checklist
+
+- [ ] `LIVEENGINE_TOKEN` is random, at least 24 bytes, and stored outside the image.
+- [ ] Remote tokens are distinct per remote and also at least 24 bytes.
+- [ ] `LIVEENGINE_BIND` is the intended interface.
+- [ ] `LIVEENGINE_ALLOWED_REMOTE_HOSTS` lists only hosts you control.
+- [ ] TLS is terminated before public traffic reaches the host.
+- [ ] Health checks poll `GET /health`.
+- [ ] Proxy-level rate limits are set if a shared proxy is used.
+- [ ] A restart/re-registration procedure exists.
+- [ ] Event draining is part of the application loop.
+- [ ] Backups or rebuild logic exist for application state, not for the in-memory registry.

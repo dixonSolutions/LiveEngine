@@ -1,0 +1,130 @@
+---
+title: "Internal hubs, external hubs, and registries"
+description: "How the registry attaches internal engines and remote services, how TTL and hop limits work, and what imports actually copy."
+---
+
+A host process owns a registry of hubs. Each registration has a local **hub ID**, a mode, scopes, optional `scopeSchema`, optional TTL, and — for external hubs — a remote address, remote hub ID, and remote credential.
+
+## Internal hubs
+
+- `mode: "internal"` with an HTTP registration creates a fresh `Engine` inside the host.
+- The hub ID is both the local registry key and the default remote hub ID.
+- Calls run on a blocking worker so a long matchmaking operation does not stall the async runtime.
+- Custom internal hubs are compiled into the Rust service with `HubService::register_internal`; they are not loaded dynamically over HTTP.
+
+```json
+{
+  "id": "ranked-au",
+  "mode": "internal",
+  "scopes": { "game": "chess", "region": "au" },
+  "scopeSchema": {
+    "type": "object",
+    "required": ["region"],
+    "properties": { "region": { "type": "string", "enum": ["au", "nz"] } },
+    "additionalProperties": false
+  },
+  "ttlSeconds": 3600
+}
+```
+
+Internal registrations must not include `address`, `remoteHubId`, or `remoteToken`.
+
+## External hubs
+
+An external registration attaches an independently hosted service at its own address:
+
+```json
+{
+  "id": "remote-ranked",
+  "mode": "external",
+  "address": "https://remote.example.net",
+  "remoteHubId": "ranked-au",
+  "remoteToken": "a-separate-remote-secret-at-least-24-bytes",
+  "scopes": { "region": "au" },
+  "ttlSeconds": 3600
+}
+```
+
+At registration time the central host:
+
+1. Validates the address and checks the destination host against `LIVEENGINE_ALLOWED_REMOTE_HOSTS`.
+2. Calls the remote `GET /health` and requires `protocol === "liveengine.hub/v1"`.
+3. Calls the remote `GET /v1/contract` and checks the same protocol.
+4. Calls the remote `GET /v1/hubs/{remoteHubId}` and requires the hub to exist.
+
+If any step fails, registration returns `502` and no local registration is created. Forwarded calls use `POST /v1/hubs/{remoteHubId}/call` with the same `{ method, args }` body and `{ result }` response as internal calls, authenticated with the **remote** token. The remote credential is never returned by list, get, or import responses.
+
+Removing an external registration does not remove or stop the remote hub. It only removes the local route.
+
+## Registry discovery
+
+`GET /v1/hubs` returns public metadata for every live registration, sorted by ID:
+
+```json
+{
+  "hubs": [
+    {
+      "id": "ranked-au",
+      "mode": "internal",
+      "remoteHubId": "ranked-au",
+      "scopes": { "game": "chess", "region": "au" },
+      "scopeSchema": { "type": "object" },
+      "expiresInSeconds": 3540
+    }
+  ]
+}
+```
+
+`GET /v1/hubs/{id}` returns one record or `404`. `expiresInSeconds` is recomputed from TTL when the record is read. Expired records are removed lazily on registry access.
+
+## TTL
+
+`ttlSeconds` is optional, must be at least 1, and cannot exceed the host's `max_ttl` (default 24 hours). Expiry is in memory only:
+
+- Expired hubs disappear from discovery and calls.
+- A hub ID can be registered again after expiry.
+- Restarting the host drops every TTL and registration state.
+
+TTL registrations and permanent registrations use the same record type; omit `ttlSeconds` for a permanent registration.
+
+## Imports are snapshots
+
+`POST /v1/registries/import` reads the remote registry **now** and creates external aliases locally with an optional prefix:
+
+```json
+{
+  "address": "https://remote.example.net",
+  "token": "a-remote-administrative-token",
+  "prefix": "partner-"
+}
+```
+
+If the remote advertises `ranked-au`, the local ID becomes `partner-ranked-au`. The import:
+
+- Validates the address against the allowlist and performs health/contract handshakes.
+- Reads the remote hub list and rejects duplicates after prefixing.
+- Preserves remote `scopes` and `scopeSchema`.
+- Reuses an existing alias when address, remote hub ID, and token all match (idempotent).
+- Returns `409` when an ID is already mapped to a different target.
+- Returns `507` when the local registry would exceed `max_hubs` and `413` when the remote list is too large.
+
+Registrations added to the remote registry after the import are not discovered automatically. Run the import again to take a new snapshot. Imported aliases have no TTL.
+
+## Hub ID rules
+
+Hub IDs and remote hub IDs must be 1–128 characters of ASCII letters, digits, `.`, `_`, or `-`. The path segments `.` and `..` are rejected, as are IDs with leading or trailing whitespace. These rules prevent a hub from being unaddressable or escaping its route segment.
+
+## Forwarding hop limit
+
+Forwarded calls carry `x-liveengine-hop`:
+
+- A request without the header is treated as hop `0`.
+- Values must parse as an unsigned 8-bit integer and be at most `2`; other values return `400`.
+- When an external hub receives a call at hop `2`, it returns `508 LOOP_DETECTED`.
+- Otherwise the host forwards with `hop + 1`.
+
+This bounds forwarding chains and catches loops. The value counts forwarding steps, not application retries.
+
+## Scopes vs. scopeSchema
+
+`scopes` on a registration is metadata describing the hub; it is returned in discovery. `scopeSchema`, when present, is enforced for `upsertUser`, `upsertUsers`, `upsertServer`, and `upsertServers` calls. It is a small JSON Schema subset (object type, `required`, primitive property types, `enum`, and `additionalProperties: false`), not a general validator. Hubs with a schema reject `generateUsers`; generate users locally and submit them with `upsertUsers`.

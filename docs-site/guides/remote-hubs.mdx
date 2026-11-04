@@ -1,0 +1,155 @@
+---
+title: "Register an external hub"
+description: "Attach an independently hosted LiveEngine service or a custom liveengine.hub/v1 service to a central registry."
+---
+
+An external hub is a route from a central registry to another HTTP service. The central host performs a handshake at registration time and forwards calls with the remote credential. The remote service keeps its own state and credentials.
+
+## Requirements
+
+- The remote service must answer `GET /health` with `protocol: "liveengine.hub/v1"`.
+- It must answer `GET /v1/contract` with the same protocol.
+- It must expose the declared `remoteHubId` at `GET /v1/hubs/{remoteHubId}`.
+- The central host must list the remote hostname in `LIVEENGINE_ALLOWED_REMOTE_HOSTS`.
+- The remote token must be at least 24 bytes and must match the remote service's `LIVEENGINE_TOKEN`.
+
+A standard `liveengine-hub` process satisfies all protocol requirements. A custom service can implement the contract independently.
+
+## Two local hosts
+
+Start the central host on `8787`:
+
+```sh
+export LIVEENGINE_TOKEN="$(openssl rand -hex 32)"
+export LIVEENGINE_ALLOWED_REMOTE_HOSTS=127.0.0.1
+export LIVEENGINE_BIND=127.0.0.1:8787
+cargo run --locked --release --bin liveengine-hub
+```
+
+Start a remote host on `8788` with a **different** token:
+
+```sh
+export LIVEENGINE_TOKEN="$(openssl rand -hex 32)"
+export LIVEENGINE_BIND=127.0.0.1:8788
+cargo run --locked --release --bin liveengine-hub
+```
+
+Register an internal hub on the remote host:
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+
+const remote = new HubClient('http://127.0.0.1:8788', {
+  token: process.env.REMOTE_HUB_TOKEN,
+});
+
+await remote.register({
+  id: 'ranked-au',
+  mode: 'internal',
+  scopes: { game: 'chess', region: 'au' },
+});
+```
+
+Attach it to the central registry:
+
+```js
+const central = new HubClient('http://127.0.0.1:8787', {
+  token: process.env.LIVEENGINE_TOKEN,
+});
+
+const info = await central.register({
+  id: 'remote-ranked',
+  mode: 'external',
+  address: 'http://127.0.0.1:8788',
+  remoteHubId: 'ranked-au',
+  remoteToken: process.env.REMOTE_HUB_TOKEN,
+  scopes: { game: 'chess', region: 'au' },
+  ttlSeconds: 3600,
+});
+
+console.log(info);
+```
+
+Then call through the central registry exactly as if the hub were local:
+
+```js
+await central.call('remote-ranked', 'upsertServer', [
+  { id: 'room-1', capacity: 2, scopes: { region: 'au' } },
+]);
+await central.call('remote-ranked', 'upsertUser', [
+  { id: 'bob', scopes: { region: 'au' } },
+]);
+console.log(await central.call('remote-ranked', 'autoJoin', ['bob']));
+
+// The state lives on the remote service:
+console.log(await remote.call('ranked-au', 'getUser', ['bob']));
+```
+
+## What the central host checks
+
+Registration returns `502` if any handshake step fails:
+
+1. Health protocol.
+2. Contract protocol.
+3. Remote hub presence.
+4. Any outbound request or JSON error.
+
+Invalid local fields return `400`. A duplicate local ID returns `409`. A full registry returns `507`. The address host must be allowlisted **before** the host attempts a connection; disallowed hosts return `400`.
+
+## Credential separation
+
+- `LIVEENGINE_TOKEN` authenticates callers to the central host.
+- `remoteToken` authenticates the central host to the remote service.
+- The central registry returns public metadata only; it never returns `remoteToken`.
+- Discovery and import responses redact the remote credential.
+- Use separate secrets for every hop. Do not reuse the central token as a remote token.
+
+## Detaching
+
+```js
+await central.remove('remote-ranked');
+```
+
+Removing the registration deletes only the local route. The remote hub, its engine, and its memberships continue to exist. This is verified by the container test, which detaches an external hub and confirms the remote remains paired.
+
+## Forwarding depth
+
+Forwarded calls carry `x-liveengine-hop`:
+
+- Missing header means hop `0`.
+- Values above `2` or non-numeric values return `400`.
+- An external hub that receives a call at hop `2` returns `508` and does not forward again.
+- Other calls forward with `hop + 1`.
+
+Keep chains short. The limit is a loop and recursion guard, not a routing feature.
+
+## Compose hostnames
+
+Inside the Compose network, the central container reaches the remote by service name, not loopback:
+
+```js
+await central.register({
+  id: 'gogh-remote',
+  mode: 'external',
+  address: 'http://remote:8787',   // container-internal address
+  remoteHubId: 'gogh',
+  remoteToken: process.env.LIVEENGINE_REMOTE_TOKEN,
+  scopes: { game: 'gogh-strike' },
+});
+```
+
+The Compose central service sets `LIVEENGINE_ALLOWED_REMOTE_HOSTS=remote`. From your laptop, the same remote is reachable at `http://127.0.0.1:8788`, but the central container must use the service hostname.
+
+## Registry imports
+
+If the remote exposes several hubs, import them as a snapshot instead of registering each one:
+
+```js
+await central.importRegistry({
+  address: 'http://remote:8787',
+  token: process.env.LIVEENGINE_REMOTE_TOKEN,
+  prefix: 'partner-',
+});
+```
+
+See [Import a foreign registry](/guides/import-registry).

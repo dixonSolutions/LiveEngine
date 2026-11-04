@@ -1,0 +1,139 @@
+---
+title: "Node.js installation and platform support"
+description: "Install the npm package, understand prebuilt native binaries, source fallback, exports, and TypeScript support."
+---
+
+## Install
+
+```sh
+npm install @dixonsolutions/liveengine
+```
+
+Node.js **22 or newer** is required (`engines.node: ">=22"`).
+
+## Prebuilt binaries
+
+Release tarballs include native artifacts for:
+
+| Platform | Architecture | Notes |
+| --- | --- | --- |
+| Linux | x64 | glibc |
+| Linux | arm64 | glibc |
+| macOS | x64 | |
+| macOS | arm64 | |
+| Windows | x64 | `.exe` host binary |
+
+The package looks for:
+
+```text
+native/liveengine.<platform>-<arch>[-gnu|-musl].node
+build/Release/liveengine.node
+build/Debug/liveengine.node
+```
+
+On Linux, the loader checks the runtime glibc version and selects the `-gnu` or `-musl` artifact name. If no prebuilt artifact is present, `scripts/install.js` runs `scripts/build.js` during `npm install`.
+
+## Source fallback
+
+Building from source requires:
+
+- Rust 1.88 or newer
+- a working platform C/C++ linker toolchain
+- Node.js 22 or newer
+
+```sh
+npm ci        # installs and builds the Rust Node addon if needed
+npm run build # release build into native/
+npm run build:debug
+npm run build:hub  # standalone host binary into native/
+```
+
+`scripts/build.js` builds the Rust library with `--no-default-features --features node` and copies the resulting dynamic library into `native/`. `LIVEENGINE_BUILD_TARGET` selects a Rust target triple for cross-compilation.
+
+If the addon is missing at runtime, requiring the default entry point throws:
+
+```text
+LiveEngine native addon not built (run `npm run build`): ...
+```
+
+## Exports
+
+```json
+{
+  ".": {
+    "types": "./index.d.ts",
+    "require": "./lib/index.js",
+    "default": "./lib/index.js"
+  },
+  "./hubs": {
+    "types": "./lib/hubs.d.ts",
+    "require": "./lib/hubs.js",
+    "default": "./lib/hubs.js"
+  },
+  "./package.json": "./package.json"
+}
+```
+
+The package is CommonJS. Use `require`, or import it from an ES module with your runtime's interoperability (for example, a default import of the CommonJS namespace). The public surface is:
+
+```js
+const {
+  LiveEngine,      // EventEmitter wrapper
+  NativeEngine,    // thin native wrapper
+  nativeVersion,   // package version string
+  HubClient,       // HTTP client
+  HUB_PROTOCOL,    // 'liveengine.hub/v1'
+} = require('@dixonsolutions/liveengine');
+
+// No native addon required:
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+```
+
+`module.exports.default` is `LiveEngine`, so a default import resolves to the wrapper.
+
+## HTTP-only client
+
+The `hubs` subpath has no native dependency. It is the right entry point for:
+
+- edge workers and small services that only call a hub
+- CI jobs that do not install the native addon
+- code paths that must not load a `.node` binary
+
+```js
+const { HubClient, HUB_PROTOCOL } = require('@dixonsolutions/liveengine/hubs');
+```
+
+## TypeScript
+
+`index.d.ts` ships with the package. It covers the engine inputs and outputs, requirement forms, match options, event unions, generation specs, stats, and the `HubClient` signatures.
+
+```ts
+import {
+  LiveEngine,
+  type UserInput,
+  type MatchOptions,
+  type EngineEvent,
+  HubClient,
+} from '@dixonsolutions/liveengine';
+
+const engine = new LiveEngine({ seed: 42 });
+const user: UserInput = { id: 'alice', scopes: { rating: 1500 } };
+const options: MatchOptions = { strategy: 'affinity', affinity: ['rating'] };
+
+engine.on('paired', (event: EngineEvent) => {
+  console.log(event.userId, event.serverId);
+});
+
+engine.upsertUser(user);
+engine.autoJoin('alice', options);
+
+const hub = new HubClient('http://127.0.0.1:8787', { token: process.env.LIVEENGINE_TOKEN! });
+```
+
+Types are declarations only. No separate `@types` package is required.
+
+## Version
+
+`nativeVersion` is the npm package version, currently `0.2.2`. It is not read from the native binary.
+
+See the [Node engine reference](/node/engine) and [HubClient reference](/node/hub-client).

@@ -1,0 +1,184 @@
+---
+title: "Embed the hub service"
+description: "Mount HubService in an Axum API, implement HubHandler, register internal hubs, and run the standalone binary."
+---
+
+The `host` feature exposes `liveengine::hub`, including `HubService`, `HubConfig`, `HubHandler`, `HubRegistration`, and `HubMode`. It is enabled by default.
+
+## Mount in Axum
+
+```rust
+use liveengine::hub::{HubConfig, HubService};
+use std::net::SocketAddr;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let hubs = HubService::new(HubConfig::from_env()?)?;
+    let app = axum::Router::new().merge(hubs.router());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8787").await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+    Ok(())
+}
+```
+
+`HubService::router()` owns these routes:
+
+```text
+GET    /health
+GET    /v1/contract
+GET    /v1/contract/schema
+GET    /v1/hubs
+POST   /v1/hubs
+GET    /v1/hubs/{id}
+DELETE /v1/hubs/{id}
+POST   /v1/hubs/{id}/call
+POST   /v1/registries/import
+```
+
+It applies the body limit and the authentication/rate/timeout middleware. Merge it after your application routes, or nest it deliberately and account for the prefix in external addresses.
+
+<Warning>
+Use `into_make_service_with_connect_info::<SocketAddr>()`. Without connect info, the host cannot see the socket peer and falls back to a shared `"unavailable-peer"` budget key.
+</Warning>
+
+If you nest the hub router under a path prefix, remote clients must include that prefix in their base address. The router itself does not rewrite paths.
+
+## Register an internal handler
+
+```rust
+use liveengine::hub::{
+    HubConfig, HubHandler, HubMode, HubRegistration, HubService,
+};
+use serde_json::{json, Value};
+
+struct Echo;
+
+impl HubHandler for Echo {
+    fn call(&mut self, method: &str, args: Vec<Value>) -> Result<Value, String> {
+        Ok(json!({ "method": method, "args": args }))
+    }
+}
+
+let service = HubService::new(HubConfig::from_env()?)?;
+
+let registration: HubRegistration = serde_json::from_value(json!({
+    "id": "echo",
+    "mode": "internal",
+    "scopes": { "kind": "echo" }
+}))?;
+
+service.register_internal(registration, Echo).await?;
+```
+
+`register_internal` returns `Result<HubInfo, String>` and:
+
+- requires `mode: "internal"`
+- validates ID, scopes, and optional `scopeSchema`
+- rejects `address`, `remoteHubId`, and `remoteToken`
+- accepts `ttlSeconds` in `1..=max_ttl`
+- rejects duplicates and a full registry
+
+Registration through HTTP (`POST /v1/hubs` with `mode: "internal"`) creates an `Engine` automatically. There is no API to attach an arbitrary handler over HTTP; custom handlers must be compiled into the service.
+
+## HubHandler
+
+```rust
+pub trait HubHandler: Send {
+    fn call(&mut self, method: &str, args: Vec<Value>) -> Result<Value, String>;
+
+    fn preflight(
+        &mut self,
+        _method: &str,
+        _args: &[Value],
+        _config: &HubConfig,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+```
+
+- `call` runs on a blocking worker; keep it free of long async awaits because it is synchronous.
+- `preflight` runs before `call` under the handler lock. Default is `Ok(())`.
+- A preflight error becomes `413`.
+- A call error becomes `400`.
+- A panic becomes `500`; a poisoned lock becomes `503`; a concurrent call that cannot acquire the lock becomes `409`.
+- `Engine` implements `HubHandler`, so engine hubs and custom hubs share the same transport, limits, and event/result checks.
+
+See [Host a custom in-process handler](/guides/custom-handler) for a full counter example and container packaging.
+
+## HubService API
+
+```rust
+pub struct HubService { /* cloneable Arc state */ }
+
+impl HubService {
+    pub fn new(config: HubConfig) -> Result<Self, String>;
+    pub fn router(&self) -> axum::Router;
+    pub async fn register_internal<H>(
+        &self,
+        registration: HubRegistration,
+        handler: H,
+    ) -> Result<HubInfo, String>
+    where
+        H: HubHandler + 'static;
+}
+```
+
+`HubService` is cloneable and cheap to share. `HubService::new` validates the config, builds the outbound client with redirects disabled, and creates the in-flight semaphore.
+
+## DTOs
+
+The Rust types serialize with camelCase field names:
+
+```rust
+use liveengine::hub::{HubMode, HubRegistration};
+
+let registration: HubRegistration = serde_json::from_value(json!({
+    "id": "remote-ranked",
+    "mode": "external",
+    "address": "https://remote.example.net",
+    "remoteHubId": "ranked-au",
+    "remoteToken": "a-remote-secret-at-least-24-bytes",
+    "scopes": { "region": "au" },
+    "ttlSeconds": 3600
+}))?;
+
+assert_eq!(registration.mode, HubMode::External);
+```
+
+`HubRegistration` uses `deny_unknown_fields`, matching the HTTP JSON parser. Unknown fields are rejected.
+
+## Standalone binary
+
+The binary is `src/bin/liveengine-hub.rs`, named `liveengine-hub`, and requires the `host` feature:
+
+```sh
+cargo run --locked --release --bin liveengine-hub
+cargo install liveengine --bin liveengine-hub
+```
+
+It reads `HubConfig::from_env()`, parses `LIVEENGINE_BIND` (default `127.0.0.1:8787`), binds the listener, and serves the router with connect info. Startup failures print to stderr and exit non-zero:
+
+```text
+liveengine-hub: LIVEENGINE_TOKEN must be set
+liveengine-hub: LIVEENGINE_TOKEN must be at least 24 bytes
+liveengine-hub: invalid LIVEENGINE_BIND: ...
+liveengine-hub: could not bind 127.0.0.1:8787: ...
+```
+
+## Configuration
+
+`HubConfig` controls tokens, allowlists, limits, timeouts, TTL, and the seed. See [Rust configuration](/rust/config) for every field and default, and [Environment reference](/reference/environment) for the standalone variable mapping.
+
+## Operational notes
+
+- State is in memory; restarting loses registrations and engines.
+- The router does not persist, replicate, or elect a leader between processes.
+- Outbound calls use the configured request timeout and never follow redirects.
+- Remote hosts must be allowlisted before any connection is attempted.
+- The response to a timed-out handler does not cancel the handler; reconcile before retrying.

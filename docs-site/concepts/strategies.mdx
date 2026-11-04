@@ -1,0 +1,112 @@
+---
+title: "Matching strategies"
+description: "How first, random, leastLoaded, mostLoaded, and affinity order results, including score and limit semantics."
+---
+
+Every match query accepts the same options object:
+
+```ts
+interface MatchOptions {
+  limit?: number;          // 0 = unlimited, default 10
+  strategy?: 'first' | 'random' | 'leastLoaded' | 'mostLoaded' | 'affinity';
+  affinity?: Array<string | { key: string; weight?: number }> | Record<string, number>;
+}
+```
+
+`autoJoin` and `matchAll` force `limit` to `1` internally.
+
+## Strategies
+
+| Strategy | Order | Score |
+| --- | --- | --- |
+| `first` | Arrival order (`seq`), with early exit at `limit` | The candidate's `seq` |
+| `random` | Shuffled, then truncated to `limit` | Post-shuffle index |
+| `leastLoaded` | Fewest current members first | `load` |
+| `mostLoaded` | Most current members first | `-load` |
+| `affinity` | Closest numeric scope values first | Weighted absolute difference |
+
+`first` is the default. `limit <= 0` means unlimited. A positive non-integer limit is truncated.
+
+```js
+const options = { strategy: 'leastLoaded', limit: 5 };
+engine.findServersForUser('alice', options);
+```
+
+## first
+
+Servers and users are indexed by arrival sequence. `first` returns candidates in that sequence order, adding `limit: 1` early exit when the strategy is `first`. This is FIFO matchmaking; it does not sort by ID.
+
+## random
+
+All fitting candidates are collected, shuffled with the engine's seeded RNG, and then truncated. Two engines with the same seed and the same operations produce the same random order.
+
+## leastLoaded and mostLoaded
+
+These are most useful for `findServersForUser`, where `load` is the server's current member count.
+
+```js
+engine.findServersForUser('alice', { strategy: 'leastLoaded' });
+// fewest members first
+
+engine.findServersForUser('alice', { strategy: 'mostLoaded', limit: 1 });
+// fullest available server first
+```
+
+For `findUsersForServer`, every match record has `load: 0` and the engine does not recompute a load score. Both strategies therefore fall back to sequence order for that direction. Use `first` or `affinity` when querying users for a server.
+
+## affinity
+
+`affinity` ranks candidates by numeric closeness on one or more scope keys. Scores are **lower-is-better**; results are sorted ascending.
+
+```js
+engine.findServersForUser('alice', { affinity: ['rating'] });
+engine.findServersForUser('alice', { affinity: [{ key: 'rating', weight: 2 }, 'latency'] });
+engine.findServersForUser('alice', { affinity: { rating: 1, latency: 0.5 } });
+```
+
+Rules:
+
+- A string entry uses weight `1`.
+- An object entry uses `{ key, weight }`, with weight defaulting to `1`.
+- A record entry maps each key to a numeric weight. A non-numeric weight becomes `0`.
+- The score is `sum(weight * abs(mine[key] - theirs[key]))`.
+- Booleans coerce to `0`/`1`.
+- If both values exist but are not both numeric, the term is `weight * 0` when the values are equal and `weight * 1e6` otherwise.
+- If either value is absent, the term is `weight * 1e6`.
+
+Setting `affinity` **without** an explicit `strategy` selects the `affinity` strategy. If you pass both, the explicit strategy wins.
+
+```js
+// affinity strategy selected automatically
+engine.findServersForUser('alice', { affinity: ['rating'] });
+
+// explicit strategy wins; affinity weights are ignored for ordering
+engine.findServersForUser('alice', { strategy: 'first', affinity: ['rating'] });
+```
+
+## Score values are not normalized
+
+`score` is strategy-internal:
+
+- `first`: arrival sequence
+- `leastLoaded`: member count
+- `mostLoaded`: negative member count
+- `affinity`: weighted absolute difference
+- `random`: post-shuffle index
+
+Do not compare scores across strategies or across separate queries; use them only relative to the result set in which they appear.
+
+## Practical combinations
+
+```js
+// Pair the oldest waiting player with the closest-skill room.
+engine.autoJoin('alice', { strategy: 'affinity', affinity: ['rating'] });
+
+// Advertise up to 20 fitting rooms, oldest first.
+engine.advertise('alice', { limit: 20 });
+
+// Fill every waiting user into the emptiest room.
+engine.matchAll({ strategy: 'leastLoaded' });
+```
+
+`matchAll` still walks waiting users in arrival order; the strategy only controls each user's candidate ordering.

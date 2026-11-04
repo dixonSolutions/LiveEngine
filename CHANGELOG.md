@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2 — 2026-11-04
+
+- Added the Mintlify developer documentation site in `docs-site/`, including the full
+  Node and Rust API references, hub protocol reference, deployment guides, and a
+  framework recipe section for Express, Fastify, NestJS, Next.js, Axum, and Actix Web.
+- Added runnable framework examples in `examples/frameworks/` and
+  `examples/axum-service.rs`, and linked the documentation from the README.
+- Connected the repository to Mintlify so pushes to `main` deploy the docs.
+
 ## 0.2.1 — 2026-11-04
 
 - Published 0.2.0 to npm and crates.io, then configured OIDC trusted publishers for

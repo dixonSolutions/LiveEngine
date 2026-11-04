@@ -1,0 +1,74 @@
+---
+title: "Axum"
+description: "Embed LiveEngine's HubService router in an existing Axum application."
+---
+
+`HubService::router()` returns an Axum `Router`. Merge it with your own routes to serve application APIs and the hub contract from one listener.
+
+## Run the repository example
+
+```sh
+LIVEENGINE_TOKEN="$(openssl rand -hex 32)" \
+LIVEENGINE_BIND=127.0.0.1:8787 \
+cargo run --example axum-service
+```
+
+```sh
+curl -s http://127.0.0.1:8787/api/health
+curl -s -H "Authorization: Bearer $LIVEENGINE_TOKEN" \
+  http://127.0.0.1:8787/v1/contract
+```
+
+## Example
+
+```rust
+use axum::{routing::get, Json, Router};
+use liveengine::hub::{HubConfig, HubRegistration, HubService};
+use serde_json::{json, Value};
+use std::net::SocketAddr;
+
+async fn app_health() -> Json<Value> {
+    Json(json!({ "app": "ok" }))
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let hubs = HubService::new(HubConfig::from_env()?)?;
+
+    let registration: HubRegistration = serde_json::from_value(json!({
+        "id": "ranked",
+        "mode": "internal",
+        "scopes": { "game": "chess", "region": "au" },
+        "scopeSchema": {
+            "type": "object",
+            "required": ["region"],
+            "properties": { "region": { "type": "string" } }
+        }
+    }))?;
+    hubs.register_internal(registration, liveengine::Engine::new(0))
+        .await?;
+
+    let app = Router::new()
+        .route("/api/health", get(app_health))
+        .merge(hubs.router());
+
+    let bind = std::env::var("LIVEENGINE_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+    Ok(())
+}
+```
+
+## Important details
+
+- **Use `into_make_service_with_connect_info`.** The peer request budget reads `ConnectInfo<SocketAddr>`. Without it, every request shares the `"unavailable-peer"` bucket.
+- **`HubConfig::from_env()` requires `LIVEENGINE_TOKEN`.** Keep the token at least 24 bytes. Configure `LIVEENGINE_ALLOWED_REMOTE_HOSTS` before registering external hubs.
+- **Mounting under a prefix.** If you nest the router under `/matchmaking`, set the external base address to include that prefix when other services register this host.
+- **Custom handlers.** `register_internal` accepts any `HubHandler`. Implement `preflight` to reject oversized or invalid mutations before they change your state.
+- **Shutdown.** The hub is in-process; stopping the Axum server stops the registry. State is in memory and is not persisted.
+
+For a router-free integration, depend on `liveengine` with `default-features = false` and use `Engine` directly. See [Rust engine](/rust/engine).

@@ -1,0 +1,128 @@
+---
+title: "Limits and defaults"
+description: "Host, client, engine, TTL, forwarding, and generation limits with their defaults and enforcement points."
+---
+
+Limits fall into four groups: host configuration, per-engine budgets, protocol/forwarding limits, and SDK client limits.
+
+## Host configuration defaults
+
+| Setting | `HubConfig` field | Environment variable | Default |
+| --- | --- | --- | --- |
+| Administrative token | `token` | `LIVEENGINE_TOKEN` | required, >= 24 bytes |
+| Remote allowlist | `allowed_remote_hosts` | `LIVEENGINE_ALLOWED_REMOTE_HOSTS` | empty |
+| Registered hubs | `max_hubs` | `LIVEENGINE_MAX_HUBS` | `256` |
+| Request body | `max_request_bytes` | `LIVEENGINE_MAX_BODY_BYTES` | `1048576` |
+| Response body | `max_response_bytes` | `LIVEENGINE_MAX_RESPONSE_BYTES` | `4194304` |
+| Arguments | `max_args` | `LIVEENGINE_MAX_ARGS` | `256` |
+| Entities per engine | `max_entities` | `LIVEENGINE_MAX_ENTITIES` | `100000` |
+| Events per engine | `max_events` | `LIVEENGINE_MAX_EVENTS` | `100000` |
+| Generated per call | `max_generates_per_call` | `LIVEENGINE_MAX_GENERATE` | `10000` |
+| In-flight calls | `max_inflight_calls` | `LIVEENGINE_MAX_INFLIGHT_CALLS` | `16` |
+| Requests per window | `rate_limit_requests` | `LIVEENGINE_RATE_LIMIT_REQUESTS` | `120` |
+| Rate window | `rate_limit_window` | `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` | `60` seconds |
+| Tracked peers | `rate_limit_peers` | `LIVEENGINE_RATE_LIMIT_PEERS` | `4096` |
+| Request timeout | `request_timeout` | none | 5 seconds |
+| Maximum TTL | `max_ttl` | none | 24 hours |
+| Engine seed | `seed` | `LIVEENGINE_SEED` | `0` |
+
+`request_timeout` and `max_ttl` are Rust-only. See [Rust configuration](/rust/config).
+
+## Entity budget
+
+`max_entities` bounds `users + servers` for each internal engine. Preflight estimates newly added entities before a mutation:
+
+- `upsertUser` / `upsertServer`: one possible new entity.
+- Bulk upserts: count unique IDs that do not already exist.
+- `generateUsers`: generated count added to the current total.
+
+Exceeding the budget returns `413` before the mutation runs. The result is also checked for nested `entities` counts.
+
+Direct local `Engine` use is **not** subject to the host entity budget; only the embedding application controls it.
+
+## Event budget
+
+`max_events` bounds the pending event queue for each internal engine. Preflight projects events per method:
+
+| Method | Projected events |
+| --- | --- |
+| `upsertUser`, `removeUser`, `setUserStatus` | 3 |
+| `upsertUsers` | array length |
+| `upsertServer`, `setServerStatus` | 2 |
+| `upsertServers` | array length × 2 |
+| `generateUsers` | count |
+| `removeServer` | members × 2 + 1 |
+| `join`, `autoJoin` | 4 |
+| `leave` | 2 |
+| `matchAll` | users × 5 |
+| `advertise` | 1 |
+| `advertiseAll` | users |
+| `clear` | 1, with pending treated as 0 |
+| Read-only methods | 0 |
+
+If pending plus projected exceeds `max_events`, the call returns `413` before mutation. Drain events in your application loop. The result is also checked for nested `events` counts.
+
+## Request and result limits
+
+| Check | Default | Result |
+| --- | --- | --- |
+| Body size | 1 MiB | `413` |
+| Serialized call size | 1 MiB | `413` |
+| Argument count | 256 | `413` |
+| Argument nesting depth | 64 | `400` |
+| Method length | 1–128 bytes | `400` |
+| Generated count per call | 10000 | `413` |
+| Response size | 4 MiB | `413` |
+| In-flight calls | 16 | `503` |
+
+The 64 MiB generation output budget is enforced by the engine itself, independently of the host response limit.
+
+## Protocol limits
+
+| Item | Limit |
+| --- | --- |
+| Hub ID / remote hub ID | 1–128 chars, `A-Z a-z 0-9 . _ -`, not `.` or `..` |
+| Import prefix | 0–64 chars, same character set (empty allowed) |
+| Remote address length | 2048 bytes |
+| Remote token | at least 24 bytes |
+| TTL | at least 1 second, at most `max_ttl` (default 86400 seconds) |
+| Forwarding hop | `0`, `1`, `2`; external at `2` gets `508` |
+| JSON nesting | 64 |
+
+## Client defaults
+
+`HubClient` has its own limits, independent of the host:
+
+| Option | Default |
+| --- | --- |
+| `timeoutMs` | `5000` |
+| `maxResponseBytes` | `1048576` (1 MiB) |
+
+If the host's response limit is larger than the client's, the client still rejects a larger response. Raise `maxResponseBytes` when calling methods that return large lists or event arrays.
+
+## Direct engine generation limits
+
+When using `Engine` directly (Node `LiveEngine`, Rust `Engine`), there is no HTTP body or hub budget. The engine still enforces:
+
+- `generateUsers` count above `100000`: error.
+- Projected generated output above 64 MiB: error.
+- Invalid generator definitions: error before mutation.
+- Requirement parse errors: error at upsert time.
+
+Everything else is bounded only by process memory.
+
+## Timeout semantics
+
+- `request_timeout` applies to the whole request, including handler execution and remote forwarding.
+- A timed-out internal handler is **not** cancelled. It keeps its in-flight permit and handler lock until it returns.
+- Capacity stays occupied, and a retry may get `503` or `409` until the first call finishes.
+- A timed-out remote request is cancelled at the HTTP client, but the remote service may still be processing it.
+
+## Choosing limits
+
+- Size `max_hubs` for expected registrations, including imports.
+- Size `max_entities` and `max_events` for the largest single engine, not the total across hubs.
+- Keep `max_inflight_calls` low enough that blocking handlers cannot exhaust worker threads.
+- Set `max_request_bytes` above your largest valid bulk upsert.
+- Set client `maxResponseBytes` above the largest result you expect, especially `drainEvents`.
+- Use proxy-level rate limits when clients share a reverse proxy.

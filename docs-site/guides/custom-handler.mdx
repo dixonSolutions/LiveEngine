@@ -1,0 +1,170 @@
+---
+title: "Host a custom in-process handler"
+description: "Implement HubHandler in Rust, register it beside matchmaking hubs, and package it as a container."
+---
+
+An internal hub does not have to be a matchmaking engine. You can compile an arbitrary handler into a Rust service, register it with the same registry, and expose application-specific methods and DTOs over the same HTTP contract.
+
+## Minimal handler
+
+```rust
+use liveengine::hub::{HubConfig, HubHandler, HubRegistration, HubService};
+use serde_json::{json, Value};
+use std::net::SocketAddr;
+
+#[derive(Default)]
+struct CounterHub {
+    count: u64,
+}
+
+impl HubHandler for CounterHub {
+    fn call(&mut self, method: &str, args: Vec<Value>) -> Result<Value, String> {
+        match method {
+            "increment" => {
+                let amount = args.first().and_then(Value::as_u64).unwrap_or(1);
+                self.count = self.count.checked_add(amount).ok_or("counter overflow")?;
+                Ok(json!({ "count": self.count }))
+            }
+            "read" => Ok(json!({ "count": self.count })),
+            _ => Err("unknown counter method".into()),
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let service = HubService::new(HubConfig::from_env()?)?;
+
+    let registration: HubRegistration = serde_json::from_value(json!({
+        "id": "counter",
+        "mode": "internal",
+        "scopes": { "kind": "custom-counter", "region": "au" }
+    }))?;
+
+    service.register_internal(registration, CounterHub::default()).await?;
+
+    let bind = std::env::var("LIVEENGINE_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    eprintln!("custom hub listening on {bind}");
+    axum::serve(
+        listener,
+        service
+            .router()
+            .into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+    Ok(())
+}
+```
+
+The full example is `examples/custom-hub.rs`:
+
+```sh
+LIVEENGINE_TOKEN="$(openssl rand -hex 32)" cargo run --example custom-hub
+```
+
+Call it like any other hub:
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+
+const hub = new HubClient('http://127.0.0.1:8787', {
+  token: process.env.LIVEENGINE_TOKEN,
+});
+
+console.log(await hub.call('counter', 'increment', [7])); // { count: 7 }
+console.log(await hub.call('counter', 'read'));           // { count: 7 }
+```
+
+Arbitrary JSON arguments and results are allowed within the configured request/response, argument-count, and nesting limits.
+
+## HubHandler
+
+```rust
+pub trait HubHandler: Send {
+    fn call(&mut self, method: &str, args: Vec<Value>) -> Result<Value, String>;
+    fn preflight(
+        &mut self,
+        _method: &str,
+        _args: &[Value],
+        _config: &HubConfig,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+```
+
+- `call` runs on a blocking worker and must return a JSON result or an error string.
+- `preflight` runs before `call` while the handler lock is held. The default is `Ok(())`.
+- `Engine` implements `HubHandler`: `call` dispatches engine methods and `preflight` enforces engine entity/event budgets.
+- An error returned from `preflight` becomes HTTP `413` with the error message.
+- An error returned from `call` becomes HTTP `400`.
+- A panic in the worker becomes `500`; a poisoned lock becomes `503`.
+
+Use `preflight` for application validation that must happen before mutation. Because it runs before `call`, a rejected preflight leaves handler state unchanged.
+
+```rust
+fn preflight(&mut self, method: &str, args: &[Value], config: &HubConfig) -> Result<(), String> {
+    if method != "increment" {
+        return Ok(());
+    }
+    let amount = args.first().and_then(Value::as_u64).unwrap_or(1);
+    if amount > config.max_generates_per_call as u64 {
+        return Err("increment is too large".into());
+    }
+    Ok(())
+}
+```
+
+The error text is your own; the transport status is fixed by where it is returned.
+
+## Registration rules
+
+`register_internal` requires `mode: "internal"` and rejects remote fields:
+
+```rust
+let registration: HubRegistration = serde_json::from_value(json!({
+    "id": "counter",
+    "mode": "internal",
+    "scopes": { "kind": "custom-counter" },
+    "scopeSchema": {
+        "type": "object",
+        "required": ["region"],
+        "properties": { "region": { "type": "string" } },
+        "additionalProperties": false
+    },
+    "ttlSeconds": 3600
+}))?;
+```
+
+`register_internal` returns `Err(String)` for:
+
+- a mode other than `internal`
+- invalid ID, scopes, or schema
+- `address`, `remoteHubId`, or `remoteToken` on an internal registration
+- a TTL of zero or above `max_ttl`
+- a duplicate ID (`hub id already registered`)
+- a full registry (`hub registry is full`)
+
+If a `scopeSchema` is present, the host validates `upsertUser`, `upsertUsers`, `upsertServer`, and `upsertServers` calls before your handler sees them. Custom methods are not schema-validated automatically.
+
+## Package it as a container
+
+```sh
+docker build -f Dockerfile.custom -t liveengine-counter .
+docker run --rm -p 8787:8787 \
+  -e LIVEENGINE_TOKEN="$LIVEENGINE_TOKEN" \
+  liveengine-counter
+```
+
+The custom image runs as a non-root user, exposes port `8787`, and uses the same entrypoint pattern as the standard host. Register it from a central registry exactly as in [Register an external hub](/guides/remote-hubs).
+
+## When to use a custom handler
+
+Use a custom handler when:
+
+- The operation is not matchmaking but belongs in the same registry and auth boundary.
+- You need application DTOs, side effects, or a result shape the engine does not provide.
+- You want an in-process call path without an extra network hop.
+
+Use a normal internal hub when you need the built-in engine semantics. Use an external service when the implementation must be deployed and scaled independently.

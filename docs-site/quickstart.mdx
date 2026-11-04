@@ -1,0 +1,180 @@
+---
+title: "Quickstart"
+description: "Install LiveEngine, run a local match, start a standalone hub, check health, and bring up the Docker Compose example."
+---
+
+This page gets you from zero to a working match and a running hub. Every other guide builds on these commands.
+
+## 1. Install
+
+```sh
+npm install @dixonsolutions/liveengine
+```
+
+Node.js 22 or newer is required. Release tarballs include prebuilt native binaries for Linux x64/arm64 (glibc), macOS x64/arm64, and Windows x64. Other platforms compile from the included Rust source and need Rust 1.88+ and the platform linker.
+
+If you only need the HTTP client and never load the native engine, import the `hubs` subpath:
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+```
+
+## 2. Run a first local match
+
+```js
+const { LiveEngine } = require('@dixonsolutions/liveengine');
+
+const engine = new LiveEngine({ seed: 42 });
+
+engine.on('paired', event => {
+  console.log('paired', event.userId, 'into', event.serverId);
+});
+
+engine.upsertServer({
+  id: 'room-au',
+  capacity: 2,
+  minMembers: 2,
+  scopes: { game: 'chess', region: 'au', rating: 1500 },
+  requirements: { rating: { between: [1300, 1700] } },
+});
+
+engine.upsertUser({
+  id: 'player',
+  scopes: { game: 'chess', rating: 1450 },
+  requirements: { game: 'chess', region: 'au' },
+});
+
+const result = engine.pair('player');
+console.log(result);
+// { ok: true, reason: null, userId: 'player', serverId: 'room-au', server: { ... } }
+```
+
+A match must satisfy the user's requirements against the server's scopes **and** the server's requirements against the user's scopes. The server must also be `open` with free capacity. See [Lifecycle](/concepts/lifecycle) and [Requirements](/concepts/requirements).
+
+## 3. Use the Rust crate
+
+```toml
+[dependencies]
+liveengine = "0.2"
+```
+
+```rust
+use liveengine::Engine;
+use serde_json::json;
+
+fn main() -> Result<(), String> {
+    let mut engine = Engine::new(42);
+
+    engine.dispatch(
+        "upsertServer",
+        vec![json!({
+            "id": "room-au",
+            "capacity": 2,
+            "scopes": { "game": "chess", "region": "au" },
+            "requirements": { "region": "au" }
+        })],
+    )?;
+
+    engine.dispatch(
+        "upsertUser",
+        vec![json!({
+            "id": "player",
+            "scopes": { "region": "au" },
+            "requirements": { "game": "chess" }
+        })],
+    )?;
+
+    let result = engine.dispatch("autoJoin", vec![json!("player")])?;
+    println!("{result}");
+    Ok(())
+}
+```
+
+For an engine-only dependency without hosting dependencies:
+
+```toml
+[dependencies]
+liveengine = { version = "0.2", default-features = false }
+```
+
+## 4. Start a standalone hub
+
+The host requires a token of at least 24 bytes. Generate a strong one and keep it in server-side configuration.
+
+```sh
+export LIVEENGINE_TOKEN="$(openssl rand -hex 32)"
+export LIVEENGINE_BIND=0.0.0.0:8787
+
+# Cargo checkout:
+cargo run --locked --release --bin liveengine-hub
+
+# npm-installed command:
+npx liveengine-hub
+```
+
+`LIVEENGINE_BIND` defaults to `127.0.0.1:8787`. Use a LAN or Tailscale interface only when you intend another device to reach it. For Internet deployment, terminate HTTPS at an ingress.
+
+## 5. Check health and the contract
+
+`GET /health` is unauthenticated. Data endpoints require `Authorization: Bearer <token>`.
+
+```sh
+curl --fail --silent http://127.0.0.1:8787/health
+# {"status":"ok","protocol":"liveengine.hub/v1","uptimeSeconds":12}
+
+curl --silent -H "Authorization: Bearer $LIVEENGINE_TOKEN" \
+  http://127.0.0.1:8787/v1/contract
+```
+
+Register an internal hub and make a call with `HubClient`:
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+
+const central = new HubClient('http://127.0.0.1:8787', {
+  token: process.env.LIVEENGINE_TOKEN,
+});
+
+await central.contract();
+await central.register({
+  id: 'ranked-au',
+  mode: 'internal',
+  scopes: { game: 'chess', region: 'au' },
+});
+
+await central.call('ranked-au', 'upsertServer', [
+  { id: 'room-1', capacity: 2, scopes: { region: 'au' } },
+]);
+await central.call('ranked-au', 'upsertUser', [
+  { id: 'alice', scopes: { region: 'au' } },
+]);
+
+const result = await central.call('ranked-au', 'autoJoin', ['alice']);
+console.log(result);
+```
+
+## 6. Docker Compose
+
+```sh
+cp .env.example .env
+# Set independent random secrets in .env before continuing.
+docker compose up --build -d
+```
+
+The Compose example hosts:
+
+- `central` on `${LIVEENGINE_LISTEN_IP:-127.0.0.1}:8787`, with `LIVEENGINE_ALLOWED_REMOTE_HOSTS=remote`
+- `remote` on loopback port `8788`
+
+They use separate tokens. No hub IDs are hard-coded in either image; registrations are runtime operations. See [Docker](/guides/docker) for the central-and-remote walkthrough.
+
+<Warning>
+Compose state is in memory. Restarting a container loses its registrations, users, memberships, and events. Re-register external hubs after a restart if you need forwarding again.
+</Warning>
+
+## Next steps
+
+- [Hosting a hub](/guides/hosting): environment, bind, and limits.
+- [Register an external hub](/guides/remote-hubs): attach an independently hosted service.
+- [Hub protocol](/protocol/overview): the exact contract.
+- [Environment reference](/reference/environment): every `LIVEENGINE_*` variable.

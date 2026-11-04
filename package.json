@@ -1,6 +1,6 @@
 {
   "name": "@dixonsolutions/liveengine",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Rust live matchmaking with embedded and standalone hub hosting, custom scopes, and authenticated remote hub registries",
   "main": "lib/index.js",
   "types": "index.d.ts",
@@ -42,6 +42,7 @@
     "LICENSE",
     "docs/hub-contract.schema.json",
     "examples/*.rs",
+    "examples/frameworks",
     "docs/*.md"
   ],
   "scripts": {
@@ -55,7 +56,9 @@
     "bench": "node bench/bench.js",
     "example": "node examples/math-game/server.js",
     "hub": "node bin/liveengine-hub.js",
-    "test:integration": "node --test integrations/gogh-strike/bridge.test.mjs"
+    "test:integration": "node --test integrations/gogh-strike/bridge.test.mjs",
+    "docs:dev": "cd docs-site && npx mint@latest dev",
+    "docs:validate": "cd docs-site && npx mint@latest validate && npx mint@latest broken-links"
   },
   "bin": {
     "liveengine-hub": "bin/liveengine-hub.js"

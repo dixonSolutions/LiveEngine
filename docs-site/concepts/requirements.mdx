@@ -1,0 +1,136 @@
+---
+title: "Requirements and scopes"
+description: "Every requirement operator, shorthand form, coercion rule, and missing-key behavior."
+---
+
+Scopes describe a user or server. Requirements are rules evaluated against the other side's scopes. Matching is always bidirectional: server requirements are evaluated against user scopes, and user requirements are evaluated against server scopes.
+
+## Scope values
+
+A scope is a JSON value: number, boolean, string, string array, or `null`. Arrays are normalized to **arrays of strings** when stored:
+
+- numbers become their decimal string (`1` becomes `"1"`)
+- booleans become `"true"` or `"false"`
+- `null` becomes `"null"`
+- nested arrays are joined with commas
+- objects become `"[object Object]"`
+
+This normalization is why a `contains` rule with the number `1` can match a stored array containing `"1"`.
+
+## Three requirement forms
+
+### Shorthand object
+
+```js
+{
+  region: 'au',                          // eq
+  rating: { between: [1200, 1800] },     // explicit operator
+  tags: ['ranked', 'duo'],               // array shorthand means "in"
+  premium: true                          // eq
+}
+```
+
+In an object rule, each key of the operator object is an operator:
+
+```js
+{ rating: { gte: 1200, lt: 2000 } }
+```
+
+### Array of rules
+
+```js
+[
+  { key: 'rating', op: 'gte', value: 1200 },
+  { key: 'region', op: 'in', value: ['au', 'nz'] }
+]
+```
+
+A rule's `key` defaults to `"undefined"`, `op` defaults to `"eq"`, and `value` defaults to `null`, but always provide all three in hand-written rules.
+
+### Rule set with all/any
+
+```js
+{
+  rules: [
+    { key: 'region', op: 'eq', value: 'au' },
+    { key: 'rating', op: 'gte', value: 1500 }
+  ],
+  match: 'any'
+}
+```
+
+`match` defaults to `all`. Only the literal `"any"` selects OR semantics; everything else is AND. An empty rule list evaluates to `true` for both modes. An absent or `null` requirement value becomes `{ rules: [], match: 'all' }`.
+
+## Operators
+
+| Operator | Aliases | Value type | Behavior |
+| --- | --- | --- | --- |
+| `eq` | `==` | any | JSON equality, or numeric equality after boolean coercion |
+| `ne` | `!=` | any | Negation of `eq` |
+| `lt` | `<` | number/string | Numeric comparison if both coerce to numbers, otherwise lexicographic string comparison |
+| `lte` | `<=` | number/string | Numeric or string comparison |
+| `gt` | `>` | number/string | Numeric or string comparison |
+| `gte` | `>=` | number/string | Numeric or string comparison |
+| `in` | - | array | Target equals at least one array element (using `eq`) |
+| `nin` | - | array | Target equals no array element |
+| `between` | - | array of at least 2 | Inclusive numeric range: `value[0] <= target <= value[1]` |
+| `exists` | - | ignored | Scope key is present and not `null` |
+| `missing` | - | ignored | Scope key is absent or `null` |
+| `contains` | - | any | Target array contains the value; non-array target uses `eq` |
+| `notContains` | - | any | Negation of `contains` |
+| `overlaps` | - | array | Any element of the rule array is contained in the target |
+
+`in`, `nin`, `between`, and `overlaps` require an array value at parse time. Supplying a non-array raises an error such as `op 'between' on 'rating' needs an array value`. An unknown operator raises `unknown requirement op: ...`.
+
+## Coercion
+
+Numbers and booleans coerce to numbers for numeric and equality comparisons (`true` is `1`, `false` is `0`). Strings are **not** parsed as numbers.
+
+```js
+eq(1, true)        // true  (both coerce to 1)
+between(1, [1, 1]) // true
+lt('a', 'b')       // true  (lexicographic)
+lt('10', '9')      // true  (strings, not numbers)
+lt(10, 9)          // false (numbers)
+```
+
+`contains` on an array compares string forms:
+
+```js
+// stored scope: { tags: ['1', '2'] }
+{ tags: { contains: 1 } }        // true: numeric needle is canonicalized to "1"
+{ tags: { contains: 'ranked' } } // true when "ranked" is an element
+{ tags: { contains: 1.5 } }      // compares against "1.5"
+```
+
+## Missing or null scopes
+
+If the target key is absent or `null`:
+
+| Operator | Result |
+| --- | --- |
+| `exists` | `false` |
+| `missing` | `true` |
+| `ne`, `nin`, `notContains` | `true` |
+| all other operators | `false` |
+
+This makes negative requirements behave naturally on sparse data: a user with no `region` scope satisfies `region: { ne: 'eu' }` and `region: { nin: ['eu'] }`.
+
+## Equality-index optimization
+
+When a user's requirements are AND-combined and contain an `eq` rule, `findServersForUser` uses an in-memory index of servers whose scopes contain that value. It then validates every candidate with the full bidirectional fit check. When the requirements use `match: 'any'`, or contain no `eq` rule, the engine scans all servers. Results are always filtered by availability and the full requirement set, so the index is only a candidate accelerator.
+
+## Errors
+
+Requirement parsing errors surface at upsert time (Node) or as `Err(String)` from `dispatch` (Rust):
+
+```js
+engine.upsertServer({ id: 'x', requirements: { rating: { bogus: 1 } } });
+// throws: unknown requirement op: bogus
+
+engine.upsertServer({ id: 'x', requirements: { rating: { between: 5 } } });
+// throws: op 'between' on 'rating' needs an array value
+
+engine.upsertUser({ id: 'x', requirements: 'nope' });
+// throws: requirements must be an array or object
+```

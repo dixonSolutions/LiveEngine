@@ -1,0 +1,113 @@
+---
+title: "Events and autoEmit"
+description: "The event queue, every event type, payload fields, ordering, manual draining, and hub event budgets."
+---
+
+Every mutating engine operation appends to an internal event queue. Events are ordered, numbered, and drained either automatically (Node `LiveEngine` default) or manually.
+
+```ts
+interface EngineEvent {
+  type: EventType;
+  seq: number;
+  userId?: string;
+  serverId?: string;
+  ids?: string[];
+  reason?: string;
+}
+```
+
+`seq` is an event sequence number, not the engine entity sequence. It increases by one per emitted event and is attached when the event is queued.
+
+## Event types
+
+| Event | Extra fields | When |
+| --- | --- | --- |
+| `user_added` | `userId` | A new user was inserted |
+| `user_updated` | `userId`, optional `serverId` | An existing user was upserted or its status changed |
+| `user_removed` | `userId` | A user was removed |
+| `server_added` | `serverId` | A new server was inserted |
+| `server_updated` | `serverId` | An existing server was upserted or its status changed |
+| `server_removed` | `serverId` | A server was removed |
+| `server_available` | `serverId` | The server became open with free capacity |
+| `server_full` | `serverId` | The server became unavailable because it filled |
+| `server_unavailable` | `serverId` | The server became unavailable for another reason, such as closing |
+| `server_ready` | `serverId`, `ids` | Membership exactly reached `minMembers` (`minMembers > 0`) |
+| `advertised` | `userId`, `ids` | `advertise` or `advertiseAll` returned matches |
+| `paired` | `userId`, `serverId` | A user joined a server |
+| `unpaired` | `userId`, `serverId`, `reason` | A paired user left |
+| `cleared` | none | `clear()` ran |
+
+`unpaired.reason` is one of:
+
+| Reason | Cause |
+| --- | --- |
+| `left` | `leave(userId)` |
+| `user_removed` | `removeUser` on a paired user |
+| `server_removed` | `removeServer` freeing its members |
+| `status_change` | `setUserStatus` moving a paired user to `waiting` or `idle` |
+
+## Ordering examples
+
+Adding a server and three users, then running `matchAll` against a two-seat table with `minMembers: 2`:
+
+```text
+server_added
+server_available
+user_added
+user_added
+user_added
+paired
+paired
+server_full
+server_ready
+```
+
+`server_ready` appears after `server_full` in this case because the room's availability transition is emitted during `join` before the ready threshold check. The ready event fires only once per crossing; filling beyond `minMembers` does not emit it again.
+
+## Node: automatic emission
+
+`LiveEngine` extends `EventEmitter`. After each mutating method it drains the native queue and re-emits every event twice:
+
+```js
+engine.on(ev.type, handler);   // typed listener
+engine.on('event', handler);   // catch-all listener
+```
+
+The mutating methods that trigger a flush are:
+
+`upsertUser`, `upsertUsers`, `removeUser`, `setUserStatus`, `upsertServer`, `upsertServers`, `removeServer`, `setServerStatus`, `advertise`, `advertiseAll`, `join`, `leave`, `autoJoin`, `matchAll`, `generateUsers`, and `clear`.
+
+Read-only methods do not flush. `LiveEngine.pair` and `joinHub` flush explicitly after their compound operations.
+
+```js
+const engine = new LiveEngine();
+engine.on('paired', ev => console.log(ev.userId, '->', ev.serverId));
+engine.on('event', ev => metrics.increment(`liveengine.${ev.type}`));
+```
+
+## Node: manual draining
+
+Pass `autoEmit: false` (or `new LiveEngine({ autoEmit: false })`) to keep events for your own delivery loop:
+
+```js
+const engine = new LiveEngine({ autoEmit: false });
+
+engine.upsertUser({ id: 'alice' });
+console.log(engine.pendingEvents());       // 1
+const events = engine.drainEvents();       // removes and returns
+console.log(events.map(ev => ev.type));    // ['user_added']
+```
+
+`drainEvents()` always drains, regardless of `autoEmit`. `NativeEngine` has no EventEmitter layer; call its `drainEvents()` directly.
+
+<Warning>
+For network hubs, explicitly drain events as part of your service's event delivery loop. A hub with `max_events` set will reject mutations that would exceed the event budget instead of silently dropping events.
+</Warning>
+
+## Hub event budgeting
+
+Hosted internal engines enforce event limits before running a mutation. The preflight estimates how many events a call can produce and rejects it with HTTP `413` if `pending + projected > max_events` (default `100000`). `clear` is treated as producing one event and resets the effective pending count to zero. Because the check runs before the mutation, a rejected call does not partially change engine state.
+
+Drain events after each batch in your application loop. A registry that forwards calls does not drain the remote engine for you.
+
+See [Limits](/reference/limits) for the full budget table.

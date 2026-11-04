@@ -1,0 +1,125 @@
+---
+title: "Import a foreign registry"
+description: "Take a snapshot of another registry and attach its advertised hubs under a local prefix."
+---
+
+Instead of registering each remote hub by hand, a central host can read another registry and create local external aliases in one request. An import is a **snapshot taken at request time**, not a subscription.
+
+## Request
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+
+const central = new HubClient('http://127.0.0.1:8787', {
+  token: process.env.LIVEENGINE_TOKEN,
+});
+
+const imported = await central.importRegistry({
+  address: 'https://remote.example.net',
+  token: process.env.REMOTE_HUB_TOKEN,
+  prefix: 'partner-',
+});
+
+console.log(imported);
+```
+
+HTTP equivalent:
+
+```sh
+curl --silent \
+  -H "Authorization: Bearer $LIVEENGINE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "address": "https://remote.example.net",
+    "token": "'"$REMOTE_HUB_TOKEN"'",
+    "prefix": "partner-"
+  }' \
+  http://127.0.0.1:8787/v1/registries/import
+```
+
+The body fields are:
+
+| Field | Required | Rules |
+| --- | --- | --- |
+| `address` | yes | Absolute HTTP(S) base URL, no credentials/query/fragment, host allowlisted |
+| `token` | yes | At least 24 bytes; sent to the remote service |
+| `prefix` | no | Up to 64 characters of ASCII letters, digits, `.`, `_`, `-` |
+
+Unknown body fields are rejected because the request uses a strict DTO.
+
+## What happens
+
+1. The address is validated and the remote host is checked against `LIVEENGINE_ALLOWED_REMOTE_HOSTS`.
+2. The host calls remote `/health` and requires the protocol.
+3. The host calls remote `/v1/contract` and requires the protocol.
+4. The host calls remote `/v1/hubs` and reads the `hubs` array.
+5. Each remote ID is rewritten as `prefix + remoteId`.
+6. Each candidate becomes an external registration pointing at the original remote address and remote hub ID.
+7. New IDs are handshaked and inserted. Existing identical mappings are returned without duplicating.
+
+```json
+{
+  "hubs": [
+    {
+      "id": "partner-ranked-au",
+      "mode": "external",
+      "address": "https://remote.example.net",
+      "remoteHubId": "ranked-au",
+      "scopes": { "game": "chess", "region": "au" }
+    }
+  ]
+}
+```
+
+The response contains public metadata only. Remote tokens are not echoed.
+
+## Call imported hubs
+
+```js
+console.log(await central.call('partner-ranked-au', 'stats'));
+await central.call('partner-ranked-au', 'upsertUser', [
+  { id: 'alice', scopes: { region: 'au' } },
+]);
+```
+
+Each imported alias forwards to the corresponding remote hub ID.
+
+## Idempotency and conflicts
+
+Running the same import twice with the same address, token, and prefix:
+
+- Returns the already-attached aliases.
+- Does not create duplicates.
+- Does not reset remote state.
+
+The import returns `409` when an imported ID already exists locally but maps to a different address, remote hub ID, or token. Remove the conflicting alias or choose a different prefix.
+
+## Snapshots, not subscriptions
+
+Registrations added to the remote registry **after** an import are not discovered automatically. Run the import again to take a new snapshot:
+
+```js
+await central.importRegistry({
+  address: 'https://remote.example.net',
+  token: process.env.REMOTE_HUB_TOKEN,
+  prefix: 'partner-',
+});
+```
+
+The second import adds new remote hubs and leaves existing aliases intact.
+
+## Capacity and size errors
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Invalid address, token, prefix, or request body; host not allowlisted |
+| `409` | Imported ID is mapped to a different target, or a concurrent registration won |
+| `413` | Remote hub list exceeds `max_hubs` |
+| `502` | Health/contract/hub-list/handshake failure, malformed remote registry, or duplicate remote IDs |
+| `507` | The local registry would exceed `max_hubs` |
+
+Imported aliases have no TTL. They remain until removed or the central host restarts.
+
+<Note>
+The remote service must allow the central host to call it. In a two-host deployment, the central and remote tokens are independent; the import token must be the remote service's administrative token.
+</Note>

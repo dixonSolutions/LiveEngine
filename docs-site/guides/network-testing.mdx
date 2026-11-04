@@ -1,0 +1,82 @@
+---
+title: "Cross-network testing"
+description: "Prove that a hub is reachable from another network using the GitHub workflow or the same script from your own device."
+---
+
+The repository includes one connectivity script used by both a GitHub workflow and local runs. It checks authentication, registration, room creation, player insertion, pairing, and cleanup against a live HTTP endpoint.
+
+## What the script does
+
+`scripts/test-network.js`:
+
+1. Reads `LIVEENGINE_NETWORK_URL` and `LIVEENGINE_NETWORK_TEST_TOKEN`.
+2. Validates the contract.
+3. Confirms unauthenticated `GET /v1/hubs` returns `401`.
+4. Registers a short-lived internal hub with `ttlSeconds: 300` and scope `purpose: cross-network-test`.
+5. Upserts a room with capacity 2 and a player.
+6. Calls `autoJoin` and asserts the player paired into the room.
+7. Reads `stats` and asserts `paired === 1`.
+8. Removes the test hub in a `finally` block.
+
+It proves network reachability and authenticated matchmaking. It does not test game-state replication or a browser.
+
+## GitHub Actions workflow
+
+The workflow is `.github/workflows/network-test.yml`, named **Cross-network connectivity**. It is manual (`workflow_dispatch`) and takes one input:
+
+| Input | Meaning |
+| --- | --- |
+| `hub_url` | Reachable HTTPS URL of the running hub host |
+
+It reads the repository secret `LIVEENGINE_NETWORK_TEST_TOKEN` and runs:
+
+```sh
+node scripts/test-network.js
+```
+
+with:
+
+```text
+LIVEENGINE_NETWORK_URL=<hub_url>
+LIVEENGINE_NETWORK_TEST_TOKEN=<secret>
+```
+
+The runner connects from GitHub's network. Expose the host through a reachable HTTPS ingress or a temporary tunnel, set a dedicated test token as the secret, dispatch the workflow, then remove the temporary secret when finished.
+
+<Warning>
+Do not reuse your production administrative token for a connectivity test. Use a dedicated test token and remove it, along with any temporary tunnel, after the check.
+</Warning>
+
+## Run it from your own device
+
+The same script works when you control the client device:
+
+```sh
+LIVEENGINE_NETWORK_URL=https://your-hub.example \
+LIVEENGINE_NETWORK_TEST_TOKEN="$LIVEENGINE_TOKEN" \
+node scripts/test-network.js
+```
+
+The URL must be reachable from the device and the token must be the host's administrative token. The script prints a single success line:
+
+```text
+Cross-network connectivity passed: authenticated contract, registry, room creation, player connection and pairing.
+```
+
+## What has and has not been verified
+
+From the repository validation record (2026-11-04):
+
+- GitHub Actions run [41788025360](https://github.com/dixonSolutions/LiveEngine/actions/runs/41788025360) succeeded. A GitHub-hosted runner connected over HTTPS through a temporary Cloudflare tunnel, created a hub/room/player, paired the player, and deleted the test hub. The tunnel was stopped and the temporary secret removed.
+- Other devices on the maintainer's Tailscale network were offline during inspection.
+- A physical tablet or phone test has **not** been performed.
+
+The successful external runner proves connectivity from a separate network to a running service. It does not prove a particular device or client works. Record the URL, time, and result in your own environment.
+
+## Recommendations
+
+- Use a disposable hub ID and TTL for tests.
+- Keep the test token separate from production credentials.
+- Terminate TLS before exposing the host.
+- Restrict the test window and remove temporary ingress rules afterward.
+- Treat the script's cleanup as best-effort; verify the hub is gone if the run is interrupted.

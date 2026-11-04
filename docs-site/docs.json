@@ -1,0 +1,147 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "LiveEngine",
+  "theme": "mint",
+  "description": "Rust matchmaking engine and authenticated HTTP hub hosting/registry for Node.js and Rust services.",
+  "colors": {
+    "primary": "#2563EB",
+    "light": "#3B82F6",
+    "dark": "#1D4ED8"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/dixonSolutions/LiveEngine"
+      },
+      {
+        "label": "Releases",
+        "href": "https://github.com/dixonSolutions/LiveEngine/releases"
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/dixonSolutions/LiveEngine"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": [
+              "index",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/first-match",
+              "guides/hosting",
+              "guides/remote-hubs",
+              "guides/import-registry",
+              "guides/custom-handler",
+              "guides/docker",
+              "guides/deployment",
+              "guides/network-testing",
+              "guides/gogh-strike"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/lifecycle",
+              "concepts/requirements",
+              "concepts/strategies",
+              "concepts/events",
+              "concepts/hubs-and-registry",
+              "concepts/security"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Framework recipes",
+        "groups": [
+          {
+            "group": "Choose an integration shape",
+            "pages": [
+              "frameworks/overview"
+            ]
+          },
+          {
+            "group": "Node.js",
+            "pages": [
+              "frameworks/express",
+              "frameworks/fastify",
+              "frameworks/nestjs",
+              "frameworks/nextjs"
+            ]
+          },
+          {
+            "group": "Rust",
+            "pages": [
+              "frameworks/axum",
+              "frameworks/actix"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Node SDK",
+            "pages": [
+              "node/installation",
+              "node/engine",
+              "node/hub-client"
+            ]
+          },
+          {
+            "group": "Rust SDK",
+            "pages": [
+              "rust/engine",
+              "rust/hub",
+              "rust/config"
+            ]
+          },
+          {
+            "group": "Hub protocol",
+            "pages": [
+              "protocol/overview",
+              "protocol/endpoints",
+              "protocol/registration",
+              "protocol/errors"
+            ]
+          },
+          {
+            "group": "Configuration and limits",
+            "pages": [
+              "reference/environment",
+              "reference/limits"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "How we work",
+        "groups": [
+          {
+            "group": "Project",
+            "pages": [
+              "contributing",
+              "publishing",
+              "validation",
+              "troubleshooting"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

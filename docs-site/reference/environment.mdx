@@ -1,0 +1,127 @@
+---
+title: "Environment reference"
+description: "Every LIVEENGINE_* variable used by the host, Compose example, build scripts, connectivity test, and Gogh bridge."
+---
+
+## Host process
+
+These variables are read by `liveengine-hub` or `HubConfig::from_env()`.
+
+| Variable | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `LIVEENGINE_TOKEN` | string | none (required) | Administrative bearer token; at least 24 bytes |
+| `LIVEENGINE_BIND` | socket address | `127.0.0.1:8787` | Listener address (`IP:port`), read by the binary |
+| `LIVEENGINE_ALLOWED_REMOTE_HOSTS` | comma-separated string | empty | Exact remote hosts (or `*.suffix` entries) allowed for external registration and imports |
+| `LIVEENGINE_MAX_HUBS` | positive integer | `256` | Maximum registrations |
+| `LIVEENGINE_MAX_BODY_BYTES` | positive integer | `1048576` | Maximum request body bytes (`max_request_bytes`) |
+| `LIVEENGINE_MAX_RESPONSE_BYTES` | positive integer | `4194304` | Maximum response bytes |
+| `LIVEENGINE_MAX_ARGS` | positive integer | `256` | Maximum arguments per call |
+| `LIVEENGINE_MAX_ENTITIES` | positive integer | `100000` | Maximum users + servers per internal engine |
+| `LIVEENGINE_MAX_EVENTS` | positive integer | `100000` | Maximum pending events per internal engine |
+| `LIVEENGINE_MAX_GENERATE` | positive integer | `10000` | Maximum generated users per call |
+| `LIVEENGINE_MAX_INFLIGHT_CALLS` | positive integer | `16` | Concurrent hub calls |
+| `LIVEENGINE_RATE_LIMIT_REQUESTS` | positive integer | `120` | Requests per peer per window |
+| `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` | integer | `60` | Rate window in seconds |
+| `LIVEENGINE_RATE_LIMIT_PEERS` | positive integer | `4096` | Maximum tracked peers |
+| `LIVEENGINE_SEED` | unsigned integer | `0` | Seed for internally created engines |
+
+`LIVEENGINE_BIND` must parse as a Rust `SocketAddr` (an IP literal plus port), not a DNS name. For example, `0.0.0.0:8787` or `[::1]:8787`.
+
+Two `HubConfig` settings have **no** environment variable in the standalone binary:
+
+- `request_timeout` (default 5 seconds)
+- `max_ttl` (default 24 hours)
+
+Set them programmatically when embedding. See [Rust configuration](/rust/config).
+
+### Parsing and validation
+
+- Integer limit variables are parsed as `usize`. A non-integer value fails startup with `<NAME> must be a positive integer`.
+- `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` must parse as an integer; otherwise `<NAME> must be an integer`.
+- `LIVEENGINE_SEED` must be an unsigned integer.
+- For the limit and window variables, a parseable zero is accepted by parsing but rejected by validation: `hub limits and timeouts must be greater than zero`. `LIVEENGINE_SEED=0` is valid.
+- The token length check uses bytes. A token shorter than 24 bytes fails startup.
+- `LIVEENGINE_ALLOWED_REMOTE_HOSTS` entries are trimmed, lowercased, and empty entries are discarded.
+- `LIVEENGINE_BIND` parse or bind failures are fatal.
+
+```sh
+export LIVEENGINE_TOKEN="$(openssl rand -hex 32)"
+export LIVEENGINE_BIND=0.0.0.0:8787
+export LIVEENGINE_ALLOWED_REMOTE_HOSTS=remote,hub.internal.example
+export LIVEENGINE_MAX_HUBS=256
+export LIVEENGINE_MAX_BODY_BYTES=1048576
+export LIVEENGINE_MAX_RESPONSE_BYTES=4194304
+export LIVEENGINE_MAX_ARGS=256
+export LIVEENGINE_MAX_ENTITIES=100000
+export LIVEENGINE_MAX_EVENTS=100000
+export LIVEENGINE_MAX_GENERATE=10000
+export LIVEENGINE_MAX_INFLIGHT_CALLS=16
+export LIVEENGINE_RATE_LIMIT_REQUESTS=120
+export LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS=60
+export LIVEENGINE_RATE_LIMIT_PEERS=4096
+export LIVEENGINE_SEED=0
+```
+
+## Compose and local scripts
+
+These are project-level variables, not read by `HubConfig`.
+
+| Variable | Type | Default | Used by |
+| --- | --- | --- | --- |
+| `LIVEENGINE_LISTEN_IP` | string | `127.0.0.1` | Compose host port binding for the central service |
+| `LIVEENGINE_REMOTE_TOKEN` | string | none (required by Compose) | Token for the Compose remote service; at least 24 bytes |
+| `LIVEENGINE_BUILD_TARGET` | Rust target triple | unset | `scripts/build.js` and `scripts/build-hub.js` cross-compilation |
+
+`.env.example` defines the Compose secrets and listen IP. Do not commit real values.
+
+## Connectivity test
+
+| Variable | Type | Default | Used by |
+| --- | --- | --- | --- |
+| `LIVEENGINE_NETWORK_URL` | URL | none (required) | `scripts/test-network.js` |
+| `LIVEENGINE_NETWORK_TEST_TOKEN` | string | none (required) | `scripts/test-network.js` and the GitHub workflow |
+
+The GitHub workflow reads `LIVEENGINE_NETWORK_TEST_TOKEN` from repository secrets and supplies `LIVEENGINE_NETWORK_URL` from its `hub_url` input. See [Cross-network testing](/guides/network-testing).
+
+## Gogh Strike bridge and e2e
+
+Bridge variables are read by `integrations/gogh-strike/bridge.mjs`:
+
+| Variable | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `LIVEENGINE_URL` | URL | none (required for matchmaking) | Hub service base URL |
+| `LIVEENGINE_TOKEN` | string | none (required for matchmaking) | Hub service token |
+| `LIVEENGINE_HUB_ID` | string | `gogh-strike` | Local hub ID |
+| `LIVEENGINE_HUB_MODE` | `internal` / `external` | `internal` | Registration mode |
+| `LIVEENGINE_REMOTE_ADDRESS` | URL | empty | Remote base URL for external mode |
+| `LIVEENGINE_REMOTE_HUB_ID` | string | same as `LIVEENGINE_HUB_ID` | Remote hub ID |
+| `LIVEENGINE_REMOTE_TOKEN` | string | empty | Remote credential; at least 24 bytes |
+| `GOGH_STRIKE_ROOT` | path | `../gogh-strike` | Upstream game checkout |
+| `PORT` | number | `8967` | Bridge port on `127.0.0.1` |
+| `GOGH_MATCH_SERVER_ID` | string | `gogh-strike-local` | Room ID |
+| `GOGH_MATCH_CAPACITY` | number | `12` | Room capacity |
+
+The e2e script additionally reads:
+
+| Variable | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `LIVEENGINE_URL` | URL | `http://127.0.0.1:8787` | Central service |
+| `LIVEENGINE_TOKEN` / `LIVEENGINE_TOKEN_FILE` | string / path | none (required) | Central token |
+| `LIVEENGINE_REMOTE_URL` | URL | none | Remote client URL for external mode |
+| `LIVEENGINE_REMOTE_ADDRESS` | URL | same as `LIVEENGINE_REMOTE_URL` | Address the central service forwards to |
+| `LIVEENGINE_REMOTE_HUB_ID` | string | generated | Remote hub ID |
+| `LIVEENGINE_REMOTE_TOKEN` / `LIVEENGINE_REMOTE_TOKEN_FILE` | string / path | none for external | Remote token |
+| `LIVEENGINE_HUB_ID` | string | generated `gogh-e2e-...` | Central hub ID |
+| `GOGH_MATCH_SERVER_ID` | string | generated `gogh-e2e-room-...` | Room ID |
+| `GOGH_BRIDGE_PORT` | number | ephemeral | Fixed bridge port |
+| `PLAYWRIGHT_PATH` | path | unset | Playwright `index.mjs` |
+| `CHROMIUM_PATH` | path | unset | Browser executable |
+| `GOGH_SCREENSHOT` | path | `/tmp/liveengine-gogh-lobby.png` | Screenshot output |
+
+See [Gogh Strike integration](/guides/gogh-strike) for commands and behavior.
+
+## Related
+
+- [Limits](/reference/limits): defaults and budget meanings.
+- [Rust HubConfig](/rust/config): programmatic fields and validation.
+- [Deployment](/guides/deployment): TLS, proxies, and state warnings.

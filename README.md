@@ -11,6 +11,18 @@ Define users, servers, custom scopes and requirements at runtime. Register inter
 
 The former C++/node-gyp implementation has been replaced by Rust. The existing `LiveEngine` and `NativeEngine` Node interfaces remain available. Seeded sequences are deterministic within the Rust implementation; random sequences are not byte-for-byte compatible with the previous C++ generator.
 
+## Documentation
+
+The complete developer guide, protocol reference and framework recipes live at **[liveengine.mintlify.site](https://liveengine.mintlify.site)**.
+
+Runnable framework examples are in the repository:
+
+- [Express](examples/frameworks/express-server.js)
+- [Fastify](examples/frameworks/fastify-server.mjs)
+- [NestJS](examples/frameworks/nestjs)
+- [Axum](examples/axum-service.rs)
+- [Actix Web](docs-site/frameworks/actix.mdx) recipe
+
 ## Install
 
 ```sh

@@ -1,0 +1,282 @@
+---
+title: "Node engine reference"
+description: "Every LiveEngine and NativeEngine export, option, method, return shape, event, and result reason."
+---
+
+## Exports
+
+```ts
+export declare class LiveEngine extends EventEmitter { /* ... */ }
+export declare class NativeEngine { /* ... */ }
+export declare const nativeVersion: string;
+export default LiveEngine;
+```
+
+`LiveEngine` is the ergonomic wrapper: it owns a `NativeEngine`, adds `pair`, `joinHub`, and automatic matching, and re-emits native events. `NativeEngine` is a thin layer over the Rust core and does not emit events.
+
+## Construction
+
+```ts
+interface LiveEngineOptions {
+  seed?: number;      // default 0
+  autoEmit?: boolean; // default true
+}
+
+new LiveEngine(options?: LiveEngineOptions | number);
+new NativeEngine(seed?: number); // default 0
+```
+
+```js
+const a = new LiveEngine();                    // seed 0, autoEmit true
+const b = new LiveEngine(42);                  // seed 42
+const c = new LiveEngine({ seed: 42, autoEmit: false });
+```
+
+The seed controls generated users and the `random` strategy. The same seed and operation sequence produce the same result within this Rust implementation. It is not byte-for-byte compatible with the former C++ generator.
+
+`NativeEngine` exposes the same matching methods as `LiveEngine` (without the wrapper extras) and has no EventEmitter.
+
+## Input and output shapes
+
+```ts
+type ScopeValue = number | boolean | string | string[] | null;
+type Scopes = Record<string, ScopeValue>;
+
+type UserStatus = 'waiting' | 'paired' | 'idle';
+type ServerStatus = 'open' | 'full' | 'closed';
+type Strategy = 'first' | 'random' | 'leastLoaded' | 'mostLoaded' | 'affinity';
+
+interface UserInput {
+  id: string;
+  scopes?: Scopes;
+  requirements?: Requirements;
+  status?: UserStatus;
+}
+
+interface User {
+  id: string;
+  scopes: Scopes;
+  requirements: RuleSet;
+  status: UserStatus;
+  serverId: string | null;
+  seq: number;
+}
+
+interface ServerInput {
+  id: string;
+  scopes?: Scopes;
+  requirements?: Requirements;
+  capacity?: number;
+  minMembers?: number;
+  status?: ServerStatus;
+}
+
+interface Server {
+  id: string;
+  scopes: Scopes;
+  requirements: RuleSet;
+  status: ServerStatus;
+  capacity: number;
+  minMembers: number;
+  members: string[];
+  free: number;
+  seq: number;
+}
+```
+
+Requirements accept a shorthand object, an array of rules, or `{ rules, match: 'all' | 'any' }`. See [Requirements](/concepts/requirements).
+
+## User methods
+
+| Method | Returns | Notes |
+| --- | --- | --- |
+| `upsertUser(user)` | `boolean` | `true` if added, `false` if updated |
+| `upsertUsers(users)` | `number` | Count of newly added users |
+| `removeUser(id)` | `boolean` | Leaves a room first if paired |
+| `getUser(id)` | `User \| null` | `null` when absent |
+| `listUsers(status?)` | `User[]` | Sorted by `seq`; validates status |
+| `setUserStatus(id, status)` | `boolean` | See status rules below |
+
+`setUserStatus`:
+
+- returns `false` when the user does not exist
+- setting `paired` returns whether the user is already paired and never changes state
+- any other status leaves a paired user first (`unpaired` reason `status_change`), then sets the status and returns `true`
+
+## Server methods
+
+| Method | Returns | Notes |
+| --- | --- | --- |
+| `upsertServer(server)` | `boolean` | `true` if added, `false` if updated |
+| `upsertServers(servers)` | `number` | Count of newly added servers |
+| `removeServer(id)` | `boolean` | Frees all members |
+| `getServer(id)` | `Server \| null` | `null` when absent |
+| `listServers(status?)` | `Server[]` | Sorted by `seq`; validates status |
+| `setServerStatus(id, status)` | `boolean` | `full` requires `members.length >= capacity` |
+
+Defaults: `capacity` 1 (minimum 1), `minMembers` 0, status `open`. A new server submitted as `full` becomes `open`. Server `free` is `capacity - members.length`, never negative.
+
+## Query and matching methods
+
+```ts
+interface MatchOptions {
+  limit?: number;     // 0 = unlimited, default 10
+  strategy?: Strategy;
+  affinity?: Array<string | { key: string; weight?: number }> | Record<string, number>;
+}
+
+interface Match { id: string; score: number; load: number; }
+
+interface Result {
+  ok: boolean;
+  reason: string | null;
+  userId: string | null;
+  serverId: string | null;
+}
+
+interface PairResult extends Result { server?: Server; }
+```
+
+| Method | Returns | Notes |
+| --- | --- | --- |
+| `findServersForUser(userId, options?)` | `Match[]` | Available fitting servers |
+| `findUsersForServer(serverId, options?)` | `Match[]` | Waiting fitting users; `[]` if server unavailable |
+| `fits(userId, serverId)` | `boolean` | Bidirectional check without mutation |
+| `advertise(userId, options?)` | `number` | Match count; emits `advertised` |
+| `advertiseAll(options?)` | `number` | Total advertised matches for waiting users |
+| `join(userId, serverId)` | `Result` | Explicit join |
+| `leave(userId)` | `Result` | Explicit leave |
+| `autoJoin(userId, options?)` | `Result` | Finds and joins one server |
+| `matchAll(options?)` | `Result[]` | Joins waiting users in arrival order |
+
+See [Strategies](/concepts/strategies) for ordering and score semantics.
+
+### Result reasons
+
+| Reason | Returned by | Meaning |
+| --- | --- | --- |
+| `user_not_found` | `join`, `leave`, `autoJoin` | No such user |
+| `server_not_found` | `join` | No such server |
+| `already_paired` | `join`, `autoJoin` | User already in a room; `serverId` is that room |
+| `closed` | `join` | Server status is `closed` |
+| `full` | `join` | Server has no free capacity |
+| `no_fit` | `join`, `autoJoin` | Requirements or availability fail |
+| `not_paired` | `leave` | User is not currently paired |
+
+On success, `reason` is `null`. `leave` returns the room ID in `serverId`.
+
+### LiveEngine extras
+
+| Method | Returns | Behavior |
+| --- | --- | --- |
+| `pair(userId, options?)` | `PairResult` | Calls `autoJoin`; on success attaches the full `server` object |
+| `joinHub(user, options?)` | `{ created, advertised }` | Upserts a user, then advertises fitting servers |
+| `startAutoMatch(intervalMs?, options?)` | `this` | Runs `matchAll` every interval (default 250 ms); timer is `unref`'d |
+| `stopAutoMatch()` | `this` | Clears the timer |
+| `drainEvents()` | `EngineEvent[]` | Drains and returns events |
+
+```js
+const { created, advertised } = engine.joinHub(
+  { id: 'alice', requirements: { game: 'chess' } },
+  { limit: 5 },
+);
+```
+
+`startAutoMatch` calls `stopAutoMatch` first, so starting twice does not create two timers.
+
+## Events
+
+`LiveEngine` emits each event under its type and under `'event'`:
+
+```js
+engine.on('paired', ev => {});
+engine.on('event', ev => {});
+engine.once('server_ready', ev => {});
+engine.off('advertised', listener);
+```
+
+Mutating methods flush events automatically when `autoEmit` is true. See [Events](/concepts/events) for every type and payload, and for manual draining with `autoEmit: false`.
+
+## State methods
+
+| Method | Returns | Notes |
+| --- | --- | --- |
+| `drainEvents()` | `EngineEvent[]` | Removes and returns queued events |
+| `pendingEvents()` | `number` | Queue length |
+| `stats()` | `Stats` | Counters |
+| `clear()` | `void` | Clears users, servers, index, availability, events; emits `cleared` |
+| `reseed(seed)` | `void` | Replaces the RNG state |
+
+```ts
+interface Stats {
+  users: number; waiting: number; paired: number; idle: number;
+  servers: number; open: number; full: number; closed: number;
+  pendingEvents: number;
+  totalJoins: number; totalLeaves: number; totalMatchesEvaluated: number;
+}
+```
+
+`clear()` does not reset `seq`, `event_seq`, generation counters, or totals; it clears the maps and event queue, then emits one `cleared` event.
+
+## Generating users
+
+```ts
+interface GenerationSpec {
+  idPrefix?: string;              // default 'user-'
+  scopes?: Record<string, ScopeGenerator>;
+  requirements?: Requirements;
+}
+
+type ScopeGenerator =
+  | string[]
+  | { type: 'int' | 'float'; min?: number; max?: number }
+  | { type: 'choice'; values: string[]; weights?: number[] }
+  | { type: 'bool'; p?: number; probability?: number }
+  | { type: 'string'; prefix?: string }
+  | { type: 'tags'; values: string[]; count?: number };
+
+generateUsers(count: number, spec?: GenerationSpec): User[];
+```
+
+```js
+const users = engine.generateUsers(100, {
+  idPrefix: 'bot-',
+  scopes: {
+    rating: { type: 'int', min: 1000, max: 2000 },
+    region: ['eu', 'us', 'apac'],
+    premium: { type: 'bool', p: 0.25 },
+    name: { type: 'string', prefix: 'Bot ' },
+    tags: { type: 'tags', values: ['a', 'b', 'c'], count: 2 },
+  },
+  requirements: { game: 'chess' },
+});
+```
+
+Generation rules:
+
+- `count` is truncated. Negative counts produce `[]`. Counts above `100000` throw.
+- IDs are `idPrefix + n`, where `n` is a global generation counter that continues across calls.
+- `int` defaults to `min: 0`, `max: 100`, inclusive.
+- `float` defaults to `min: 0`, `max: 100`; equal bounds produce that value.
+- `bool` defaults to probability `0.5`; `p` and `probability` are both accepted.
+- `string` produces `prefix + n`.
+- `choice` picks from `values` with optional `weights`; an empty pool throws.
+- `tags` shuffles `values` and takes `count` (default 1).
+- An array generator is a choice pool.
+- All generators are validated before any user is inserted. Invalid bounds, probabilities, empty pools, unknown types, or a projected output above 64 MiB throw without partial mutation.
+- Generated users receive the parsed `requirements` spec.
+
+## Errors
+
+Invalid input throws a JavaScript `Error` whose message comes from the Rust dispatch:
+
+```js
+engine.upsertUser({});                       // user.id is required
+engine.getUser(42);                          // id must be a string
+engine.setServerStatus('s', 'bogus');        // unknown server status
+engine.findServersForUser('u', { strategy: 'bogus' }); // unknown strategy
+engine.upsertServer({ id: 'x', requirements: { rating: { between: 5 } } });
+// op 'between' on 'rating' needs an array value
+```
+
+`NativeEngine.dispatch` is not part of the documented public API; use the typed methods. Undefined arguments passed through the wrapper are converted to `null` before reaching Rust.

@@ -1,0 +1,161 @@
+---
+title: "Publishing and releases"
+description: "Registries, trusted publishers, the tag and dispatch workflow, idempotent publish checks, and what CI validates."
+---
+
+## Registries and names
+
+| Registry | Name | Current state |
+| --- | --- | --- |
+| npm | `@dixonsolutions/liveengine` | `0.2.2` published; `0.2.1` was the trusted-publishing release and `0.2.0` the bootstrap release |
+| crates.io | `liveengine` (binary `liveengine-hub`) | `0.2.2` published; `0.2.1` was the trusted-publishing release and `0.2.0` the bootstrap release |
+
+Both manifests use the same version. The release workflow verifies that a `v<version>` tag matches both `Cargo.toml` and `package.json` through `scripts/check-release.js`.
+
+The npm package includes a Rust N-API engine, TypeScript definitions, the HTTP-only client, the `liveengine-hub` command, Rust source, the hub schema, and docs. The Cargo package includes the library, binary, examples, tests, and the hub schema.
+
+## Trusted publishers
+
+Both registries are configured for:
+
+- Owner: `dixonSolutions`
+- Repository: `LiveEngine`
+- Workflow: `.github/workflows/release.yml` (`release.yml`)
+- npm environment: empty (the workflow does not select an environment)
+- npm permission: publish
+
+Trust is **registry-side**. Committing `id-token: write` does not create it. The npm connection is validated and includes provenance.
+
+<Warning>
+Never put a passkey, npm session token, or crates.io token into GitHub secrets for this workflow. The release jobs use OIDC. Registry-side configuration is an account operation separate from the code.
+</Warning>
+
+### npm trusted publishing
+
+A package must exist before `npm trust` can configure it. The first publication uses an interactive maintainer login. Afterward, with npm CLI 11.15+:
+
+```sh
+npm login --auth-type=web
+npm trust github @dixonsolutions/liveengine \
+  --repo=dixonSolutions/LiveEngine --file=release.yml --allow-publish
+npm trust list @dixonsolutions/liveengine
+```
+
+The browser flow may require touching the account's passkey. A newly created npm trust configuration requires its first successful OIDC publication within two days; configure trust when ready to release.
+
+The npm job installs the latest npm, requests GitHub OIDC, and publishes with:
+
+```sh
+npm publish --access public --provenance
+```
+
+### crates.io trusted publishing
+
+The Cargo job uses [`rust-lang/crates-io-auth-action`](https://github.com/rust-lang/crates-io-auth-action) to obtain a short-lived token, then runs:
+
+```sh
+cargo publish --locked
+```
+
+A new crate requires an initial authenticated publication before its publisher can be configured:
+
+```sh
+cargo login
+cargo publish --locked
+```
+
+If the crate name is already owned by another publisher, choose an available name and update the Cargo instructions before publishing.
+
+## Release workflow
+
+`.github/workflows/release.yml` triggers on:
+
+- a pushed tag matching `v*`
+- manual `workflow_dispatch` with a boolean `publish` input (default `false`)
+
+### Build matrix
+
+| OS | Rust target |
+| --- | --- |
+| `ubuntu-22.04` | `x86_64-unknown-linux-gnu` |
+| `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
+| `macos-15` | `aarch64-apple-darwin` |
+| `macos-15` | `x86_64-apple-darwin` |
+| `windows-latest` | `x86_64-pc-windows-msvc` |
+
+Each build installs Node 24, builds the addon and host binary, runs `cargo test --locked`, and runs `npm test` except for the cross-compiled `x86_64-apple-darwin` artifact. Native artifacts are uploaded and merged for the npm package.
+
+### npm job
+
+1. Downloads all native artifacts and restores executable permissions.
+2. Runs `npm ci` and `npm test`.
+3. Runs `node scripts/check-release.js` with `RELEASE_TAG` when the ref is a tag.
+4. Checks whether the manifest version already exists on npm.
+5. Runs `npm pack` and verifies the packed artifact with `node scripts/test-package.js`.
+6. Uploads the package artifact.
+7. Publishes only when the ref is a tag or `publish` is true, **and** the version does not already exist.
+8. On a tag, creates a GitHub release with the tarball and host binaries.
+
+### Cargo job
+
+Runs for a tag or `publish: true`, checks the crate version through the crates.io API, authenticates through the trusted publisher, and publishes only if the version does not already exist.
+
+## Idempotent publish checks
+
+Registry publication is immutable. The workflow:
+
+- queries npm for `@dixonsolutions/liveengine@<version>`
+- queries crates.io for `liveengine/<version>`
+- skips the corresponding publish when the version is already present
+
+This makes a partially completed release safe to retry. It does **not** overwrite, yank, or unpublish anything.
+
+## Manual dispatch
+
+By default, a dispatch builds downloadable artifacts without publishing. Enable the `publish` input only for a version that is not yet published:
+
+```text
+Actions -> Release -> Run workflow
+publish: false   (build artifacts only)
+publish: true    (publish current manifest version)
+```
+
+Do not enable publication for an already published version; the workflow will skip it by design.
+
+## What CI validates
+
+`.github/workflows/ci.yml` runs on pushes to `main` and pull requests:
+
+- `cargo fmt --all -- --check`
+- `cargo test --locked`
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `npm ci`
+- `npm test`
+- `npm run test:integration`
+- `node bench/bench.js 500 5000` on Linux/Node 24
+- container build for the standard and custom images, then `scripts/test-containers.sh`
+
+Local release verification:
+
+```sh
+cargo fmt --all -- --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+npm ci
+npm test
+npm run build:hub
+npm pack --dry-run
+cargo package --locked
+```
+
+## Release procedure
+
+1. Update `Cargo.toml`, `package.json`, and `CHANGELOG.md` to the same version.
+2. Run the full local verification list.
+3. Confirm registry-side publishers are configured and ready.
+4. Commit and create the matching `v<version>` tag.
+5. Push the tag.
+6. Watch the build, npm, and Cargo jobs.
+7. Verify npm provenance and the GitHub release assets.
+
+The release workflow does not automatically overwrite or unpublish a package. Registry trust and publication are account operations recorded in [Validation](/validation).

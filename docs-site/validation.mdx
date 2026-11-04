@@ -1,0 +1,83 @@
+---
+title: "Validation record"
+description: "What was actually observed for 0.2.2, and what remains unverified."
+---
+
+Validation performed on **2026-11-04**. This is a record of observed checks, not a guarantee for other environments. Registry publication and trust configuration are separate account operations.
+
+## Observed checks
+
+### Rust core and Node regression
+
+- The existing Node engine and math-game regression suites pass.
+- Core tests cover FIFO ordering, rule coercion, missing scopes, invalid generators, and membership invariants.
+
+### Hub behavior
+
+- Authentication.
+- Custom embedded handler calls.
+- Scope validation.
+- Pre-mutation event budgets.
+- Remote credentials and redaction.
+- Live registry import.
+- TTL behavior.
+- Peer request limits.
+
+### OCI container integration
+
+- Separate central and remote containers with independent tokens successfully handshake, forward player matchmaking, and import a live registry.
+- Unauthenticated access is denied.
+- Executed locally with Podman using the standard Dockerfile; Docker execution is also configured in CI.
+
+### Cross-network connectivity
+
+- GitHub Actions run [41788025360](https://github.com/dixonSolutions/LiveEngine/actions/runs/41788025360) succeeded.
+- A GitHub-hosted runner connected over HTTPS to the local service through a temporary Cloudflare tunnel.
+- The runner created a hub/room/player, paired the player, and deleted the test hub.
+- The tunnel was stopped and its temporary repository secret removed after the check.
+
+### Gogh Strike
+
+- Cloned upstream, applied the optional hub matchmaking lobby, passed its 168 upstream tests and build.
+- A real central-to-remote join and headless browser play flow passed without page errors.
+- The game remains locally simulated; this check does not claim multiplayer game-state replication.
+
+## Not verified
+
+- Other devices on the maintainer's Tailscale network were offline during inspection.
+- A physical tablet or phone test has **not** been performed.
+- The successful external runner proves connectivity from a separate network; it does not prove a specific device or client works.
+- The Gogh Strike test ran against local central and remote HTTP services, not a remote physical device.
+- Registry publication/trust state is account-side; this page does not independently verify current registry credentials.
+
+## How to reproduce
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+npm ci
+npm test
+npm run test:integration
+npm run build:hub
+npm pack --dry-run
+cargo package --locked
+```
+
+Containers:
+
+```sh
+docker build -t liveengine:test .
+docker build -f Dockerfile.custom -t liveengine-custom:test .
+bash scripts/test-containers.sh docker liveengine:test liveengine-custom:test
+```
+
+Cross-network:
+
+```sh
+LIVEENGINE_NETWORK_URL=https://your-hub.example \
+LIVEENGINE_NETWORK_TEST_TOKEN="$LIVEENGINE_TOKEN" \
+node scripts/test-network.js
+```
+
+See [Cross-network testing](/guides/network-testing) and [Contributing](/contributing).

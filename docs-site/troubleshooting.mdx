@@ -1,0 +1,242 @@
+---
+title: "Troubleshooting and FAQ"
+description: "Symptom-based fixes for installation, authentication, matching, hosting, remote hubs, containers, and the Gogh bridge."
+---
+
+## Installation and loading
+
+### `LiveEngine native addon not built`
+
+The default entry point could not load a `.node` artifact. Either install a release tarball with prebuilt binaries or build from source:
+
+```sh
+npm ci
+npm run build
+```
+
+Check that `native/liveengine.<platform>-<arch>[-gnu|-musl].node` exists. On Linux, the loader picks `-gnu` or `-musl` from the runtime glibc report.
+
+### `Cannot find module '@dixonsolutions/liveengine/hubs'`
+
+Check the Node version (22+) and that the package exports are intact. The `hubs` subpath is a separate export; deep-importing `lib/hubs.js` is not the supported path.
+
+### TypeScript cannot find types
+
+Use the package root or `./hubs` subpath. `index.d.ts` and `lib/hubs.d.ts` ship with the package. Do not install a separate `@types` package.
+
+## Authentication
+
+### Startup exits with `LIVEENGINE_TOKEN must be set`
+
+Export the variable in the process environment. Compose reads it from `.env`, but a bare shell does not.
+
+### Startup exits with `LIVEENGINE_TOKEN must be at least 24 bytes`
+
+The check is bytes, not characters. Generate a strong value:
+
+```sh
+export LIVEENGINE_TOKEN="$(openssl rand -hex 32)"
+```
+
+### `401 unauthorized`
+
+- Send `Authorization: Bearer <token>`.
+- Do not send the token in the URL or a custom header.
+- `/health` needs no token; `/v1/*` always does.
+- A rate-limited request is `429`, not `401`.
+
+## Rate limits
+
+### `429 rate limit exceeded`
+
+The socket peer exhausted `LIVEENGINE_RATE_LIMIT_REQUESTS` in the window. Wait for the window or raise the limit. Unauthenticated requests also consume slots.
+
+### Only one client seems to get rate-limited
+
+If a reverse proxy sits in front, all clients share the proxy's socket peer. The host ignores `X-Forwarded-For`. Apply per-client limits at the proxy or expose the service directly.
+
+## Matching results
+
+### `no_fit` but a room looks compatible
+
+Fit is bidirectional. Check both sides:
+
+```js
+engine.fits('alice', 'room-1');
+engine.getUser('alice');
+engine.getServer('room-1');
+```
+
+Common causes:
+
+- The server is `closed` or already `full`.
+- The server requires a scope the user lacks.
+- The user requires a scope the server lacks.
+- A numeric range excludes the value.
+- An array `contains` compares string forms; `1` matches `"1"`.
+
+### `already_paired`
+
+The user is already in a room. The result's `serverId` is that room. Call `leave` first if you intend to move them.
+
+### `not_paired`
+
+`leave` only succeeds for a user whose status is `paired`.
+
+### `full` or `closed`
+
+`full` means `members.length >= capacity`. `closed` is an explicit server status. `setServerStatus(id, 'full')` returns `false` when the server is not actually full.
+
+### Pairing did not emit an event
+
+- `LiveEngine` only flushes after mutating methods.
+- With `autoEmit: false`, call `drainEvents()` yourself.
+- In a hosted engine, drain events before the queue hits `max_events`.
+
+### `server_ready` did not fire
+
+It fires exactly when membership reaches `minMembers` and `minMembers > 0`. It does not repeat after that.
+
+### Match order changes unexpectedly
+
+`first` uses arrival order, not ID order. `random` depends on the seed. `leastLoaded`/`mostLoaded` are meaningful for server queries; for user queries `load` is always 0. Use `affinity` for user ordering.
+
+## Hosting
+
+### `404 hub not found`
+
+The registration may have expired (`ttlSeconds`) or the host may have restarted. List hubs:
+
+```sh
+curl -H "Authorization: Bearer $LIVEENGINE_TOKEN" "$HUB/v1/hubs"
+```
+
+### `409 hub id already registered`
+
+Choose a different ID or remove the existing registration. Imports can also produce ID conflicts; use a different prefix.
+
+### `507 hub registry is full`
+
+Raise `LIVEENGINE_MAX_HUBS` or remove unused registrations. Imports count against the same limit.
+
+### `413` on a valid mutation
+
+Check:
+
+- request body size
+- argument count
+- generated count
+- entity budget (`max_entities`)
+- pending events (`pendingEvents` and `max_events`)
+
+Drain events and split large bulk upserts.
+
+### `504` and then `503` or `409`
+
+A handler timed out but is still running and holding its permit/lock. Wait for it to finish and reconcile state before retrying. The timeout did not cancel or roll back the handler.
+
+### State disappeared after restart
+
+Expected. Registry, TTL, users, servers, memberships, and events are in memory. Re-register hubs and rebuild application state from your own persistence.
+
+### `LIVEENGINE_BIND` fails to parse
+
+The value must be `IP:port`, not a hostname. Use `0.0.0.0:8787`, `127.0.0.1:8787`, or `[::1]:8787`.
+
+## External hubs and imports
+
+### `400 remote host is not in LIVEENGINE_ALLOWED_REMOTE_HOSTS`
+
+Add the exact hostname (or a deliberate `*.suffix`) to the central host's allowlist and restart. The check happens before any connection.
+
+### `502` during external registration
+
+The handshake failed. Verify, from the central host's network:
+
+```sh
+curl -H "Authorization: Bearer $REMOTE_TOKEN" https://remote.example.net/health
+curl -H "Authorization: Bearer $REMOTE_TOKEN" https://remote.example.net/v1/contract
+curl -H "Authorization: Bearer $REMOTE_TOKEN" https://remote.example.net/v1/hubs/ranked-au
+```
+
+The remote token must be at least 24 bytes and must match the remote service.
+
+### Compose external registration fails with `http://remote:8787`
+
+The central container can resolve `remote`, but your laptop cannot. Use `http://127.0.0.1:8788` from the host and `http://remote:8787` from central. Make sure `LIVEENGINE_ALLOWED_REMOTE_HOSTS=remote` on central.
+
+### Imported hub is missing
+
+Imports are snapshots. Register the remote hub first, then import again. Check that the prefix produces the ID you expect.
+
+### `508 forwarding hop limit reached`
+
+The external chain is too long or loops. Shorten it. A hop value of `2` at an external hub is terminal.
+
+## Containers
+
+### Health check fails
+
+```sh
+docker logs <container>
+```
+
+Confirm `LIVEENGINE_TOKEN` is at least 24 bytes and `LIVEENGINE_BIND` is `0.0.0.0:8787` inside the container. The image already sets the bind value.
+
+### `scripts/test-containers.sh` cannot find ports
+
+The script uses `docker port` or `podman port`. Make sure the runtime is running and the image tag matches. It cleans up on exit, so rerun rather than reusing old containers.
+
+## Gogh Strike
+
+### `403 Invalid Host header`
+
+Open the bridge through `http://127.0.0.1:8967` or `http://localhost:8967`. Do not use a LAN IP; the bridge binds only to loopback.
+
+### `403 Cross-origin request rejected`
+
+Send the join request from the served page origin, not a different host or port.
+
+### `503 Set LIVEENGINE_URL and LIVEENGINE_TOKEN`
+
+The bridge is running without matchmaking configuration. Export both variables and restart the bridge.
+
+### `502` or `409` from the join route
+
+Check the central host logs, the hub registration, and the remote handshake if using external mode. The bridge intentionally returns generic upstream errors and does not reflect tokens.
+
+### Playwright flow did not run
+
+Set `PLAYWRIGHT_PATH` to a Playwright `index.mjs`. The integration does not install Playwright.
+
+## Docs site
+
+### `mint validate` fails on an internal link
+
+Every page listed in `docs.json` must exist as an `.mdx` file. Internal links use root-relative paths such as `/quickstart`, `/node/engine`, or `/protocol/endpoints`.
+
+### The docs site is not deployed by CI
+
+The repository does not include a docs deployment workflow. Connect `docs-site/` to Mintlify separately and validate locally before merging.
+
+## FAQ
+
+**Does LiveEngine persist matchmaking state?** No. State is in memory in 0.2.2.
+
+**Can I use it without Rust installed?** Yes, on a supported platform with a release tarball. Unsupported platforms and source installs need Rust 1.88+.
+
+**Can I use only the HTTP client?** Yes. Import `@dixonsolutions/liveengine/hubs`.
+
+**Does the host authenticate players?** No. It authenticates one administrative bearer token. Add player auth in your application or bridge.
+
+**Can a remote hub be another vendor's service?** Yes, if it implements `liveengine.hub/v1`, including health, contract, hub presence, call, and error behavior.
+
+**Does deleting an external hub stop the remote?** No. It removes only the local route.
+
+**Does the host follow redirects?** No.
+
+**Does a timeout roll back a mutation?** No. The handler may finish after the caller receives `504`.
+
+**Is `scopeSchema` a full JSON Schema validator?** No. It is a documented subset.
+
+**Does Gogh Strike synchronize game state?** No. Gameplay is locally simulated.

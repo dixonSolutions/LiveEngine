@@ -1,0 +1,98 @@
+---
+title: "Security model and limits"
+description: "Administrative authentication, peer rate budgets, remote-host allowlists, request budgets, and the boundaries of 0.2.2."
+---
+
+LiveEngine 0.2.2 provides **administrative** security. It does not provide player accounts, per-player authorization, tenant isolation, or durable storage. Treat the hub token as a server-side secret and put application authentication in front of player-facing routes.
+
+## Token authentication
+
+- `LIVEENGINE_TOKEN` is required and must contain at least 24 bytes.
+- Data endpoints require `Authorization: Bearer <token>`.
+- `GET /health` is intentionally unauthenticated for liveness checks.
+- Token comparison is constant-time over the supplied and expected bytes and also checks length.
+- Failure returns `401` with `{"error":"unauthorized"}` and does not echo the token.
+
+A short token fails at startup before the listener binds:
+
+```text
+liveengine-hub: LIVEENGINE_TOKEN must be at least 24 bytes
+```
+
+## Peer rate budgets
+
+Every non-health request consumes a rate slot **before** authentication, keyed by the actual socket peer IP:
+
+- `LIVEENGINE_RATE_LIMIT_REQUESTS` (default `120`) per window.
+- `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` (default `60`).
+- `LIVEENGINE_RATE_LIMIT_PEERS` (default `4096`).
+
+The host ignores `X-Forwarded-For` and does not trust proxy headers for identity. If the peer table is full, a **new** peer is rejected rather than evicting an active peer's budget. This preserves active budgets but means a shared reverse proxy consumes one budget for all of its clients.
+
+<Warning>
+Behind a shared reverse proxy, the socket peer is the proxy. All public clients share one peer budget. Apply public-client rate limits at the proxy as well, or give the service a dedicated reachable address.
+</Warning>
+
+## Remote-host allowlist
+
+Remote registrations and registry imports are only allowed for hosts listed in `LIVEENGINE_ALLOWED_REMOTE_HOSTS` (comma-separated, case-insensitive, trimmed). Validation runs **before** any outbound connection, so a disallowed host is rejected with `400` rather than attempted.
+
+```sh
+LIVEENGINE_ALLOWED_REMOTE_HOSTS=remote,hub.internal.example
+```
+
+- Entries match the exact lowercased hostname (IPv4/IPv6 addresses are host strings too).
+- A `*.` entry matches subdomains of the suffix but not the suffix itself.
+- Listing loopback or private addresses is an explicit authorization to connect to them.
+- Only list hosts you control; this allowlist is the SSRF boundary for remote registration.
+
+Remote addresses must be absolute `http` or `https` URLs, at most 2048 bytes, with no username, password, query, or fragment. Redirects are disabled on outbound requests.
+
+## Outbound behavior
+
+- The HTTP client follows **no redirects**.
+- Outbound requests use the configured `request_timeout` (default 5 seconds).
+- Remote responses are bounded by `max_response_bytes` (default 4 MiB).
+- Remote credentials are sent only as bearer tokens to the registered remote address, and are redacted from discovery/import responses.
+
+## Request and resource budgets
+
+The host enforces, before or during a call:
+
+| Budget | Default | Rejection |
+| --- | --- | --- |
+| Request body | 1 MiB | `413` |
+| Response body | 4 MiB | `413` |
+| Arguments per call | 256 | `413` |
+| JSON nesting depth | 64 | `400` |
+| Generated users per call | 10000 | `413` |
+| In-flight calls | 16 | `503` |
+| Registered hubs | 256 | `507` |
+| Entities per engine | 100000 | `413` |
+| Pending events per engine | 100000 | `413` |
+
+The entity and event checks run in preflight for internal handlers, so a rejected call does not mutate state. The response size, entity, and event checks also run on the result before it is returned.
+
+## Handler execution and timeouts
+
+Internal handlers run on blocking workers. The route applies `request_timeout`:
+
+- A timed-out request returns `504`.
+- The handler that already started is **not** cancelled or rolled back.
+- It continues to hold its global in-flight permit and the engine lock until it finishes.
+- Retrying a mutation while the first attempt is still running can produce conflicting state. Reconcile before retrying.
+
+A concurrent call to a busy handler returns `409`; a poisoned handler lock returns `503`.
+
+## Scope validation is not a validator
+
+`scopeSchema` supports only a subset: object type, required properties, primitive property type checks, `enum`, and `additionalProperties: false`. It is not execution, code loading, or a complete JSON Schema implementation. Validate application-specific payloads inside your handler.
+
+## Explicit non-goals in 0.2.2
+
+- No player authentication or authorization.
+- No tenant isolation policy.
+- No persistence or restart recovery.
+- No built-in TLS termination; use an ingress or reverse proxy.
+- No automatic discovery beyond registry listing and explicit imports.
+- No multiplayer state replication in the Gogh Strike integration.

@@ -1,0 +1,119 @@
+---
+title: "Users, servers, and match lifecycle"
+description: "Statuses, bidirectional fit, capacity rules, and exactly what join, leave, upsert, and removal do."
+---
+
+An `Engine` holds two maps: **users** and **servers**. Pairing is the only operation that changes both in one step, and every operation updates the event queue atomically.
+
+## Users
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `id` | required | Coerced to a string if not one; `user.id is required` if absent |
+| `scopes` | `{}` | Values offered to server requirements |
+| `requirements` | no rules | What a server must provide |
+| `status` | `waiting` | One of `waiting`, `paired`, `idle` |
+
+`User` objects also expose `serverId` (`null` when unpaired) and `seq` (arrival order).
+
+## Servers
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `id` | required | Coerced to a string if not one |
+| `scopes` | `{}` | Values offered to user requirements |
+| `requirements` | no rules | What a user must provide |
+| `status` | `open` | One of `open`, `full`, `closed` |
+| `capacity` | `1` | Minimum 1 |
+| `minMembers` | `0` | Threshold for `server_ready` |
+| `members` | `[]` | User IDs currently paired |
+| `free` | computed | `capacity - members.length`, saturating at 0 |
+| `seq` | assigned | Arrival order |
+
+## Fit is bidirectional
+
+A user fits a server only when all of these are true:
+
+1. The server is available: `status === 'open'` and `members.length < capacity`.
+2. **Server requirements** evaluate `true` against the **user's scopes**.
+3. **User requirements** evaluate `true` against the **server's scopes**.
+
+This prevents a player from entering a room that rejects them, and prevents a room from accepting a player it does not want. `fits(userId, serverId)` performs the same check without mutating state.
+
+## Upsert semantics
+
+`upsertUser` returns `true` when the user was newly added and `false` when an existing user was updated. `upsertUsers` returns the number of newly added users.
+
+An update preserves the user's `seq` and `serverId`. It also preserves pairing: if the old user or the incoming user has status `paired`, the stored status remains the old status. A **new** user submitted with status `paired` is normalized to `waiting`. Therefore you cannot use an upsert to move or unpair a user; use `join`, `leave`, or `setUserStatus`.
+
+`upsertServer` follows the same added/updated contract. Updates preserve `seq` and `members`. A new server submitted as `full` is normalized to `open`. An updated server submitted as `full` keeps its previous status before availability is recomputed.
+
+Upserts re-index server scopes used by equality lookups.
+
+## Availability transitions and events
+
+After any membership change, `refresh` recomputes availability:
+
+- `open` becomes `full` when `members.length >= capacity`.
+- `full` becomes `open` when `members.length < capacity`.
+- A transition from available to unavailable emits `server_full` when the new status is `full`, otherwise `server_unavailable`.
+- A transition from unavailable to available emits `server_available`.
+
+## Join
+
+`join(userId, serverId)` checks in order:
+
+1. `user_not_found`
+2. `server_not_found`
+3. `already_paired` (the result's `serverId` is the current room)
+4. `closed` or `full`
+5. `no_fit`
+
+On success the user becomes `paired`, the server gains the member, a `paired` event is emitted, availability is refreshed, and `server_ready` is emitted **once**, when membership exactly reaches `minMembers` and `minMembers > 0`. The `server_ready` event carries `ids`: the current member list.
+
+```js
+const engine = new LiveEngine();
+engine.on('server_ready', ev => console.log('table ready', ev.serverId, ev.ids));
+
+engine.upsertServer({ id: 'table', capacity: 4, minMembers: 2 });
+for (const id of ['p1', 'p2', 'p3']) {
+  engine.upsertUser({ id });
+  engine.autoJoin(id);
+}
+// one server_ready event with ids: ['p1', 'p2']
+```
+
+## Leave and removal
+
+- `leave(userId)` fails with `user_not_found` or `not_paired`. On success it removes the member, emits `unpaired` with `reason: 'left'`, refreshes the server, and returns the user to `waiting`.
+- `removeUser(id)` leaves the current room first (if paired) with `reason: 'user_removed'`, then deletes the user and emits `user_removed`.
+- `removeServer(id)` leaves every member with `reason: 'server_removed'`, removes the server and its index/availability entries, then emits `server_removed`.
+- `setUserStatus(id, status)` returns `false` if the user is absent. Setting `paired` returns whether the user is already paired and does not change state. Any other status first leaves a paired user with `reason: 'status_change'`, then sets the status.
+- `setServerStatus(id, status)` returns `false` if the server is absent or if you try to set `full` while `members.length < capacity`.
+
+## Match results are queries, not stored objects
+
+`findServersForUser`, `findUsersForServer`, `advertise`, and `matchAll` return match records:
+
+```json
+{ "id": "room-1", "score": 3, "load": 0 }
+```
+
+`id` identifies the user or server depending on the query direction. `score` is strategy-dependent. `load` is the server's current member count (it is always `0` for user results returned by `findUsersForServer`).
+
+`matchAll(options)` walks waiting users in arrival order, finds the best first match for each with `limit` forced to 1, and joins them. It returns only the results of successful joins.
+
+## Stats
+
+`stats()` returns counters that are useful for health checks and tests:
+
+```json
+{
+  "users": 4, "waiting": 2, "paired": 1, "idle": 1,
+  "servers": 2, "open": 1, "full": 1, "closed": 0,
+  "pendingEvents": 9,
+  "totalJoins": 1, "totalLeaves": 0, "totalMatchesEvaluated": 6
+}
+```
+
+`totalMatchesEvaluated` counts every `fits` evaluation performed by the engine, including internal matchmaking checks.

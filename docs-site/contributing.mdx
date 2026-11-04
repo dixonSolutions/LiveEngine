@@ -1,0 +1,162 @@
+---
+title: "Contributing and repository layout"
+description: "Where the code lives, how to build and test it, what CI runs, and how releases and docs fit together."
+---
+
+## Repository layout
+
+```text
+src/
+  engine.rs          users, servers, matching, generation, events
+  rules.rs           requirement parsing, coercion, evaluation, scopes
+  hub.rs             HTTP host, registry, auth, limits, forwarding, imports
+  node.rs            N-API NativeEngineCore
+  lib.rs             crate exports and feature gates
+  bin/liveengine-hub.rs   standalone host
+lib/
+  index.js           Node LiveEngine/NativeEngine wrappers
+  hubs.js            HTTP HubClient
+index.d.ts           Node type declarations
+bin/
+  liveengine-hub.js  npm command; spawns the Rust binary or cargo run
+test/                Node tests (engine, math game, HubClient)
+tests/               Rust integration tests (engine, hubs)
+examples/
+  custom-hub.rs      in-process custom handler example
+integrations/
+  gogh-strike/       optional browser-game bridge, patch, adapter/e2e tests
+scripts/             build, install, packaging, container and network tests
+docs/                hosting, publishing, validation, hub contract schema
+docs-site/           this Mintlify documentation site
+Dockerfile           standard host image
+Dockerfile.custom    custom-hub image
+compose.yaml         central + remote example
+Cargo.toml, package.json, CHANGELOG.md
+.github/workflows/   ci.yml, network-test.yml, release.yml
+```
+
+## Requirements
+
+- Rust 1.88 or newer
+- Node.js 22 or newer
+- Docker or Podman for container checks
+- OpenSSL for generating test secrets
+
+## Build
+
+```sh
+npm ci            # installs Node deps and builds the Rust addon if needed
+npm run build     # release Node addon into native/
+npm run build:hub # standalone host binary into native/
+cargo build --locked
+cargo build --locked --release --bin liveengine-hub
+```
+
+## Test
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+npm test
+npm run test:integration
+npm run build:hub
+npm pack --dry-run
+cargo package --locked
+```
+
+Node tests use the built-in `node:test` runner:
+
+```text
+test/engine.test.js
+test/math-game.test.js
+test/hub-client.test.js
+```
+
+The Gogh Strike adapter test has no install step:
+
+```sh
+node --test integrations/gogh-strike/bridge.test.mjs
+```
+
+Benchmark:
+
+```sh
+npm run bench
+node bench/bench.js 500 5000
+```
+
+## Container tests
+
+```sh
+docker build -t liveengine:test .
+docker build -f Dockerfile.custom -t liveengine-custom:test .
+bash scripts/test-containers.sh docker liveengine:test liveengine-custom:test
+```
+
+Podman works with the same script:
+
+```sh
+bash scripts/test-containers.sh podman liveengine:local liveengine-custom:test
+```
+
+The script creates isolated central and remote containers (and a custom container when a custom image is supplied), uses different tokens, performs the handshake, forwards matchmaking, imports the remote registry, verifies auth denial, checks detach semantics, and cleans up.
+
+## Package test
+
+`scripts/test-package.js` installs a packed tarball into a temporary directory and exercises the native engine, `HubClient` export, and the standalone host's token validation:
+
+```sh
+npm pack
+node scripts/test-package.js
+```
+
+## CI
+
+`.github/workflows/ci.yml` runs two jobs.
+
+**test** matrix:
+
+| Dimension | Values |
+| --- | --- |
+| OS | `ubuntu-latest`, `macos-latest`, `windows-latest` |
+| Node | `22`, `24` |
+
+Steps: `cargo fmt`, `cargo test --locked`, `cargo clippy --locked --all-targets -- -D warnings`, `npm ci`, `npm test`, `npm run test:integration`. The benchmark runs only on Linux with Node 24.
+
+**containers** (Ubuntu):
+
+1. Builds the standard image.
+2. Builds the custom-hub image.
+3. Runs `scripts/test-containers.sh docker liveengine:test liveengine-custom:test`.
+
+## Keeping the SDKs aligned
+
+The Rust `dispatch` methods and Node `LiveEngine` methods share names, argument order, and result shapes. When adding behavior:
+
+1. Implement it in `src/engine.rs`.
+2. Add or update Rust tests in `tests/engine.rs`.
+3. Update Node types in `index.d.ts` and tests in `test/engine.test.js`.
+4. If it affects hosting, update `src/hub.rs` and `tests/hubs.rs`.
+5. Update the hub schema and these docs when the protocol changes.
+6. Run the full validation list above.
+
+## Releases
+
+Versions in `Cargo.toml` and `package.json` must match. The release workflow checks that a `v<version>` tag matches both manifests. See [Publishing and releases](/publishing) for trusted publisher setup, the tag workflow, and idempotent publish checks.
+
+## Docs site
+
+This site lives in `docs-site/` with `docs.json` and MDX pages. It is not built by the repository CI currently. Validate it locally before review:
+
+```sh
+cd docs-site
+npx -y mint@latest validate
+npx -y mint@latest broken-links
+```
+
+The site references `dixonSolutions/LiveEngine`; do not point it at a different repository. Deployment is a separate Mintlify connection/account operation, not a workflow in this repository.
+
+## Changelog
+
+Record user-visible changes in `CHANGELOG.md` under the current version. The 0.2.2 entry covers the Mintlify docs and framework recipes; 0.2.1 covers the trusted-publisher release, idempotent publish checks, and Cargo test packaging; 0.2.0 covers the Rust replacement and hub system.
