@@ -137,7 +137,7 @@ Remote imports are explicit snapshots taken at request time; registrations added
 
 ## Contract and DTOs
 
-[Hub protocol schema](docs/hub-contract.schema.json) defines registrations, discovery, calls, registry imports and errors. Internal and external modes use the same DTOs; external mode additionally requires its address and credential. Hub IDs use ASCII letters, digits, dots, underscores and hyphens (1–128 characters).
+[Hub protocol schema](docs/hub-contract.schema.json) defines registrations, discovery, calls, registry imports and errors. Internal and external modes use the same DTOs; external mode additionally requires its address and credential. Hub IDs use ASCII letters, digits, dots, underscores and hyphens (1–128 characters); the path segments `.` and `..` are rejected.
 
 | Endpoint | Purpose |
 | --- | --- |

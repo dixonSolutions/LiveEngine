@@ -1016,7 +1016,9 @@ async fn forward_call(
 
 fn validate_registration(state: &Inner, r: &HubRegistration) -> Result<(), String> {
     let id = r.id.trim();
-    if id.is_empty()
+    if id != r.id
+        || matches!(id, "." | "..")
+        || id.is_empty()
         || id.len() > 128
         || !id
             .bytes()
@@ -1051,7 +1053,8 @@ fn validate_registration(state: &Inner, r: &HubRegistration) -> Result<(), Strin
         }
         HubMode::External
             if r.remote_hub_id.as_ref().is_some_and(|id| {
-                id.is_empty()
+                matches!(id.as_str(), "." | "..")
+                    || id.is_empty()
                     || id.len() > 128
                     || !id
                         .bytes()

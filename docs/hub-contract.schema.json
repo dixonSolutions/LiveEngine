@@ -21,7 +21,13 @@
       "properties": {
         "id": {
           "type": "string",
-          "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+          "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          }
         },
         "mode": {
           "$ref": "#/$defs/HubMode"
@@ -32,7 +38,13 @@
         },
         "remoteHubId": {
           "type": "string",
-          "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+          "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          }
         },
         "remoteToken": {
           "type": "string",
@@ -103,7 +115,13 @@
       "properties": {
         "id": {
           "type": "string",
-          "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+          "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          }
         },
         "mode": {
           "$ref": "#/$defs/HubMode"
@@ -114,7 +132,13 @@
         },
         "remoteHubId": {
           "type": "string",
-          "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+          "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          }
         },
         "scopes": {
           "type": "object"

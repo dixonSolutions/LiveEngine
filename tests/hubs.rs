@@ -535,3 +535,21 @@ async fn new_peers_cannot_evict_and_reset_an_active_rate_budget() {
         );
     }
 }
+
+#[tokio::test]
+async fn rejects_hub_ids_that_normalize_as_url_path_segments() {
+    let app = HubService::new(config()).unwrap().router();
+    for id in [".", "..", " padded "] {
+        let (status, _) = request(
+            app.clone(),
+            "POST",
+            "/v1/hubs",
+            Some(json!({"id":id,"mode":"internal"})),
+            true,
+        )
+        .await;
+        assert_eq!(status, 400, "unaddressable hub id must be rejected: {id}");
+    }
+    let (_, list) = request(app, "GET", "/v1/hubs", None, true).await;
+    assert_eq!(list["hubs"], json!([]));
+}
