@@ -48,10 +48,11 @@ try {
 
   let remoteAddress = '';
   if (mode === 'external') {
-    remoteAddress = process.env.LIVEENGINE_REMOTE_URL || '';
-    assert.ok(remoteAddress, 'Set LIVEENGINE_REMOTE_URL when LIVEENGINE_HUB_MODE=external');
+    const remoteClientUrl = process.env.LIVEENGINE_REMOTE_URL || '';
+    assert.ok(remoteClientUrl, 'Set LIVEENGINE_REMOTE_URL when LIVEENGINE_HUB_MODE=external');
+    remoteAddress = process.env.LIVEENGINE_REMOTE_ADDRESS || remoteClientUrl;
     remoteToken = await readSecret('LIVEENGINE_REMOTE_TOKEN');
-    remote = new HubClient(remoteAddress, {token: remoteToken});
+    remote = new HubClient(remoteClientUrl, {token: remoteToken});
     await remote.contract();
     const remoteList = await remote.list();
     const remoteHubs = Array.isArray(remoteList) ? remoteList : remoteList.hubs || [];

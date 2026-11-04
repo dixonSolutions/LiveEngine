@@ -55,3 +55,7 @@ node scripts/test-network.js
 ```
 
 Keep administrative credentials in the server-side bridge rather than browser game code. For production applications, implement player authentication and authorization in that application bridge.
+
+The Compose example exposes central port 8787 on the chosen interface and remote management port 8788 only on loopback. It uses separate credentials from `.env`.
+
+For hubs with a `scopeSchema`, user/server upserts are validated before dispatch. `generateUsers` is rejected for these hubs; generate locally and submit validated users with `upsertUsers`. The active peer budget table rejects new peers at capacity instead of evicting and resetting existing budgets.

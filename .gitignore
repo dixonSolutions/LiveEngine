@@ -10,3 +10,5 @@ npm-debug.log*
 .env
 .env.*
 !.env.example
+
+/LOCAL-RUNNING.md

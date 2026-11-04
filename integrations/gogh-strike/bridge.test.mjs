@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import http from 'node:http';
+import {mkdtemp, writeFile, rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {after, before, test} from 'node:test';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../gogh-strike');
+let root;
 const bridge = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'bridge.mjs');
 let upstream, upstreamPort, bridgePort, child;
 const users = new Map();
@@ -34,6 +36,8 @@ function rawPost(port, headers, body) {
 }
 
 before(async () => {
+  root = await mkdtemp(path.join(tmpdir(), 'liveengine-game-fixture-'));
+  await writeFile(path.join(root, 'index.html'), '<!doctype html><title>Gogh Strike fixture</title>');
   upstream = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const auth = req.headers.authorization;
@@ -70,8 +74,11 @@ before(async () => {
       LIVEENGINE_URL: `http://127.0.0.1:${upstreamPort}`, LIVEENGINE_TOKEN: 'test-token', LIVEENGINE_HUB_ID: 'gogh-test'},
     stdio: 'ignore',
   });
+  let startupError;
+  child.once('error', error => { startupError = error; });
   const base = `http://127.0.0.1:${bridgePort}`;
   for (let i = 0; i < 60; i++) {
+    if (startupError) throw startupError;
     try { if ((await fetch(`${base}/health`)).ok) return; } catch {}
     await new Promise(resolve => setTimeout(resolve, 50));
   }
@@ -80,7 +87,8 @@ before(async () => {
 
 after(async () => {
   child?.kill('SIGTERM');
-  await new Promise(resolve => upstream?.close(resolve));
+  if (upstream?.listening) await new Promise(resolve => upstream.close(resolve));
+  if (root) await rm(root, {recursive: true, force: true});
 });
 
 test('bridge serves the game and keeps the service bearer token server-side', async () => {

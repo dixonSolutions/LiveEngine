@@ -52,6 +52,8 @@ LIVEENGINE_REMOTE_TOKEN_FILE=/path/to/remote-token \
 node integrations/gogh-strike/e2e.mjs
 ```
 
+For the Compose services, set `LIVEENGINE_REMOTE_ADDRESS=http://remote:8787` as well: the test client reaches the remote through loopback port 8788, while the central container forwards through the container hostname.
+
 For optional headless browser coverage, set `PLAYWRIGHT_PATH` to a Playwright `index.mjs` and optionally set `CHROMIUM_PATH` to the browser executable. The runner checks the lobby checkbox, starts a match, verifies the LiveEngine toast and browser user pairing, then saves `/tmp/liveengine-gogh-lobby.png` (override with `GOGH_SCREENSHOT`). It does not install Playwright into either project.
 
 Validated on upstream commit `2285e640097d9b12bcc42af72d5e8d0b37082f51`. `npm test` passed all 168 upstream tests, `npm run build` passed, and `node --test integrations/gogh-strike/bridge.test.mjs` passed. The live external-hub run reported `service join ok`, and optional Playwright reported `phase playing` with zero page errors; the screenshot was saved to `/tmp/liveengine-gogh-lobby.png`. A wrong local bearer returned HTTP 401 with a generic message and no token reflection. The test ran against local central and remote HTTP services, not a remote device.

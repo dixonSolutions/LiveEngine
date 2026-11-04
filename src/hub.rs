@@ -419,13 +419,8 @@ fn take_rate_slot(state: &Inner, peer: String) -> bool {
     let mut map = state.rate.lock().unwrap_or_else(|e| e.into_inner());
     map.retain(|_, entry| now.duration_since(entry.started) < state.config.rate_limit_window);
     if !map.contains_key(&peer) && map.len() >= state.config.rate_limit_peers {
-        if let Some(oldest) = map
-            .iter()
-            .min_by_key(|(_, e)| e.started)
-            .map(|(k, _)| k.clone())
-        {
-            map.remove(&oldest);
-        }
+        // Preserve active budgets: a new peer must not reset an existing peer's limit.
+        return false;
     }
     let entry = map.entry(peer).or_insert(RateEntry {
         started: now,
@@ -1136,6 +1131,7 @@ fn validate_scope_schema(scopes: &Value, schema: &Value) -> Result<(), String> {
 
 fn validate_call_scopes(schema: &Value, call: &CallRequest) -> Result<(), String> {
     let items: Vec<&Value> = match call.method.as_str() {
+        "generateUsers" => return Err("generateUsers requires a hub without scopeSchema; generate locally and upsert validated users".into()),
         "upsertUser" | "upsertServer" => call.args.first().into_iter().collect(),
         "upsertUsers" | "upsertServers" => call
             .args

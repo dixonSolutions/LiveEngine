@@ -341,6 +341,27 @@ async fn custom_internal_handlers_share_http_limits_and_schema_validation() {
     .await;
     assert_eq!(status, 200);
     assert!(absent["result"].is_null());
+    let (status, _) = request(
+        app.clone(),
+        "POST",
+        "/v1/hubs/validated/call",
+        Some(json!({"method":"generateUsers","args":[1]})),
+        true,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "generation must not bypass the hub scope schema"
+    );
+    let (_, stats) = request(
+        app.clone(),
+        "POST",
+        "/v1/hubs/validated/call",
+        Some(json!({"method":"stats"})),
+        true,
+    )
+    .await;
+    assert_eq!(stats["result"]["users"], 0);
     let (status, _) = request(app, "POST", "/v1/hubs/validated/call", Some(json!({"method":"upsertUser","args":[{"id":"unexpected","scopes":{"region":"au","extra":true}}]})), true).await;
     assert_eq!(status, 400);
 }
@@ -479,4 +500,38 @@ async fn timed_out_blocking_handler_keeps_its_global_permit_until_finished() {
         "the handler's second wait should also be bounded"
     );
     assert_eq!(response["error"], "request exceeded configured timeout");
+}
+
+#[tokio::test]
+async fn new_peers_cannot_evict_and_reset_an_active_rate_budget() {
+    let service = HubService::new(HubConfig {
+        rate_limit_peers: 1,
+        rate_limit_requests: 1,
+        ..config()
+    })
+    .unwrap();
+    let app = service.router();
+    for (ip, expected) in [
+        ([127, 0, 0, 1], 200),
+        ([127, 0, 0, 2], 429),
+        ([127, 0, 0, 1], 429),
+    ] {
+        let mut request = axum::http::Request::builder()
+            .uri("/v1/hubs")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((ip, 1234))));
+        assert_eq!(
+            app.clone()
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            expected
+        );
+    }
 }
