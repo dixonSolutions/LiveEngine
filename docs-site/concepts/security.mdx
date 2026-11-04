@@ -1,9 +1,9 @@
 ---
 title: "Security model and limits"
-description: "Administrative authentication, peer rate budgets, remote-host allowlists, request budgets, and the boundaries of 0.2.3."
+description: "Administrative authentication, peer rate budgets, remote-host allowlists, request budgets, and the boundaries of 0.2.4."
 ---
 
-LiveEngine 0.2.3 provides **administrative** security. It does not provide player accounts, per-player authorization, tenant isolation, or durable storage. Treat the hub token as a server-side secret and put application authentication in front of player-facing routes.
+LiveEngine 0.2.4 provides **administrative** security. It does not provide player accounts, per-player authorization, tenant isolation, or durable storage. Treat the hub token as a server-side secret and put application authentication in front of player-facing routes.
 
 ## Token authentication
 
@@ -88,7 +88,7 @@ A concurrent call to a busy handler returns `409`; a poisoned handler lock retur
 
 `scopeSchema` supports only a subset: object type, required properties, primitive property type checks, `enum`, and `additionalProperties: false`. It is not execution, code loading, or a complete JSON Schema implementation. Validate application-specific payloads inside your handler.
 
-## Explicit non-goals in 0.2.3
+## Explicit non-goals in 0.2.4
 
 - No player authentication or authorization.
 - No tenant isolation policy.

@@ -7,8 +7,8 @@ description: "Registries, trusted publishers, the tag and dispatch workflow, ide
 
 | Registry | Name | Current state |
 | --- | --- | --- |
-| npm | `@dixonsolutions/liveengine` | `0.2.3` published; `0.2.1` was the trusted-publishing release and `0.2.0` the bootstrap release |
-| crates.io | `liveengine` (binary `liveengine-hub`) | `0.2.3` published; `0.2.1` was the trusted-publishing release and `0.2.0` the bootstrap release |
+| npm | `@dixonsolutions/liveengine` | `0.2.4` published; `0.2.1` was the trusted-publishing release and `0.2.0` the bootstrap release |
+| crates.io | `liveengine` (binary `liveengine-hub`) | `0.2.4` published; `0.2.1` was the trusted-publishing release and `0.2.0` the bootstrap release |
 
 Both manifests use the same version. The release workflow verifies that a `v<version>` tag matches both `Cargo.toml` and `package.json` through `scripts/check-release.js`.
 
@@ -70,8 +70,20 @@ If the crate name is already owned by another publisher, choose an available nam
 
 `.github/workflows/release.yml` triggers on:
 
+- every push to `main`
 - a pushed tag matching `v*`
 - manual `workflow_dispatch` with a boolean `publish` input (default `false`)
+
+### Automatic main releases
+
+A preflight job reads the manifest version and checks both registries:
+
+- If the version is missing from npm or crates.io, the build matrix runs and the
+  missing registry publish steps run automatically.
+- If both registries already contain the version, the build and publish jobs are
+  skipped. Routine commits to `main` therefore do not rebuild five platforms.
+- Tag pushes always run the build so the GitHub release can carry artifacts, but
+  npm and crates.io publish steps still skip versions that already exist.
 
 ### Build matrix
 
@@ -93,12 +105,12 @@ Each build installs Node 24, builds the addon and host binary, runs `cargo test 
 4. Checks whether the manifest version already exists on npm.
 5. Runs `npm pack` and verifies the packed artifact with `node scripts/test-package.js`.
 6. Uploads the package artifact.
-7. Publishes only when the ref is a tag or `publish` is true, **and** the version does not already exist.
+7. Publishes for a tag, an automatic `main` release, or `publish: true`, **and** only when the version does not already exist.
 8. On a tag, creates a GitHub release with the tarball and host binaries.
 
 ### Cargo job
 
-Runs for a tag or `publish: true`, checks the crate version through the crates.io API, authenticates through the trusted publisher, and publishes only if the version does not already exist.
+Runs for a tag, an automatic `main` release, or `publish: true`. It checks the crate version through the crates.io API, authenticates through the trusted publisher, and publishes only if the version does not already exist.
 
 ## Idempotent publish checks
 
@@ -153,8 +165,10 @@ cargo package --locked
 1. Update `Cargo.toml`, `package.json`, and `CHANGELOG.md` to the same version.
 2. Run the full local verification list.
 3. Confirm registry-side publishers are configured and ready.
-4. Commit and create the matching `v<version>` tag.
-5. Push the tag.
+4. Commit and push to `main`. The preflight detects the new version and publishes
+   npm and crates.io automatically.
+5. Optionally create and push the matching `v<version>` tag to build the platform
+   artifacts and create the GitHub release.
 6. Watch the build, npm, and Cargo jobs.
 7. Verify npm provenance and the GitHub release assets.
 

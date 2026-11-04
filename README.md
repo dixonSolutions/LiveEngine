@@ -265,6 +265,6 @@ npm pack --dry-run
 cargo package --locked
 ```
 
-CI runs Rust and Node tests on Linux, macOS and Windows, and an independent central/remote container test on Linux. [Release workflow](.github/workflows/release.yml) builds native addons and host binaries, publishes npm with GitHub OIDC/provenance, and publishes Cargo with crates.io trusted publishing. Registry-side trust must be configured before an OIDC release can succeed. Observed test evidence is recorded in [validation](docs/validation.md). See [publishing](docs/publishing.md) for the bootstrap and exact workflow identity.
+CI runs Rust and Node tests on Linux, macOS and Windows, and an independent central/remote container test on Linux. The [release workflow](.github/workflows/release.yml) also runs on pushes to `main`: when the manifest version is missing from npm or crates.io, it builds native addons and host binaries, publishes npm with GitHub OIDC/provenance, and publishes Cargo with crates.io trusted publishing. Unchanged versions skip the build. Tag pushes build the platform artifacts and create the GitHub release. Registry-side trust must be configured before an OIDC release can succeed. Observed test evidence is recorded in [validation](docs/validation.md). See [publishing](docs/publishing.md) for the bootstrap and exact workflow identity.
 
 MIT licensed. See [LICENSE](LICENSE).

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.4 — 2026-11-04
+
+- The release workflow now runs on every push to `main`. A version that is missing
+  from npm or crates.io is built and published automatically; unchanged versions
+  skip the build matrix and publication.
+- Tag pushes still build the platform artifacts and create the GitHub release, while
+  npm and crates.io publication remains idempotent.
+
 ## 0.2.3 — 2026-11-04
 
 - Added native ping: an unauthenticated `/v1/ping` hub route, Rust `ping_hub`,

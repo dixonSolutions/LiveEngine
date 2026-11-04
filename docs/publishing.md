@@ -4,7 +4,7 @@ npm package: `@dixonsolutions/liveengine`. Cargo crate/binary: `liveengine` / `l
 
 ## Current registry state
 
-- `0.2.3` is published to npm and crates.io; `0.2.2` added the docs site and framework recipes, `0.2.1` was the trusted-publishing release, and `0.2.0` the bootstrap release.
+- `0.2.4` is published to npm and crates.io; `0.2.2` added the docs site and framework recipes, `0.2.1` was the trusted-publishing release, and `0.2.0` the bootstrap release.
 - npm and crates.io trusted publishers are configured for `dixonSolutions/LiveEngine` and `.github/workflows/release.yml`. The npm connection is validated and releases include provenance.
 - Tag releases publish future versions through OIDC. The workflow checks both registries first and skips a version that is already present, so a partially completed release can be retried.
 
@@ -60,6 +60,8 @@ npm pack --dry-run
 cargo package --locked
 ```
 
-Create and push the matching tag after the registry-side publishers are ready. Linux, macOS and Windows builders produce the addon and host binaries. The npm release contains all supported binaries, so installation uses the local prebuilt artifact. Platforms outside the build matrix compile from the included Rust source.
+Pushing a commit to `main` that changes the manifest version to one missing from either registry runs the full build matrix and publishes npm and crates.io automatically. If both registries already contain that version, the workflow runs only its preflight check and skips the build. Tag pushes still build the platform artifacts and create the GitHub release; publish steps skip versions that already exist.
+
+To attach GitHub release assets, create and push the matching tag after the registry-side publishers are ready. Linux, macOS and Windows builders produce the addon and host binaries. The npm release contains all supported binaries, so installation uses the local prebuilt artifact. Platforms outside the build matrix compile from the included Rust source.
 
 A workflow dispatch builds downloadable package artifacts by default. Enable its `publish` input to publish the current manifest version; do not enable publication for an already published version. Registry publication is immutable. The release workflow does not automatically overwrite or unpublish any package.

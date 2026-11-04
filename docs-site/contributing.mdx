@@ -143,7 +143,7 @@ The Rust `dispatch` methods and Node `LiveEngine` methods share names, argument 
 
 ## Releases
 
-Versions in `Cargo.toml` and `package.json` must match. The release workflow checks that a `v<version>` tag matches both manifests. See [Publishing and releases](/publishing) for trusted publisher setup, the tag workflow, and idempotent publish checks.
+Versions in `Cargo.toml` and `package.json` must match. Pushing a new version to `main` runs the release preflight; if the version is missing from npm or crates.io, the workflow builds and publishes it automatically. A matching `v<version>` tag is optional and builds the platform artifacts for a GitHub release. See [Publishing and releases](/publishing) for trusted publisher setup, automatic releases, and idempotent publish checks.
 
 ## Docs site
 
@@ -159,4 +159,4 @@ The site references `dixonSolutions/LiveEngine`; do not point it at a different 
 
 ## Changelog
 
-Record user-visible changes in `CHANGELOG.md` under the current version. The 0.2.3 entry covers native ping and the user hub interface; 0.2.2 covers the Mintlify docs and framework recipes; 0.2.1 covers the trusted-publisher release, idempotent publish checks, and Cargo test packaging; 0.2.0 covers the Rust replacement and hub system.
+Record user-visible changes in `CHANGELOG.md` under the current version. The 0.2.4 entry covers automatic main-branch releases; 0.2.3 covers native ping and the user hub interface; 0.2.2 covers the Mintlify docs and framework recipes; 0.2.1 covers the trusted-publisher release, idempotent publish checks, and Cargo test packaging; 0.2.0 covers the Rust replacement and hub system.

@@ -1,6 +1,7 @@
 name: Release
 on:
   push:
+    branches: [main]
     tags: ['v*']
   workflow_dispatch:
     inputs:
@@ -10,8 +11,84 @@ on:
         default: false
 permissions:
   contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.state.outputs.version }}
+      run_build: ${{ steps.state.outputs.run_build }}
+      run_publish: ${{ steps.state.outputs.run_publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Check manifest and registry state
+        id: state
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          CARGO_VERSION="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "package.json ($VERSION) and Cargo.toml ($CARGO_VERSION) versions differ" >&2
+            exit 1
+          fi
+
+          npm_published=false
+          for attempt in 1 2 3; do
+            if npm view "@dixonsolutions/liveengine@$VERSION" version >/dev/null 2>&1; then
+              npm_published=true
+              break
+            fi
+            sleep 5
+          done
+          crate_status="$(curl -s -o /dev/null -w '%{http_code}' -A 'LiveEngine release workflow' "https://crates.io/api/v1/crates/liveengine/$VERSION")"
+          if [ "$crate_status" = "200" ]; then
+            crate_published=true
+          else
+            crate_published=false
+          fi
+
+          run_build=false
+          run_publish=false
+          if [ "$REF_TYPE" = "tag" ]; then
+            run_build=true
+            run_publish=true
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            run_build=true
+            run_publish="$PUBLISH_INPUT"
+          elif [ "$npm_published" = "false" ] || [ "$crate_published" = "false" ]; then
+            run_build=true
+            run_publish=true
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "run_build=$run_build"
+            echo "run_publish=$run_publish"
+            echo "npm_published=$npm_published"
+            echo "crate_published=$crate_published"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### LiveEngine $VERSION"
+            echo ""
+            echo "| Registry | Published |"
+            echo "| --- | --- |"
+            echo "| npm | $npm_published |"
+            echo "| crates.io | $crate_published |"
+            echo ""
+            echo "\`run_build=$run_build\`, \`run_publish=$run_publish\` ($EVENT_NAME, ref_type=$REF_TYPE)"
+          } >> "$GITHUB_STEP_SUMMARY"
   build:
+    needs: check
+    if: needs.check.outputs.run_build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -50,7 +127,8 @@ jobs:
           path: native/*
           if-no-files-found: error
   npm:
-    needs: build
+    needs: [check, build]
+    if: needs.check.outputs.run_build == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -92,7 +170,7 @@ jobs:
           name: npm-package
           path: "*.tgz"
       - name: Publish through npm OIDC trusted publisher
-        if: (github.ref_type == 'tag' || inputs.publish) && steps.npm-published.outputs.exists != 'true'
+        if: (github.ref_type == 'tag' || inputs.publish || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && steps.npm-published.outputs.exists != 'true'
         run: npm publish --access public --provenance
       - name: Attach package and host binaries to GitHub release
         if: github.ref_type == 'tag'
@@ -100,8 +178,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "${GITHUB_REF_NAME}" ./*.tgz native/liveengine-hub.* --generate-notes --verify-tag
   cargo:
-    if: github.ref_type == 'tag' || inputs.publish
-    needs: build
+    needs: [check, build]
+    if: needs.check.outputs.run_publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
