@@ -8,7 +8,23 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const {HubClient} = createRequire(import.meta.url)('../../lib/hubs.js');
 const gameRoot = path.resolve(process.env.GOGH_STRIKE_ROOT || path.join(here, '../../../gogh-strike'));
 const port = Number(process.env.PORT || 8967);
-const host = '127.0.0.1';
+const host = process.env.HOST || '127.0.0.1';
+const extraHosts = (process.env.GOGH_ALLOWED_HOSTS || '')
+  .split(',')
+  .map(value => value.trim().toLowerCase())
+  .filter(Boolean);
+const extraOrigins = (process.env.GOGH_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(value => value.trim().toLowerCase())
+  .filter(Boolean);
+const allowedHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`, ...extraHosts]);
+if (!['127.0.0.1', 'localhost', '0.0.0.0', '::'].includes(host)) {
+  allowedHosts.add(`${host.toLowerCase()}:${port}`);
+}
+const allowedOrigins = new Set([
+  ...extraOrigins,
+  ...[...allowedHosts].map(value => `http://${value}`),
+]);
 const apiBase = (process.env.LIVEENGINE_URL || '').replace(/\/$/, '');
 const token = process.env.LIVEENGINE_TOKEN || '';
 const remoteToken = process.env.LIVEENGINE_REMOTE_TOKEN || '';
@@ -108,7 +124,6 @@ function getClient() { return client ||= new LiveEngineClient(); }
 const server = http.createServer(async (req, res) => {
   try {
     const hostHeader = req.headers.host?.toLowerCase();
-    const allowedHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
     if (!allowedHosts.has(hostHeader)) return json(res, 403, {error: 'Invalid Host header'});
     const url = new URL(req.url, `http://${host}:${port}`);
     if (url.pathname === '/health') return json(res, 200, {app: 'Gogh Strike LiveEngine bridge', hubId});
@@ -117,7 +132,6 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/liveengine/join' && req.method === 'POST') {
       const origin = req.headers.origin;
-      const allowedOrigins = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`]);
       if (!allowedOrigins.has(origin)) return json(res, 403, {error: 'Cross-origin request rejected'});
       const now = Date.now();
       const timestamps = (joinRates.get(req.socket.remoteAddress) || []).filter(time => now - time < RATE_WINDOW_MS);
@@ -152,4 +166,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(port, host, () => console.log(`Gogh Strike + LiveEngine: http://${host}:${port}`));
+server.listen(port, host, () => {
+  console.log(`Gogh Strike + LiveEngine: http://${host}:${port}`);
+  console.log(`Allowed hosts: ${[...allowedHosts].join(', ')}`);
+});

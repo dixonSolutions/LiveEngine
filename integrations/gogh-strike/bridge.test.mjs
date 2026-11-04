@@ -70,7 +70,8 @@ before(async () => {
   bridgePort = await freePort();
   child = spawn(process.execPath, [bridge], {
     cwd: root,
-    env: {...process.env, PORT: String(bridgePort), HOST: '127.0.0.1', GOGH_STRIKE_ROOT: root,
+    env: {...process.env, PORT: String(bridgePort), HOST: '0.0.0.0', GOGH_STRIKE_ROOT: root,
+      GOGH_ALLOWED_HOSTS: `gogh.test:${bridgePort}`,
       LIVEENGINE_URL: `http://127.0.0.1:${upstreamPort}`, LIVEENGINE_TOKEN: 'test-token', LIVEENGINE_HUB_ID: 'gogh-test'},
     stdio: 'ignore',
   });
@@ -120,6 +121,11 @@ test('bridge serves the game and keeps the service bearer token server-side', as
   const hostileHost = await rawPost(bridgePort, {'Content-Type': 'application/json', Origin: base, Host: 'attacker.example'}, JSON.stringify({userId: 'attacker'}));
   assert.equal(hostileHost, 403);
   assert.equal(calls.length, callsBeforeAttack);
+
+  const networkHost = `gogh.test:${bridgePort}`;
+  const networkOrigin = `http://${networkHost}`;
+  const networkJoin = await rawPost(bridgePort, {'Content-Type': 'application/json', Origin: networkOrigin, Host: networkHost}, JSON.stringify({userId: 'network-player'}));
+  assert.equal(networkJoin, 200);
 
   const repeated = await fetch(`${base}/api/liveengine/join`, {
     method: 'POST', headers: {'Content-Type': 'application/json', Origin: base},

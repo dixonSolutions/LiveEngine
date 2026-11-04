@@ -27,7 +27,31 @@ Open `http://127.0.0.1:8967/`, select **Find a LiveEngine match**, then press **
 
 To target an external hub, set `LIVEENGINE_HUB_MODE=external`, `LIVEENGINE_REMOTE_ADDRESS`, `LIVEENGINE_REMOTE_HUB_ID`, and a separate `LIVEENGINE_REMOTE_TOKEN` (at least 24 characters). The bridge registers that external hub on the local service and passes the remote credential only in that server-side registration. The service must allow the remote host and use matching credentials on the remote service.
 
-The bridge binds only to `127.0.0.1`, validates the Host and Origin headers on matchmaking requests, limits request bodies to 16 KiB, and rate-limits joins. It has no browser-facing token because it is intended for one local player. Do not expose it on a network interface. The upstream game's own `npm start` does not include the proxy; use this bridge command so credentials are not placed in browser storage or URLs. Outbound service calls use `HubClient` with its five-second request timeout.
+The bridge validates the Host and Origin headers on every request, limits request bodies to 16 KiB, and rate-limits joins. It has no browser-facing token. The upstream game's own `npm start` does not include the proxy; use this bridge command so credentials are not placed in browser storage or URLs. Outbound service calls use `HubClient` with its five-second request timeout.
+
+## Hosting on a network
+
+By default the bridge binds to `127.0.0.1`. To serve the game on a private LAN or Tailscale network, bind the address you want and keep the Host/Origin allowlist narrow:
+
+```sh
+HOST=100.115.126.72 PORT=8967 \
+LIVEENGINE_URL=http://127.0.0.1:8787 \
+LIVEENGINE_TOKEN=your-local-token \
+LIVEENGINE_HUB_ID=gogh-strike \
+GOGH_STRIKE_ROOT=../gogh-strike \
+node integrations/gogh-strike/bridge.mjs
+```
+
+When `HOST` is a concrete address, `HOST:PORT` is allowed automatically alongside loopback. If you bind `0.0.0.0` or want multiple addresses, list them explicitly:
+
+```sh
+HOST=0.0.0.0 \
+GOGH_ALLOWED_HOSTS=100.115.126.72:8967,10.1.1.239:8967 \
+GOGH_ALLOWED_ORIGINS=https://gogh.example.net \
+node integrations/gogh-strike/bridge.mjs
+```
+
+The bridge has no player authentication. Expose it only on a private network such as Tailscale or a trusted LAN, or put your own authenticated proxy in front of it. Do not publish it directly to the Internet.
 
 Run the bridge adapter test without installing dependencies:
 

@@ -57,7 +57,33 @@ node integrations/gogh-strike/bridge.mjs
 
 Open `http://127.0.0.1:8967/`, select **Find a LiveEngine match**, then press **Play**.
 
-The bridge binds only to `127.0.0.1`. Do not expose it on a network interface. The upstream game's own `npm start` does not include the proxy; use the bridge command so credentials are not placed in browser storage.
+The bridge validates Host and Origin, limits request bodies to 16 KiB, and rate-limits joins. It has no player authentication. The upstream game's own `npm start` does not include the proxy; use the bridge command so credentials are not placed in browser storage.
+
+## Hosting on a network
+
+By default the bridge binds to `127.0.0.1`. To serve the game over Tailscale or a trusted LAN, bind an address and keep the allowlist narrow:
+
+```sh
+HOST=100.115.126.72 PORT=8967 \
+LIVEENGINE_URL=http://127.0.0.1:8787 \
+LIVEENGINE_TOKEN=your-local-token \
+LIVEENGINE_HUB_ID=gogh-strike \
+GOGH_STRIKE_ROOT=../gogh-strike \
+node integrations/gogh-strike/bridge.mjs
+```
+
+A concrete `HOST` is allowed automatically alongside loopback. If you bind `0.0.0.0` or use several addresses, list them explicitly:
+
+```sh
+HOST=0.0.0.0 \
+GOGH_ALLOWED_HOSTS=100.115.126.72:8967,10.1.1.239:8967 \
+GOGH_ALLOWED_ORIGINS=https://gogh.example.net \
+node integrations/gogh-strike/bridge.mjs
+```
+
+<Warning>
+  The bridge has no player authentication. Expose it only on a private network such as Tailscale or a trusted LAN, or put an authenticated proxy in front of it. Do not publish it directly to the Internet.
+</Warning>
 
 ### Bridge configuration
 
@@ -71,7 +97,10 @@ The bridge binds only to `127.0.0.1`. Do not expose it on a network interface. T
 | `LIVEENGINE_REMOTE_HUB_ID` | `LIVEENGINE_HUB_ID` | Remote hub ID |
 | `LIVEENGINE_REMOTE_TOKEN` | empty | Remote credential (at least 24 bytes) |
 | `GOGH_STRIKE_ROOT` | `../gogh-strike` relative to repo | Game checkout |
-| `PORT` | `8967` | Bridge listen port on loopback |
+| `HOST` | `127.0.0.1` | Bind address |
+| `PORT` | `8967` | Bridge listen port |
+| `GOGH_ALLOWED_HOSTS` | empty | Extra allowed `host:port` values for Host checks |
+| `GOGH_ALLOWED_ORIGINS` | empty | Extra allowed `scheme://host:port` origins |
 | `GOGH_MATCH_SERVER_ID` | `gogh-strike-local` | Room ID |
 | `GOGH_MATCH_CAPACITY` | `12` | Room capacity |
 
@@ -101,8 +130,8 @@ The central service must allow the remote host and use matching credentials on t
 
 The bridge:
 
-- validates the `Host` header against `127.0.0.1:PORT` and `localhost:PORT`
-- validates the `Origin` header on join requests
+- validates the `Host` header against loopback, the concrete `HOST:PORT`, and `GOGH_ALLOWED_HOSTS`
+- validates the `Origin` header on join requests against the allowed hosts and `GOGH_ALLOWED_ORIGINS`
 - limits request bodies to 16 KiB
 - rate-limits joins to 10 per 60 seconds per socket peer
 - returns `503` when `LIVEENGINE_URL` or `LIVEENGINE_TOKEN` is missing
