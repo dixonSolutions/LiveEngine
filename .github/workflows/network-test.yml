@@ -1,0 +1,23 @@
+name: Cross-network connectivity
+on:
+  workflow_dispatch:
+    inputs:
+      hub_url:
+        description: Reachable HTTPS URL of the running hub host
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  connect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Connect from GitHub's network to the running service
+        run: node scripts/test-network.js
+        env:
+          LIVEENGINE_NETWORK_URL: ${{ inputs.hub_url }}
+          LIVEENGINE_NETWORK_TEST_TOKEN: ${{ secrets.LIVEENGINE_NETWORK_TEST_TOKEN }}
