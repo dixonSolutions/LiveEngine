@@ -1,0 +1,20 @@
+services:
+  central:
+    build: .
+    ports:
+      - "${LIVEENGINE_LISTEN_IP:-127.0.0.1}:8787:8787"
+    environment:
+      LIVEENGINE_TOKEN: ${LIVEENGINE_TOKEN:?Set a strong token of at least 24 characters}
+      LIVEENGINE_ALLOWED_REMOTE_HOSTS: remote
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+  remote:
+    build: .
+    environment:
+      LIVEENGINE_TOKEN: ${LIVEENGINE_REMOTE_TOKEN:?Set a separate strong remote token}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped

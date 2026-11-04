@@ -1,0 +1,96 @@
+diff --git a/index.html b/index.html
+index 3d9d4e7..292cb2e 100644
+--- a/index.html
++++ b/index.html
+@@ -31,7 +31,7 @@
+           <div class="secondary-kit"><span class="eyebrow">SIDEARM</span><div id="secondary-preview" class="weapon-preview"></div><b id="selected-sidearm">Atelier</b><span>Pistol</span></div>
+           <div class="art-kit"><span class="eyebrow">YOUR ART TAG</span><img id="selected-art-tag" alt="" width="68" height="68"><b id="selected-tag-name"></b><span><kbd>T</kbd> Spray a wall</span></div>
+         </div>
+-        <div class="kit-play"><div class="selected-artist"><span class="eyebrow">YOU’RE PLAYING</span><strong id="selected-artist-name">Van Gogh</strong><button id="inspect-artist" class="inspect-artist" type="button"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8" cy="8" r="5"/><path d="m12 12 5 5M8 5v6M5 8h6"/></svg>Inspect artist</button><span class="kit-taunt"><kbd>J</kbd><span id="selected-taunt-name">Sunflower spin</span></span></div><button id="deploy-button" class="primary-button" disabled>Play <span aria-hidden="true">↗</span></button></div>
++        <div class="kit-play"><div class="selected-artist"><span class="eyebrow">YOU’RE PLAYING</span><strong id="selected-artist-name">Van Gogh</strong><button id="inspect-artist" class="inspect-artist" type="button"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8" cy="8" r="5"/><path d="m12 12 5 5M8 5v6M5 8h6"/></svg>Inspect artist</button><span class="kit-taunt"><kbd>J</kbd><span id="selected-taunt-name">Sunflower spin</span></span><label class="liveengine-toggle"><input id="liveengine-matchmaking" type="checkbox"><span>Find a LiveEngine match</span><small>Matchmaking only · local simulation</small></label></div><button id="deploy-button" class="primary-button" disabled>Play <span aria-hidden="true">↗</span></button></div>
+       </section>
+       <div class="rival-preview"><div id="enemy-portraits" class="enemy-portraits" aria-hidden="true"></div><p>Against <strong id="enemy-faction-name">The Independents</strong><span>Real artists. An entirely imagined paint fight.</span></p></div>
+     </main>
+diff --git a/src/game.js b/src/game.js
+index 22dacf2..bbcd05f 100644
+--- a/src/game.js
++++ b/src/game.js
+@@ -21,6 +21,7 @@ import {bodyProfile} from './actor-profile.js';
+ import {actorPose,bodyPoint,intersectActorBody} from './actor-body.js';
+ import {UtilitySystem} from './utility.js';
+ import {initEquipment,equip,stashMagazine,absorbDamage} from './loadout.js';
++import {joinLiveEngineMatch} from './liveengine-matchmaking.js';
+ 
+ const V=(x=0,y=0,z=0)=>new THREE.Vector3(x,y,z),clamp=THREE.MathUtils.clamp,lerp=THREE.MathUtils.lerp;
+ const teamColors=FACTIONS.map(f=>new THREE.Color(f.color).getHex());
+@@ -51,7 +52,7 @@ const classicSpawns=[
+  [[-14,-32],[20,-37],[37,-7],[58,14],[81,-8],[6,15],[47,-23],[-30,17],[70,25],[89,-4]],
+ ];
+ const objectives=[];
+-const ui=new GameUI({weapons:WEAPONS,settings,onStart:startMatch,onRestart:startMatch,onMenu:showMenu,onPauseChange:setPause,onSettings:applySettings,
++const ui=new GameUI({weapons:WEAPONS,settings,onStart:startMatch,onRestart:startMatch,onMenu:showMenu,onPauseChange:setPause,onSettings:applySettings,onMatchmaking:joinLiveEngineMatch,
+  onWeaponSelect:value=>{if(controlsReady())switchWeapon(typeof value==='number'?player?.carriedWeapons[value]:value);}});
+ const pointerCapture=new PointerCapture({element:renderer.domElement,document,
+  canCapture:()=>phase==='playing'&&!paused&&!document.hidden&&document.hasFocus(),
+diff --git a/src/liveengine-matchmaking.js b/src/liveengine-matchmaking.js
+new file mode 100644
+index 0000000..1fcfa41
+--- /dev/null
++++ b/src/liveengine-matchmaking.js
+@@ -0,0 +1,31 @@
++const USER_KEY = 'gogh-strike-liveengine-user';
++
++function localUserId() {
++  try {
++    let id = localStorage.getItem(USER_KEY);
++    if (!id) {
++      id = `gogh-${crypto.randomUUID().replaceAll('-', '').slice(0, 24)}`;
++      localStorage.setItem(USER_KEY, id);
++    }
++    return id;
++  } catch {
++    return `gogh-${crypto.randomUUID().replaceAll('-', '').slice(0, 24)}`;
++  }
++}
++
++export async function getLiveEngineStatus() {
++  const response = await fetch('/api/liveengine/status', {headers: {Accept: 'application/json'}});
++  if (!response.ok) throw new Error(`Local matchmaking bridge is unavailable (${response.status})`);
++  return response.json();
++}
++
++export async function joinLiveEngineMatch(config) {
++  const response = await fetch('/api/liveengine/join', {
++    method: 'POST',
++    headers: {'Content-Type': 'application/json', Accept: 'application/json'},
++    body: JSON.stringify({userId: localUserId(), team: config.team, role: config.role}),
++  });
++  const result = await response.json().catch(() => ({}));
++  if (!response.ok) throw new Error(result.error || result.reason || `Matchmaking failed (${response.status})`);
++  return result;
++}
+diff --git a/src/style.css b/src/style.css
+index b41b102..c8ff47e 100644
+--- a/src/style.css
++++ b/src/style.css
+@@ -40,6 +40,7 @@
+ /* Crew emblems keep their identity; green and coral still mean ally and enemy. */
+ .team-crest{display:block;width:28px;height:28px;flex:0 0 auto;line-height:0;font-style:normal}.team-crest>svg{width:100%;height:100%;overflow:visible;filter:drop-shadow(0 1px 2px #061c3059)}.faction-card>.team-crest{width:32px;height:32px}.team-score{gap:12px}.team-score>.team-crest{width:27px;height:27px}.scoreboard-team>header{gap:10px}.scoreboard-team>header>.team-crest{width:25px;height:25px}.scoreboard-team>header>b{flex:1}.results-score small{display:flex;align-items:center;justify-content:center;gap:6px}.results-score small>.team-crest{width:20px;height:20px}
+ .kit-play .kit-taunt{display:flex;align-items:center;gap:5px;min-width:0;font-size:10px;color:#b9d0c2;line-height:1.4;margin-top:6px}.kit-taunt>kbd{font-size:8px;padding:2px 4px}.kit-taunt>span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
++.kit-play .liveengine-toggle{display:grid;grid-template-columns:13px 1fr;align-items:center;column-gap:6px;margin-top:7px;font-size:10px;line-height:1.25;color:#d4dfd1;cursor:pointer}.liveengine-toggle input{width:13px;height:13px;margin:0;accent-color:var(--friendly)}.liveengine-toggle small{grid-column:2;color:#96b2b2;font-size:8px}
+ .cosmetic-hud{position:absolute;left:50%;bottom:120px;transform:translateX(-50%);display:flex;align-items:center;gap:8px;height:29px;z-index:3}.cosmetic-hud .spray-hud{position:static;transform:none}.taunt-hud{display:flex;align-items:center;gap:6px;height:29px;padding:2px 8px 2px 4px;border-radius:4px;background:#0c25369c;color:#cddcca;font-size:10px;white-space:nowrap}.taunt-hud>kbd{font-size:9px;padding:2px 4px}.taunt-hud>svg{width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.taunt-hud>svg circle{fill:currentColor;stroke:none}.taunt-hud.unavailable{color:#90a9a9}.taunt-hud.unavailable>svg{opacity:.4}.taunt-hud.active{color:var(--friendly)}.taunt-hud.active>svg{animation:taunt-step .5s ease-in-out infinite alternate}.taunt-hud.active>kbd{border-color:#a6e7b480;color:var(--friendly)}@keyframes taunt-step{from{transform:rotate(-9deg)}to{transform:rotate(9deg)}}
+ #crosshair>i{transition:left .1s ease-out,right .1s ease-out,top .1s ease-out,bottom .1s ease-out,color .1s}
+ .killer-avatar{width:76px;height:88px}.killer-avatar .portrait img{transform:scale(1.35);transform-origin:center 20%}.death-credit{gap:15px}.death-credit>span{display:flex;flex-direction:column;align-items:flex-start;gap:4px;font-size:12px}.death-credit b{font-size:24px;line-height:1.15;font-weight:600}.respawn-message>p{margin-bottom:16px}.kill-entry .portrait{width:30px;height:34px}.is-dead #cosmetic-hud{display:none!important}
+diff --git a/src/ui.js b/src/ui.js
+index cf1f87b..19e2716 100644
+--- a/src/ui.js
++++ b/src/ui.js
+@@ -112,7 +112,7 @@ export class GameUI{
+   document.querySelectorAll('[data-graphics]').forEach(button=>{const selected=button.dataset.graphics===this.settings.graphics;button.classList.toggle('selected',selected);button.setAttribute('aria-pressed',String(selected));});
+  }
+  changeSettings(next){Object.assign(this.settings,next);this.config.settings={...this.settings};this.syncSettings();try{localStorage.setItem('vgs-settings',JSON.stringify(this.settings));}catch{}this.options.onSettings?.({...this.settings});}
+- launch(restart=false){if(!this.isReady)return;this.config.settings={...this.settings};const callback=restart?(this.options.onRestart||this.options.onStart):this.options.onStart;try{const result=callback?.({...this.config,mode:'tdm',attachments:{...this.config.attachments},settings:{...this.settings}});result?.catch?.(error=>this.showError(error));}catch(error){this.showError(error);}}
++ async launch(restart=false){if(!this.isReady)return;this.config.settings={...this.settings};const callback=restart?(this.options.onRestart||this.options.onStart):this.options.onStart;const config={...this.config,mode:'tdm',attachments:{...this.config.attachments},settings:{...this.settings}};const deploy=$('deploy-button');try{if($('liveengine-matchmaking')?.checked&&this.options.onMatchmaking){deploy.disabled=true;const match=await this.options.onMatchmaking(config);this.showToast(`Matched to ${match.serverId}. Local simulation only.`,3600);}const result=callback?.(config);result?.catch?.(error=>this.showError(error));}catch(error){this.showError(error);}finally{if(this.isReady)deploy.disabled=false;}}
+  async ready(){
+   const images=[...$('main-menu').querySelectorAll('img[src]')];
+   await Promise.allSettled(images.map(image=>image.decode()));

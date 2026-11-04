@@ -1,0 +1,18 @@
+'use strict';
+const { spawnSync } = require('node:child_process');
+const { mkdirSync, copyFileSync, chmodSync } = require('node:fs');
+const path = require('node:path');
+const root = path.resolve(__dirname, '..');
+const target = process.env.LIVEENGINE_BUILD_TARGET;
+const args = ['build', '--locked', '--release', '--bin', 'liveengine-hub'];
+if (target) args.push('--target', target);
+const result = spawnSync('cargo', args, { cwd: root, stdio: 'inherit' });
+if (result.error) throw result.error;
+if (result.status !== 0) process.exit(result.status || 1);
+const arch = target?.startsWith('x86_64') ? 'x64' : target?.startsWith('aarch64') ? 'arm64' : process.arch;
+const libc = process.platform === 'linux' ? (target?.includes('musl') ? '-musl' : '-gnu') : '';
+const suffix = process.platform === 'win32' ? '.exe' : '';
+mkdirSync(path.join(root, 'native'), { recursive: true });
+const destination = path.join(root, 'native', `liveengine-hub.${process.platform}-${arch}${libc}${suffix}`);
+copyFileSync(path.join(root, 'target', ...(target ? [target] : []), 'release', `liveengine-hub${suffix}`), destination);
+chmodSync(destination, 0o755);

@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1
+FROM docker.io/library/rust:1.92-bookworm AS build
+WORKDIR /source
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src ./src
+COPY docs/hub-contract.schema.json ./docs/hub-contract.schema.json
+COPY examples/custom-hub.rs ./examples/custom-hub.rs
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/source/target \
+    cargo build --locked --release --example custom-hub && cp target/release/examples/custom-hub /custom-hub
+
+FROM docker.io/library/debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=build /custom-hub /usr/local/bin/custom-hub
+USER 65532:65532
+ENV LIVEENGINE_BIND=0.0.0.0:8787
+EXPOSE 8787
+ENTRYPOINT ["/usr/local/bin/custom-hub"]

@@ -152,3 +152,33 @@ export declare class LiveEngine extends EventEmitter {
 
 export declare const nativeVersion: string;
 export default LiveEngine;
+
+export type HubMode = 'internal' | 'external';
+export interface HubDefinition {
+  id: string;
+  mode: HubMode;
+  address?: string;
+  remoteHubId?: string;
+  remoteToken?: string;
+  scopes?: Record<string, unknown>;
+  scopeSchema?: Record<string, unknown>;
+  ttlSeconds?: number;
+}
+export interface HubClientOptions {
+  token: string;
+  timeoutMs?: number;
+  maxResponseBytes?: number;
+  fetch?: typeof globalThis.fetch;
+}
+export declare const HUB_PROTOCOL: 'liveengine.hub/v1';
+export declare class HubClient {
+  constructor(address: string, options: HubClientOptions);
+  readonly address: string;
+  contract(): Promise<{ protocol: typeof HUB_PROTOCOL; [key: string]: unknown }>;
+  list(): Promise<unknown>;
+  register(hub: HubDefinition): Promise<unknown>;
+  get(id: string): Promise<unknown>;
+  remove(id: string): Promise<unknown>;
+  call<T = unknown>(id: string, method: string, args?: unknown[], options?: { signal?: AbortSignal }): Promise<T>;
+  importRegistry(registry: { address: string; token: string; prefix?: string }): Promise<unknown>;
+}

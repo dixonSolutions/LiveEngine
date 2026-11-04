@@ -1,32 +1,37 @@
 name: CI
-
 on:
   push:
     branches: [main]
   pull_request:
-
+permissions:
+  contents: read
 jobs:
   test:
-    name: node ${{ matrix.node }} on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # windows-2022: node-gyp 11 does not yet recognise the Visual Studio 18 image on windows-latest
-        os: [ubuntu-latest, macos-latest, windows-2022]
-        node: [18, 20, 22]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      - name: Install (builds the addon with node-gyp)
-        run: npm ci
-      - name: JS + example tests
-        run: npm test
-      - name: C++ core tests
-        if: runner.os == 'Linux'
-        run: npm run test:cpp
-      - name: Benchmark (smoke, small sizes)
-        if: runner.os == 'Linux' && matrix.node == 22
-        run: node bench/bench.js 500 5000
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: npm ci
+      - run: npm test
+      - run: npm run test:integration
+      - run: node bench/bench.js 500 5000
+        if: runner.os == 'Linux' && matrix.node == 24
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t liveengine:test .
+      - run: bash scripts/test-containers.sh docker liveengine:test
+      - name: Package a standalone custom hub
+        run: docker build -f Dockerfile.custom -t liveengine-custom:test .

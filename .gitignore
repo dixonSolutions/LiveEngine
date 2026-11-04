@@ -4,3 +4,9 @@ build-cpp/
 *.node
 npm-debug.log*
 .DS_Store
+/target/
+/native/
+*.tgz
+.env
+.env.*
+!.env.example

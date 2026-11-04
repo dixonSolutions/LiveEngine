@@ -1,55 +1,15 @@
 # LiveEngine
 
-**A general-purpose live pairing engine.** C++17 core, packaged for Node.js through
-[Node-API](https://nodejs.org/api/n-api.html) with the
-[node-addon-api](https://github.com/nodejs/node-addon-api) wrapper.
+Rust matchmaking and hub hosting for Node.js and Rust services. LiveEngine hosts internal hubs inside your API, runs standalone central registries, and connects independently hosted remote hubs through one authenticated HTTP contract.
 
-LiveEngine knows nothing about your domain. You give it two live hubs:
+Define users, servers, custom scopes and requirements at runtime. Register internal or external hubs while the service is running; import a remote registry without rebuilding DTOs or redeploying. Each internal matchmaking hub owns an isolated engine. External hubs own their engine or custom implementation at their own address.
 
-| Hub | What it holds | What you define |
-|---|---|---|
-| **Users** | people, players, agents, clients, workers | `scopes` (any key → number / bool / string / tags) and optional `requirements` on a server |
-| **Servers** | rooms, tables, matches, lobbies, hosts, shifts | `scopes`, `requirements` on a user, `capacity`, `minMembers`, `status` |
+- **Cargo:** `liveengine`, with an embeddable Rust library and `liveengine-hub` host.
+- **npm:** `@dixonsolutions/liveengine`, with a Rust N-API engine, TypeScript definitions, HTTP client and host command.
+- **Containers:** one image runs a central registry, an internal hub host, or an independently hosted remote service.
+- **Custom hubs:** implement the versioned protocol externally or embed a Rust handler in your API.
 
-and it answers the only question that matters live: **which servers fit this user right
-now — requirements both ways, and a free seat?** Fits are *advertised* back to the user hub as
-events; users can then *join* a server (or be *auto-joined*), servers fill up and become
-*ready*, seats free up when users leave. There is a seeded random user generator for load,
-bots and simulations.
-
-Because the model is agnostic it applies to game lobbies, tournament brackets, online chess
-pairing, co-op sessions, support-agent routing, ride sharing — anything that pairs a stream of
-arrivals with a pool of limited-capacity slots under user-defined rules.
-
-```
-                      requirements ⇄ scopes                         events
-   ┌──────────┐      ┌──────────────────────────┐      ┌──────────┐    advertised
-   │ user hub │ ───▶ │  LiveEngine (C++ core)   │ ◀─── │server hub│    paired / unpaired
-   │  scopes  │      │  indexes · fit · rank    │      │ capacity │    server_ready
-   │  reqs    │ ◀─── │  join · leave · matchAll │ ───▶ │ status   │    server_full / available
-   └──────────┘      └──────────────────────────┘      └──────────┘
-```
-
----
-
-## Contents
-
-- [Install](#install)
-- [Quick start](#quick-start)
-- [Concepts](#concepts)
-- [Requirements DSL](#requirements-dsl)
-- [Matching and ranking strategies](#matching-and-ranking-strategies)
-- [Events](#events)
-- [Random user generation](#random-user-generation)
-- [API reference](#api-reference)
-- [Scaling](#scaling)
-- [Example appliance: the math game](#example-appliance-the-math-game)
-- [Modelling recipes](#modelling-recipes) (chess, tournaments, game servers)
-- [Using the C++ core directly](#using-the-c-core-directly)
-- [Project layout, development, tests](#project-layout)
-- [Roadmap](#roadmap)
-
----
+The former C++/node-gyp implementation has been replaced by Rust. The existing `LiveEngine` and `NativeEngine` Node interfaces remain available. Seeded sequences are deterministic within the Rust implementation; random sequences are not byte-for-byte compatible with the previous C++ generator.
 
 ## Install
 
@@ -57,365 +17,220 @@ arrivals with a pool of limited-capacity slots under user-defined rules.
 npm install @dixonsolutions/liveengine
 ```
 
-The addon is compiled on install with `node-gyp`, so you need a C++17 toolchain and Python 3:
+Node.js 22 or newer is required. Release tarballs are built with native binaries for Linux x64/arm64 (glibc), macOS x64/arm64, and Windows x64. Source checkouts and other platforms build with Rust 1.88+ and the platform linker. The HTTP-only client is available without loading a native addon:
 
-| Platform | Toolchain |
-|---|---|
-| Linux | `build-essential` (g++ ≥ 9) |
-| macOS | Xcode command line tools |
-| Windows | Visual Studio Build Tools (C++ workload) |
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+```
 
-Node.js ≥ 18. No runtime dependencies besides `node-addon-api` headers at build time.
+```sh
+cargo add liveengine
+cargo install liveengine --bin liveengine-hub
+```
 
-## Quick start
+For local development:
+
+```sh
+npm ci                  # builds the Rust Node addon
+npm test
+cargo test --locked
+npm run build:hub       # standalone Rust host
+```
+
+## Local matchmaking
 
 ```js
 const { LiveEngine } = require('@dixonsolutions/liveengine');
-
 const engine = new LiveEngine({ seed: 42 });
+engine.on('paired', event => console.log(event));
+engine.upsertServer({
+  id: 'room-au', capacity: 2, minMembers: 2,
+  scopes: { game: 'chess', region: 'au', rating: 1500 },
+  requirements: { rating: { between: [1300, 1700] } },
+});
+engine.upsertUser({
+  id: 'player', scopes: { rating: 1450 },
+  requirements: { game: 'chess', region: 'au' },
+});
+console.log(engine.pair('player'));
+```
 
-engine.on('advertised', ev => console.log(`${ev.userId} can join`, ev.ids));
-engine.on('server_ready', ev => console.log(`${ev.serverId} can start with`, ev.ids));
+Matches must satisfy requirements in both directions and fit available capacity. Pairing updates user membership, server availability and the event queue in one engine operation. `minMembers` emits `server_ready` when that threshold is reached.
 
-// Servers: two chess tables with a rating band, two seats each, start when both are taken.
-engine.upsertServers([
-  { id: 'table-1500', capacity: 2, minMembers: 2,
-    scopes: { game: 'chess', rating: 1500 },
-    requirements: { game: 'chess', rating: { between: [1300, 1700] } } },
-  { id: 'table-2000', capacity: 2, minMembers: 2,
-    scopes: { game: 'chess', rating: 2000 },
-    requirements: { game: 'chess', rating: { between: [1800, 2200] } } },
+Scopes accept numbers, booleans, strings, string arrays and null. Requirements accept shorthand, arrays of rules, or `{ rules, match: 'all' | 'any' }`:
+
+```js
+const requirements = {
+  region: ['au', 'nz'],
+  rating: { between: [1200, 1800] },
+  tags: { contains: 'ranked' },
+};
+```
+
+Operators: `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `in`, `nin`, `between`, `exists`, `missing`, `contains`, `notContains`, `overlaps`. Strategies: `first` (FIFO), `random`, `leastLoaded`, `mostLoaded`, and `affinity`. `affinity: ['rating']` ranks numeric closeness. Match queries default to 10 results; `limit: 0` means unlimited.
+
+The API includes user/server upsert, bulk upsert, get/list/remove/status operations, `fits`, `findServersForUser`, `findUsersForServer`, `join`, `leave`, `autoJoin`, `matchAll`, `advertise`, `advertiseAll`, `generateUsers`, `stats`, `clear`, `reseed`, and `drainEvents`. The `LiveEngine` wrapper adds `pair`, `joinHub`, `startAutoMatch` and `stopAutoMatch`. See [TypeScript definitions](index.d.ts) for complete signatures.
+
+`autoEmit: false` retains events for manual draining. For network hubs, explicitly drain events as part of your service's event delivery loop. Registries and engine state are held in memory; restart loses registrations, users and memberships. Add application persistence before relying on restart recovery.
+
+## Hosted and remote hubs
+
+Run a host with a strong secret:
+
+```sh
+export LIVEENGINE_TOKEN="$(openssl rand -hex 32)"
+export LIVEENGINE_BIND=0.0.0.0:8787
+cargo run --locked --release --bin liveengine-hub
+# npm-installed command: liveengine-hub
+```
+
+`liveengine-hub` is the npm and Cargo executable name. It defaults to `127.0.0.1:8787`; choose a LAN or Tailscale interface for another device. For Internet deployment, terminate HTTPS at your ingress and configure network access deliberately.
+
+A central registry and an ordinary hub host use the same runtime. A service may host several internal hubs and route to several external ones simultaneously:
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+const central = new HubClient('http://127.0.0.1:8787', {
+  token: process.env.LIVEENGINE_TOKEN,
+});
+await central.contract();
+await central.register({
+  id: 'ranked-au', mode: 'internal',
+  scopes: { game: 'chess', region: 'au' },
+  scopeSchema: {
+    type: 'object', required: ['region'],
+    properties: { region: { type: 'string', enum: ['au', 'nz'] } },
+  },
+});
+await central.call('ranked-au', 'upsertServer', [
+  { id: 'room-1', capacity: 2, scopes: { region: 'au' } },
+]);
+await central.call('ranked-au', 'upsertUser', [
+  { id: 'alice', scopes: { region: 'au' } },
+]);
+const result = await central.call('ranked-au', 'autoJoin', ['alice']);
+```
+
+An external registration attaches an existing hub by address and hub ID. The central host must explicitly allow that remote hostname through `LIVEENGINE_ALLOWED_REMOTE_HOSTS`. Remote credentials are separate from central credentials and are omitted from discovery responses.
+
+```js
+await central.register({
+  id: 'remote-ranked', mode: 'external',
+  address: 'https://remote.example.net',
+  remoteHubId: 'ranked-au',
+  remoteToken: process.env.REMOTE_HUB_TOKEN,
+  scopes: { region: 'au' }, ttlSeconds: 3600,
+});
+await central.call('remote-ranked', 'upsertUser', [
+  { id: 'bob', scopes: { region: 'au' } },
 ]);
 
-// Users: join the hub, get the fitting servers advertised back immediately.
-engine.joinHub({ id: 'ada', scopes: { game: 'chess', rating: 1450 } });
-engine.joinHub({ id: 'bob', scopes: { game: 'chess', rating: 1620 }, requirements: { game: 'chess' } });
-
-// Pair everyone who is waiting (FIFO, first fit) — 'paired' then 'server_ready' fire.
-engine.matchAll();
-
-console.log(engine.getServer('table-1500').members); // ['ada', 'bob']
-console.log(engine.stats());                          // { users: 2, waiting: 0, paired: 2, servers: 2, full: 1, ... }
-```
-
-TypeScript users get full typings from `index.d.ts`.
-
-## Concepts
-
-**Scopes** are your data. Any key, with a value that is a number, a boolean, a string, or a
-list of strings (tags). Both users and servers have scopes.
-
-**Requirements** are predicates over the *other side's* scopes. A server's requirements are
-evaluated against a user's scopes, and a user's requirements are evaluated against a server's
-scopes. A pair *fits* when both requirement sets pass **and** the server has a free seat.
-
-**Capacity** is the number of seats. A server is `open` while it has room, becomes `full`
-automatically when the last seat is taken, and returns to `open` when someone leaves. Setting
-it `closed` hides it from matching without dropping its members.
-
-**`minMembers`** is the "can start" threshold. When a join brings the member count to exactly
-`minMembers`, a `server_ready` event carries the member list — the natural trigger for
-"start the game".
-
-**Status of a user** is `waiting` (in the hub, eligible), `paired` (seated at `serverId`), or
-`idle` (in the hub, not eligible). Only `join()`/`autoJoin()`/`matchAll()` can make a user
-`paired`.
-
-**Arrival order** is preserved: every user and server gets a monotonic `seq`. FIFO fairness in
-`matchAll` and the `first` strategy come from it.
-
-## Requirements DSL
-
-Three interchangeable forms are accepted everywhere a `requirements` field appears.
-
-```js
-// 1. Shorthand object — scalar means eq, array means in, nested object means {op: value}
-{ region: 'eu', mode: ['ranked', 'casual'], rating: { between: [1300, 1700] }, tags: { contains: 'fast' } }
-
-// 2. Rule array
-[{ key: 'region', op: 'eq', value: 'eu' }, { key: 'rating', op: 'gte', value: 1300 }]
-
-// 3. Rule set with match mode ('all' = AND, default; 'any' = OR)
-{ rules: [{ key: 'region', op: 'eq', value: 'us' }, { key: 'premium', op: 'eq', value: true }], match: 'any' }
-```
-
-| Op | Meaning | Value |
-|---|---|---|
-| `eq`, `ne` | equal / not equal (numbers and bools compare numerically) | scalar |
-| `lt`, `lte`, `gt`, `gte` | numeric comparison (strings compare lexically) | scalar |
-| `in`, `nin` | scalar is / is not one of | array |
-| `between` | `lo ≤ x ≤ hi` | `[lo, hi]` |
-| `exists`, `missing` | key present / absent | — |
-| `contains`, `notContains` | tag list contains value (scalar scope: same as `eq`) | scalar |
-| `overlaps` | tag list shares any element with | array |
-
-A missing key fails every positive test and passes `ne`, `nin`, `notContains`, `missing`.
-Unknown ops throw a `TypeError` at insert time, not silently at match time.
-
-## Matching and ranking strategies
-
-All read queries and pairing calls take a `MatchOptions` object:
-
-```js
-{ limit: 10, strategy: 'first' | 'random' | 'leastLoaded' | 'mostLoaded' | 'affinity', affinity: ['rating'] }
-```
-
-| Strategy | Order |
-|---|---|
-| `first` (default) | oldest server first (arrival `seq`). Stops scanning at `limit` — the cheapest path. |
-| `random` | uniform shuffle of the fitting set (seeded) |
-| `leastLoaded` | fewest members first — spread users across servers |
-| `mostLoaded` | most members first — fill servers so they start sooner |
-| `affinity` | smallest weighted numeric distance between user and server scopes on the given keys, e.g. rating closeness. `affinity: ['rating']`, `[{ key: 'rating', weight: 2 }]` or `{ rating: 2, latency: 0.1 }`. Supplying `affinity` without a `strategy` selects it. |
-
-`limit: 0` means unlimited. Each match is `{ id, score, load }` where `score` is the strategy's
-sort key (lower is better) and `load` is the server's member count.
-
-## Events
-
-Every mutating call on `LiveEngine` drains the native event queue and emits each event both by
-type and as a catch-all `'event'`. Construct with `{ autoEmit: false }` to poll `drainEvents()`
-yourself instead (cheaper for bulk work).
-
-| Event | Fields | When |
-|---|---|---|
-| `user_added`, `user_updated`, `user_removed` | `userId` | hub changes |
-| `server_added`, `server_updated`, `server_removed` | `serverId` | hub changes |
-| `server_available` | `serverId` | a server gains a free seat (or is opened) |
-| `server_full` | `serverId` | last seat taken |
-| `server_unavailable` | `serverId` | closed while it still had room |
-| `server_ready` | `serverId`, `ids` (members) | member count reaches `minMembers` |
-| `advertised` | `userId`, `ids` (server ids in rank order) | `advertise*` / `joinHub` |
-| `paired` | `userId`, `serverId` | a join succeeded |
-| `unpaired` | `userId`, `serverId`, `reason` (`left`, `user_removed`, `server_removed`, `status_change`) | a seat freed |
-| `cleared` | — | `clear()` |
-
-Events carry a monotonic `seq` so consumers can detect gaps.
-
-## Random user generation
-
-`generateUsers(count, spec)` creates users from a per-key generator spec, upserts them and
-returns them. It is deterministic for a given engine `seed`, which makes load tests and
-simulations reproducible.
-
-```js
-engine.generateUsers(1000, {
-  idPrefix: 'bot-',
-  scopes: {
-    rating:  { type: 'int',    min: 800, max: 2400 },
-    latency: { type: 'float',  min: 5,   max: 120 },
-    region:  ['eu', 'us', 'apac'],                          // shorthand for choice
-    tier:    { type: 'choice', values: ['free', 'pro'], weights: [0.8, 0.2] },
-    premium: { type: 'bool',   p: 0.3 },
-    name:    { type: 'string', prefix: 'Bot ' },            // "Bot 1", "Bot 2", …
-    tags:    { type: 'tags',   values: ['fast', 'ranked', 'voice', 'new'], count: 2 },
-  },
-  requirements: { game: 'chess' },                           // copied onto every generated user
+// Discover the remote registry now and attach its advertised hubs.
+await central.importRegistry({
+  address: 'https://remote.example.net',
+  token: process.env.REMOTE_HUB_TOKEN,
+  prefix: 'partner-',
 });
 ```
 
-## API reference
+Remote imports are explicit snapshots taken at request time; registrations added remotely later require another import. An external hub must implement `liveengine.hub/v1`, pass a health/contract handshake and expose its declared remote hub. Forwarded calls use the same `{ method, args }` request and `{ result }` response as internal calls. Custom external methods can use arbitrary JSON arguments and results within configured limits.
 
-Everything below is available on both `LiveEngine` (EventEmitter wrapper, recommended) and the
-raw `NativeEngine` class. Signatures are in [`index.d.ts`](index.d.ts).
+## Contract and DTOs
 
-### Users
-
-| Method | Returns | Notes |
-|---|---|---|
-| `upsertUser({ id, scopes?, requirements?, status? })` | `boolean` created | updating keeps `seq` and pairing |
-| `upsertUsers(users[])` | `number` created | one boundary crossing for bulk loads |
-| `removeUser(id)` | `boolean` | frees the seat if paired |
-| `getUser(id)` | `User \| null` | |
-| `listUsers(status?)` | `User[]` in arrival order | |
-| `setUserStatus(id, 'waiting' \| 'idle')` | `boolean` | leaving a server if paired |
-
-### Servers
-
-| Method | Returns | Notes |
-|---|---|---|
-| `upsertServer({ id, scopes?, requirements?, capacity?, minMembers?, status? })` | `boolean` created | `full` is derived and cannot be set |
-| `upsertServers(servers[])` | `number` created | |
-| `removeServer(id)` | `boolean` | members return to `waiting` with `unpaired` events |
-| `getServer(id)` | `Server \| null` | includes `members`, `free` |
-| `listServers(status?)` | `Server[]` | |
-| `setServerStatus(id, 'open' \| 'closed')` | `boolean` | |
-
-### Matching
-
-| Method | Returns |
-|---|---|
-| `findServersForUser(userId, options?)` | `Match[]` — servers that fit, ranked |
-| `findUsersForServer(serverId, options?)` | `Match[]` — waiting users that fit, ranked |
-| `fits(userId, serverId)` | `boolean` |
-| `advertise(userId, options?)` | number of servers advertised (emits `advertised`) |
-| `advertiseAll(options?)` | total advertised across all waiting users (one event per user with ≥1 fit) |
-
-### Pairing
-
-| Method | Returns |
-|---|---|
-| `join(userId, serverId)` | `{ ok, reason, userId, serverId }` — reasons: `user_not_found`, `server_not_found`, `already_paired`, `full`, `closed`, `no_fit` |
-| `leave(userId)` | `Result` — reason `not_paired` |
-| `autoJoin(userId, options?)` | `Result` — joins the top-ranked fit |
-| `matchAll(options?)` | `Result[]` — walks waiting users FIFO, auto-joins each |
-| `pair(userId, options?)` *(wrapper only)* | `Result & { server }` |
-| `joinHub(user, options?)` *(wrapper only)* | upsert + advertise in one call |
-| `startAutoMatch(intervalMs?, options?)` / `stopAutoMatch()` *(wrapper only)* | timer-driven `matchAll` |
-
-### Everything else
-
-`generateUsers(count, spec)`, `drainEvents()`, `pendingEvents()`, `stats()`, `clear()`,
-`reseed(seed)`.
-
-`stats()` → `{ users, waiting, paired, idle, servers, open, full, closed, pendingEvents, totalJoins, totalLeaves, totalMatchesEvaluated }`.
-
-## Scaling
-
-The core is designed so that the cost of a query is proportional to the *candidates*, not to
-the hub size:
-
-- **Equality index** — for every scope key, `value → servers` (and `value → users`) buckets.
-  A query whose requirements contain an `eq`/`contains` rule scans only the smallest bucket.
-- **Numeric index** — ordered `number → ids` per key; `between`, `lt`, `lte`, `gt`, `gte`
-  rules become range scans.
-- **Seq-ordered buckets** — every bucket is ordered by arrival, so the default `first`
-  strategy stops as soon as `limit` fits are found (`limit: 1` for `autoJoin`/`matchAll`).
-- **Open-server set** — closed and full servers are never visited.
-- **Bulk entry points** — `upsertUsers`, `upsertServers`, `generateUsers`, `matchAll`,
-  `advertiseAll` do their loops in C++ with one JS boundary crossing.
-- **Single mutex** — the engine is safe to share across threads in the C++ core; the Node
-  binding is single-threaded like every N-API addon.
-
-`npm run bench` (5 000 servers × 10 seats, 50 000 generated users, users demand
-`region: eu` + `mode: ranked`, servers demand a tier band; ~86 % of users cannot fit anywhere,
-which is the worst case) on a laptop, Node 22:
-
-| Operation | Time |
-|---|---|
-| `upsertServers` × 5 000 | 34 ms |
-| `generateUsers` × 50 000 | 420 ms |
-| `findServersForUser` × 10 000, indexed `eq`, `limit: 5` | 290 ms (29 µs each) |
-| `findServersForUser` × 10 000, `affinity` ranking | 1.5 s (full candidate ranking) |
-| `matchAll` over 50 000 waiting users | 3.5 s (42 M fit evaluations, ~80 ns each) |
-
-The remaining cost is users with **no** fit: proving nothing fits means evaluating every
-candidate the index yields. An interval index over server-side requirements is on the roadmap
-for that case.
-
-## Example appliance: the math game
-
-[`examples/math-game`](examples/math-game) is a complete Node.js server built on LiveEngine
-with zero dependencies:
-
-- **Users** are players (humans over Server-Sent Events, or bots from `generateUsers`) with a
-  `level` scope: `easy` (+), `medium` (×, −), `hard` (× then ±).
-- **Servers** are two-seat tables per level (`requirements: { level }`, `minMembers: 2`).
-- A player joins the hub, gets fitting tables **advertised**, is seated at the fullest fitting
-  table (`strategy: 'mostLoaded'`), or a new table is opened for their level.
-- `server_ready` starts a 5-round game: the first correct answer wins the round, 12 s per
-  round. `game_over` frees the seats, the table goes back to `open`, and waiting players get a
-  fresh `advertised` event.
-- Bots get a random `speedMs` and `accuracy` from the generator and answer accordingly.
-
-```sh
-npm run example          # http://localhost:3131
-curl -XPOST localhost:3131/api/bots -H 'content-type: application/json' -d '{"count":6}'
-```
+[Hub protocol schema](docs/hub-contract.schema.json) defines registrations, discovery, calls, registry imports and errors. Internal and external modes use the same DTOs; external mode additionally requires its address and credential. Hub IDs use ASCII letters, digits, dots, underscores and hyphens (1–128 characters).
 
 | Endpoint | Purpose |
-|---|---|
-| `GET /` | browser client: join, see advertised tables, answer, watch the hub |
-| `POST /api/join {name, level}` | add a player, advertise, auto-seat |
-| `GET /api/events?userId=` | SSE stream: `advertised`, `seated`, `game_start`, `question`, `round_result`, `wrong`, `game_over`, … |
-| `POST /api/answer {userId, answer}` | answer the current question |
-| `POST /api/seat {userId, tableId?}` | sit at a specific table, or the best fit |
-| `POST /api/bots {count, level?}` | generate and seat bots |
-| `GET /api/state` | stats, tables, waiting players, running games |
+| --- | --- |
+| `GET /health` | Liveness and protocol |
+| `GET /v1/contract` | Versioned capability handshake |
+| `GET /v1/contract/schema` | JSON schema for the hub contract |
+| `GET /v1/hubs` | Discover currently attached hubs |
+| `POST /v1/hubs` | Register a dynamic internal or external hub |
+| `GET /v1/hubs/{id}` | Inspect a hub |
+| `DELETE /v1/hubs/{id}` | Remove a registration |
+| `POST /v1/hubs/{id}/call` | Exchange `{ method, args }` / `{ result }` |
+| `POST /v1/registries/import` | Discover and attach a remote registry |
 
-[`test/math-game.test.js`](test/math-game.test.js) boots this server on a random port, joins a
-human over HTTP, follows the SSE stream, adds a bot, plays all five rounds, and checks that the
-seats are freed afterwards. It is the integration test for the whole stack.
+Send `Authorization: Bearer <token>` for data endpoints. `scopeSchema` supports object properties with primitive types and enums, required properties and `additionalProperties: false`; it is not a complete JSON Schema validator. Define application DTOs freely within the JSON protocol, and validate application-specific operations in your custom handler.
 
-## Modelling recipes
+## Embed in an existing Rust API
 
-**Online chess (rating-band pairing).** Servers are boards with `capacity: 2, minMembers: 2`,
-scopes `{ rating: <host rating>, timeControl }`, requirements `{ rating: { between: [r-150, r+150] } }`.
-Pair with `{ affinity: ['rating'] }` so the closest rating wins when several boards fit. Create
-a board when a player arrives and nothing fits (as the math game does), remove it when the game
-ends.
+The Cargo library exposes the same host as an Axum router:
 
-**Tournament rounds.** Each pairing slot is a server with `capacity: 2` and requirements on
-`{ bracket, round, notPlayed: { notContains: '<opponent>' } }` (tags on the user hold past
-opponents). `findUsersForServer` gives the ordered candidate list for a seat; `server_ready`
-publishes the pairing.
+```rust,no_run
+use liveengine::hub::{HubConfig, HubService};
+use std::net::SocketAddr;
 
-**Game servers with regions and modes.** Servers carry `{ region, mode, map, version }` and
-`capacity: 64`. Users' requirements express their filters (`region: ['eu', 'us']`,
-`mode: 'ranked'`, `version: { gte: 12 }`); the server's requirements guard entry
-(`rank: { between: [...] }`, `banned: { ne: true }`). Use `leastLoaded` to spread or
-`mostLoaded` to fill, and `startAutoMatch(200)` to pair continuously.
-
-**Support routing.** Agents are servers (`capacity` = concurrent chats, `skills` tags);
-customers are users with `requirements: { skills: { contains: 'billing' }, language: 'de' }`.
-
-## Using the C++ core directly
-
-[`src/core/engine.hpp`](src/core/engine.hpp) / [`engine.cpp`](src/core/engine.cpp) have no Node
-dependency. Compile them into any C++17 program:
-
-```cpp
-#include "engine.hpp"
-using namespace liveengine;
-
-Engine e(42);
-Server s; s.id = "room"; s.capacity = 4; s.minMembers = 2;
-s.requirements.rules = {{"level", Op::Between, {}, {1.0, 3.0}}};
-e.upsertServer(s);
-User u; u.id = "ada"; u.scopes["level"] = 2.0;
-e.upsertUser(u);
-auto r = e.autoJoin("ada");          // r.ok == true, r.serverId == "room"
-for (auto& ev : e.drainEvents()) { /* ev.type, ev.userId, ev.serverId, ev.ids */ }
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let hubs = HubService::new(HubConfig::from_env()?)?;
+    let app = axum::Router::new().merge(hubs.router());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8787").await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    Ok(())
+}
 ```
 
-`npm run test:cpp` builds and runs [`tests/cpp/engine_test.cpp`](tests/cpp/engine_test.cpp)
-against the core alone.
-
-## Project layout
-
-```
-LiveEngine/
-├── src/core/engine.{hpp,cpp}   C++17 engine, no Node dependency
-├── src/addon/binding.cc        node-addon-api binding (JS ⇄ core conversion)
-├── lib/index.js                LiveEngine EventEmitter wrapper
-├── index.d.ts                  TypeScript typings
-├── binding.gyp                 node-gyp build
-├── test/                       node:test suites (binding, end-to-end math game)
-├── tests/cpp/                  standalone core tests
-├── bench/bench.js              throughput benchmark
-├── examples/math-game/         example appliance: game.js (logic), server.js (HTTP+SSE), public/index.html
-└── .github/workflows/ci.yml    Linux / macOS / Windows × Node 18 / 20 / 22
-```
-
-### Development
+Implement `HubHandler::call` to host custom methods and application DTOs in the same process, then use `HubService::register_internal(registration, handler).await`. HTTP registrations create matchmaking hubs; application code supplies custom handlers. The [custom hub example](examples/custom-hub.rs) implements `increment` and `read` with its own result shape:
 
 ```sh
-npm install          # builds the addon
-npm test             # JS + end-to-end tests
-npm run test:cpp     # core tests without Node
-npm run test:all
-npm run bench [servers] [users]
-npm run build:debug  # debug build of the addon
+cargo run --example custom-hub
+# Package the same custom service as an independent container:
+docker build -f Dockerfile.custom -t liveengine-counter .
+docker run --rm -p 8787:8787 -e LIVEENGINE_TOKEN="$LIVEENGINE_TOKEN" liveengine-counter
 ```
 
-## Roadmap
+Pass real peer connection information so rate limits apply to the socket peer. Proxy headers do not establish client identity. When nesting the router below a prefix, advertise that prefix as part of the external base address.
 
-- Interval index over server-side numeric requirements so "no fit" is answered without a scan.
-- Group joins: seat a party of N together or not at all.
-- Optional background matcher thread with `ThreadSafeFunction` event delivery.
-- Snapshot / restore of both hubs.
-- Prebuilt binaries via `prebuildify` so `npm install` needs no toolchain.
+For an engine-only Rust dependency, disable hosting dependencies with `liveengine = { version = "0.2", default-features = false }`. The core is `Engine::new(seed)` with `dispatch(method, Vec<serde_json::Value>)` and has no Node dependency.
 
-## License
+## Docker and Podman
 
-[MIT](LICENSE) © dixonSolutions
+```sh
+cp .env.example .env
+# Set independent random secrets in .env.
+docker compose up --build -d
+# Podman: podman build -t liveengine:local .
+```
+
+The Compose example hosts a central registry at loopback port 8787 and a remote host on the private container network. Register an internal hub on `remote`, then attach it to `central` with `address: 'http://remote:8787'`. These are runtime registrations; no hub IDs are hard-coded in the image.
+
+```sh
+docker build -t liveengine:local .
+docker run --rm -p 8787:8787 \
+  -e LIVEENGINE_TOKEN="$LIVEENGINE_TOKEN" liveengine:local
+bash scripts/test-containers.sh docker liveengine:local
+```
+
+Containers run as a non-root user. For a standalone custom hub binary, build your Rust application with the library and copy it into a minimal image using the same pattern as [Dockerfile](Dockerfile).
+
+## Limits and security
+
+Hosts require a token of at least 24 bytes. Keep administrative tokens in server code or secret storage, and expose application-specific routes to untrusted game clients. The Gogh Strike bridge demonstrates this separation.
+
+Defaults include a remote hostname allowlist, disabled HTTP redirects, outbound timeouts, bounded HTTP bodies/responses, bounded hub/entity/event counts and a peer request budget. Exact allowlist entries authorize the destination host, including private addresses when explicitly listed; only list hosts you control. Behind a shared reverse proxy, the socket peer budget is shared by its clients. TTL registrations expire in memory and can be re-registered after expiry.
+
+See [hosting configuration](docs/hosting.md) for environment settings and deployment details. Authentication is administrative for this initial protocol: there is no per-player authorization, tenant isolation policy or durable storage layer supplied by the host.
+
+## Gogh Strike integration
+
+The integration clones [petergpt/gogh-strike](https://github.com/petergpt/gogh-strike), adds an optional lobby, and sends matchmaking requests through a server bridge to the same internal/external hub contract. See [integration instructions](integrations/gogh-strike/README.md).
+
+Gogh Strike's gameplay is locally simulated. The integration validates registration, remote connectivity and matchmaking; it does not add multiplayer state synchronization.
+
+## Verification and releases
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+npm ci
+npm test
+npm run build:hub
+npm pack --dry-run
+cargo package --locked
+```
+
+CI runs Rust and Node tests on Linux, macOS and Windows, and an independent central/remote container test on Linux. [Release workflow](.github/workflows/release.yml) builds native addons and host binaries, publishes npm with GitHub OIDC/provenance, and publishes Cargo with crates.io trusted publishing. Registry-side trust must be configured before an OIDC release can succeed. Observed test evidence is recorded in [validation](docs/validation.md). See [publishing](docs/publishing.md) for the bootstrap and exact workflow identity.
+
+MIT licensed. See [LICENSE](LICENSE).

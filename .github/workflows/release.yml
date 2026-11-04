@@ -1,0 +1,111 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to npm and crates.io after registry trust is configured
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    env:
+      LIVEENGINE_BUILD_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm run build:hub
+      - run: cargo test --locked
+      - run: npm test
+        # The x86 macOS artifact is cross-compiled on an arm64 runner.
+        if: matrix.target != 'x86_64-apple-darwin'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: native/*
+          if-no-files-found: error
+  npm:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install --global npm@latest
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: native
+          merge-multiple: true
+      - name: Restore executable permissions
+        run: chmod +x native/liveengine-hub.*
+      - run: npm ci
+      - run: npm test
+      - name: Check release version
+        run: node scripts/check-release.js
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+      - run: npm pack
+      - name: Install and exercise the packed artifact
+        run: node scripts/test-package.js
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: "*.tgz"
+      - name: Publish through npm OIDC trusted publisher
+        if: github.ref_type == 'tag' || inputs.publish
+        run: npm publish --access public --provenance
+      - name: Attach package and host binaries to GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" ./*.tgz native/liveengine-hub.* --generate-notes --verify-tag
+  cargo:
+    if: github.ref_type == 'tag' || inputs.publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check release version
+        run: node scripts/check-release.js
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+      - name: Authenticate to crates.io using its trusted publisher
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

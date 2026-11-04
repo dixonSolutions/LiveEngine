@@ -1,0 +1,18 @@
+'use strict';
+const { spawnSync } = require('node:child_process');
+const { mkdirSync, copyFileSync } = require('node:fs');
+const path = require('node:path');
+const root = path.resolve(__dirname, '..');
+const target = process.env.LIVEENGINE_BUILD_TARGET;
+const debug = process.argv.includes('--debug');
+const args = ['build', '--locked', '--lib', '--no-default-features', '--features', 'node'];
+if (!debug) args.push('--release');
+if (target) args.push('--target', target);
+const result = spawnSync('cargo', args, { cwd: root, stdio: 'inherit' });
+if (result.error) throw new Error('Building LiveEngine requires Rust (https://rustup.rs): ' + result.error.message);
+if (result.status !== 0) process.exit(result.status || 1);
+const artifact = process.platform === 'win32' ? 'liveengine.dll' : process.platform === 'darwin' ? 'libliveengine.dylib' : 'libliveengine.so';
+const arch = target?.startsWith('x86_64') ? 'x64' : target?.startsWith('aarch64') ? 'arm64' : process.arch;
+const libc = process.platform === 'linux' ? (target?.includes('musl') || (!target && !process.report.getReport().header.glibcVersionRuntime) ? '-musl' : '-gnu') : '';
+mkdirSync(path.join(root, 'native'), { recursive: true });
+copyFileSync(path.join(root, 'target', ...(target ? [target] : []), debug ? 'debug' : 'release', artifact), path.join(root, 'native', `liveengine.${process.platform}-${arch}${libc}.node`));
