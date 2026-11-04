@@ -69,6 +69,34 @@ Calls `GET /v1/contract`. Throws `Incompatible hub protocol` unless the response
 await client.contract();
 ```
 
+### ping(options?)
+
+```ts
+interface HubPingOptions {
+  samples?: number;   // 1–32, default 5
+  intervalMs?: number; // default 0
+}
+
+interface HubPing {
+  protocol: 'liveengine.hub/v1';
+  samples: number[];
+  minMs: number;
+  maxMs: number;
+  avgMs: number;
+  jitterMs: number;
+  serverTimeMs?: number;
+}
+
+ping(options?: HubPingOptions): Promise<HubPing>
+```
+
+Calls the unauthenticated native `GET /v1/ping` endpoint repeatedly and measures round-trip time with the high-resolution clock. `jitterMs` is the mean absolute difference between consecutive samples.
+
+```js
+const result = await client.ping({ samples: 5, intervalMs: 50 });
+console.log(result.avgMs, result.minMs, result.maxMs, result.jitterMs);
+```
+
 ### list()
 
 ```ts

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.3 — 2026-11-04
+
+- Added native ping: an unauthenticated `/v1/ping` hub route, Rust `ping_hub`,
+  `liveengine-hub ping`, and Node `HubClient.ping()` with samples, min/avg/max and jitter.
+- Added the dependency-free user hub browser interface in `examples/user-hub/` with
+  client connection, live room listing, matchmaking, demo rooms, and native ping rendering.
+- Added Nitro and SvelteKit framework recipes and expanded the Next.js recipe with
+  server listing, matchmaking, native ping, and a client page.
+- Included the framework and user hub examples in the npm package.
+
 ## 0.2.2 — 2026-11-04
 
 - Added the Mintlify developer documentation site in `docs-site/`, including the full

@@ -51,6 +51,7 @@ curl --silent \
   "version": 1,
   "endpoints": [
     "/health",
+    "/v1/ping",
     "/v1/contract",
     "/v1/hubs",
     "/v1/hubs/{id}",
@@ -61,7 +62,7 @@ curl --silent \
 }
 ```
 
-`/health` is the only unauthenticated endpoint. All `/v1/*` routes require the bearer token.
+`/health` and `/v1/ping` are unauthenticated. All other routes require the bearer token.
 
 ## Register an internal hub
 

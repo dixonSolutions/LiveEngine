@@ -20,6 +20,10 @@ Runnable framework examples are in the repository:
 - [Express](examples/frameworks/express-server.js)
 - [Fastify](examples/frameworks/fastify-server.mjs)
 - [NestJS](examples/frameworks/nestjs)
+- [Next.js](examples/frameworks/nextjs)
+- [Nitro](examples/frameworks/nitro)
+- [SvelteKit](examples/frameworks/sveltekit)
+- [User hub interface](examples/user-hub)
 - [Axum](examples/axum-service.rs)
 - [Actix Web](docs-site/frameworks/actix.mdx) recipe
 
@@ -81,7 +85,7 @@ const requirements = {
 
 Operators: `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `in`, `nin`, `between`, `exists`, `missing`, `contains`, `notContains`, `overlaps`. Strategies: `first` (FIFO), `random`, `leastLoaded`, `mostLoaded`, and `affinity`. `affinity: ['rating']` ranks numeric closeness. Match queries default to 10 results; `limit: 0` means unlimited.
 
-The API includes user/server upsert, bulk upsert, get/list/remove/status operations, `fits`, `findServersForUser`, `findUsersForServer`, `join`, `leave`, `autoJoin`, `matchAll`, `advertise`, `advertiseAll`, `generateUsers`, `stats`, `clear`, `reseed`, and `drainEvents`. The `LiveEngine` wrapper adds `pair`, `joinHub`, `startAutoMatch` and `stopAutoMatch`. See [TypeScript definitions](index.d.ts) for complete signatures.
+The API includes user/server upsert, bulk upsert, get/list/remove/status operations, `fits`, `findServersForUser`, `findUsersForServer`, `join`, `leave`, `autoJoin`, `matchAll`, `advertise`, `advertiseAll`, `generateUsers`, `stats`, `clear`, `reseed`, and `drainEvents`. The `LiveEngine` wrapper adds `pair`, `joinHub`, `startAutoMatch` and `stopAutoMatch`. `HubClient` adds `contract`, `list`, `register`, `get`, `remove`, `call`, `importRegistry`, and `ping`. See [TypeScript definitions](index.d.ts) for complete signatures.
 
 `autoEmit: false` retains events for manual draining. For network hubs, explicitly drain events as part of your service's event delivery loop. Registries and engine state are held in memory; restart loses registrations, users and memberships. Add application persistence before relying on restart recovery.
 
@@ -146,6 +150,24 @@ await central.importRegistry({
 ```
 
 Remote imports are explicit snapshots taken at request time; registrations added remotely later require another import. An external hub must implement `liveengine.hub/v1`, pass a health/contract handshake and expose its declared remote hub. Forwarded calls use the same `{ method, args }` request and `{ result }` response as internal calls. Custom external methods can use arbitrary JSON arguments and results within configured limits.
+
+## Native ping
+
+The host exposes an unauthenticated `GET /v1/ping` latency probe. Node and Rust clients can sample it without a third-party ping binary:
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+const hub = new HubClient('http://127.0.0.1:8787', { token: process.env.LIVEENGINE_TOKEN });
+const ping = await hub.ping({ samples: 5 });
+console.log(ping.avgMs, ping.minMs, ping.maxMs, ping.jitterMs);
+```
+
+```sh
+liveengine-hub ping http://127.0.0.1:8787 --samples 5
+liveengine-hub ping http://127.0.0.1:8787 --samples 5 --json
+```
+
+The Rust API exposes the same measurement as `liveengine::hub::ping_hub`. The browser interface in [`examples/user-hub`](examples/user-hub) renders live ping samples alongside the room list.
 
 ## Contract and DTOs
 

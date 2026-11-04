@@ -23,6 +23,7 @@ http://127.0.0.1:8787/v1/hubs
   "version": 1,
   "endpoints": [
     "/health",
+    "/v1/ping",
     "/v1/contract",
     "/v1/hubs",
     "/v1/hubs/{id}",
@@ -37,13 +38,13 @@ Clients should verify `protocol` before using the service. LiveEngine's `HubClie
 
 ## Authentication
 
-- `GET /health` is unauthenticated.
+- `GET /health` and `GET /v1/ping` are unauthenticated.
 - Every other endpoint requires `Authorization: Bearer <token>`.
 - The token is the host's `LIVEENGINE_TOKEN` and must be at least 24 bytes at startup.
 - Authentication is administrative, not per-player.
 - Requests without a valid token return `401` with `{"error":"unauthorized"}`.
 
-The host rate-limits by socket peer **before** checking the token. An unauthenticated request still consumes a rate slot.
+Requests other than `/health` and `/v1/ping` are rate-limited by socket peer **before** checking the token. An unauthenticated request to those routes still consumes a rate slot.
 
 ## Content type and JSON
 

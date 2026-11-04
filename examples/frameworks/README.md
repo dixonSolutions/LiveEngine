@@ -7,6 +7,10 @@ These examples use the published `@dixonsolutions/liveengine` package. They are 
 | `express-server.js` | In-process `LiveEngine` | HTTP matchmaking routes and SSE event draining |
 | `fastify-server.mjs` | `HubClient` | Calling an internal hub hosted by `liveengine-hub` |
 | `nestjs/` | In-process `LiveEngine` provider | NestJS module, service and controller wiring |
+| `nextjs/` | `HubClient` | App Router routes and a client page with live room listing |
+| `nitro/` | `HubClient` | Nitro server routes for rooms, matchmaking and ping |
+| `sveltekit/` | `HubClient` | SvelteKit server routes and a client page with room listing |
+| `../user-hub` | Browser interface | Dependency-free player UI with rooms and native ping |
 | `../axum-service.rs` | Embedded Rust `HubService` | Mounting LiveEngine routes inside an Axum app |
 
 ## Express
@@ -50,3 +54,19 @@ Copy the three files in `nestjs/` into a NestJS application, install `@dixonsolu
 ```sh
 LIVEENGINE_TOKEN="$(openssl rand -hex 32)" cargo run --example axum-service
 ```
+
+## Next.js
+
+Copy `nextjs/app/` and `nextjs/lib/` into an App Router project. See `nextjs/README.md` for the full route list. The `/liveengine` page lists rooms and connects as a client.
+
+## Nitro
+
+Copy `nitro/server/` into a Nitro or Nuxt project. The server routes list rooms, match a user, and sample native ping. See `nitro/README.md`.
+
+## SvelteKit
+
+Copy `sveltekit/src/` into a SvelteKit project. The `/liveengine` page lists rooms and connects as a client. See `sveltekit/README.md`.
+
+## User hub interface
+
+`../user-hub` is a standalone browser interface with room listing, matchmaking and a native ping panel. See `../user-hub/README.md`.

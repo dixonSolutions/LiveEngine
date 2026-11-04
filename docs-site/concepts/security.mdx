@@ -1,15 +1,15 @@
 ---
 title: "Security model and limits"
-description: "Administrative authentication, peer rate budgets, remote-host allowlists, request budgets, and the boundaries of 0.2.2."
+description: "Administrative authentication, peer rate budgets, remote-host allowlists, request budgets, and the boundaries of 0.2.3."
 ---
 
-LiveEngine 0.2.2 provides **administrative** security. It does not provide player accounts, per-player authorization, tenant isolation, or durable storage. Treat the hub token as a server-side secret and put application authentication in front of player-facing routes.
+LiveEngine 0.2.3 provides **administrative** security. It does not provide player accounts, per-player authorization, tenant isolation, or durable storage. Treat the hub token as a server-side secret and put application authentication in front of player-facing routes.
 
 ## Token authentication
 
 - `LIVEENGINE_TOKEN` is required and must contain at least 24 bytes.
 - Data endpoints require `Authorization: Bearer <token>`.
-- `GET /health` is intentionally unauthenticated for liveness checks.
+- `GET /health` and `GET /v1/ping` are intentionally unauthenticated. Neither exposes state; ping returns timing metadata only.
 - Token comparison is constant-time over the supplied and expected bytes and also checks length.
 - Failure returns `401` with `{"error":"unauthorized"}` and does not echo the token.
 
@@ -21,7 +21,7 @@ liveengine-hub: LIVEENGINE_TOKEN must be at least 24 bytes
 
 ## Peer rate budgets
 
-Every non-health request consumes a rate slot **before** authentication, keyed by the actual socket peer IP:
+Every request other than `/health` and `/v1/ping` consumes a rate slot **before** authentication, keyed by the actual socket peer IP:
 
 - `LIVEENGINE_RATE_LIMIT_REQUESTS` (default `120`) per window.
 - `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` (default `60`).
@@ -88,7 +88,7 @@ A concurrent call to a busy handler returns `409`; a poisoned handler lock retur
 
 `scopeSchema` supports only a subset: object type, required properties, primitive property type checks, `enum`, and `additionalProperties: false`. It is not execution, code loading, or a complete JSON Schema implementation. Validate application-specific payloads inside your handler.
 
-## Explicit non-goals in 0.2.2
+## Explicit non-goals in 0.2.3
 
 - No player authentication or authorization.
 - No tenant isolation policy.

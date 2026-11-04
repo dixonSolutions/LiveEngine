@@ -1,0 +1,94 @@
+---
+title: "User hub interface"
+description: "A dependency-free browser interface for joining a hub, listing rooms, matching, and measuring native hub ping."
+---
+
+The repository includes a complete player-facing interface in `examples/user-hub/`. It is intentionally small and dependency-free: a Node HTTP server serves static HTML/CSS/JS and keeps the administrative hub token server-side.
+
+<Frame>
+  <img src="/media/user-hub.png" alt="LiveEngine user hub interface showing a matched room, live room list, and native ping samples" />
+</Frame>
+
+## What it shows
+
+- **Client connection:** a player ID with JSON scopes and requirements, auto-match or join a specific room.
+- **Server listing:** every room's status, members, capacity, free seats, and scopes, refreshed every 2.5 seconds.
+- **Native ping:** five `/v1/ping` samples with average, min, max and jitter, rendered as bars.
+- **Demo rooms:** a one-click room creator for trying matchmaking without a separate server tool.
+
+## Run it
+
+Start a hub, or use the Compose services:
+
+```sh
+export LIVEENGINE_TOKEN="$(openssl rand -hex 32)"
+LIVEENGINE_BIND=127.0.0.1:8787 liveengine-hub &
+```
+
+```sh
+LIVEENGINE_URL=http://127.0.0.1:8787 \
+LIVEENGINE_TOKEN="$LIVEENGINE_TOKEN" \
+LIVEENGINE_HUB_ID=user-hub \
+node examples/user-hub/server.js
+```
+
+Open `http://127.0.0.1:8970/`. With the Compose services, use `LIVEENGINE_TOKEN_FILE` instead of exporting the central token.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `LIVEENGINE_URL` | `http://127.0.0.1:8787` | Hub base URL |
+| `LIVEENGINE_TOKEN` | none | Administrative hub token |
+| `LIVEENGINE_TOKEN_FILE` | none | Read the token from a file |
+| `LIVEENGINE_HUB_ID` | `user-hub` | Internal hub to create or use |
+| `HOST` | `127.0.0.1` | Bridge listen address |
+| `PORT` | `8970` | Bridge listen port |
+
+The bridge creates the internal hub if it is missing. It binds to loopback by default because it is an administrative proxy; add application authentication before exposing it to untrusted clients.
+
+## Native ping
+
+The hub exposes an unauthenticated `GET /v1/ping` route. The Rust handler records its own processing time and returns protocol, server time, and uptime metadata. Clients measure the round trip:
+
+```js
+const hub = new HubClient(process.env.LIVEENGINE_URL, {
+  token: process.env.LIVEENGINE_TOKEN,
+});
+
+const result = await hub.ping({ samples: 5, intervalMs: 50 });
+console.log(result.avgMs, result.minMs, result.maxMs, result.jitterMs);
+```
+
+Rust clients can use the same feature without a JavaScript runtime:
+
+```sh
+liveengine-hub ping http://127.0.0.1:8787 --samples 5
+liveengine-hub ping http://127.0.0.1:8787 --samples 5 --json
+```
+
+```rust
+use liveengine::hub::ping_hub;
+use std::time::Duration;
+
+let stats = ping_hub("http://127.0.0.1:8787", 5, Duration::from_secs(3)).await?;
+println!("{:.3} ms average", stats.avg_ms);
+```
+
+`jitterMs` is the mean absolute difference between consecutive samples. The endpoint returns no state and no credentials, so it is safe to use as a lightweight latency probe.
+
+## Browser API
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/config` | Hub ID, URL and readiness |
+| `GET /api/state?userId=` | User, matched room, rooms and stats |
+| `GET /api/ping?samples=5` | Native hub ping samples |
+| `POST /api/join` | Upsert user and optionally auto-match |
+| `POST /api/join-room` | Join a specific room |
+| `POST /api/leave` | Leave the current room |
+| `POST /api/rooms` | Create a demo room |
+
+`POST` routes validate `Host` and `Origin`, enforce a 64 KiB body limit, and map hub failures to `409` for matchmaking conflicts and `503` for upstream failures.
+
+## Reuse the pattern
+
+The same client connection shape works in [Next.js](/frameworks/nextjs), [Nitro](/frameworks/nitro), and [SvelteKit](/frameworks/sveltekit). For a multi-instance deployment, point every frontend at one central hub instead of running a process-local `LiveEngine`.

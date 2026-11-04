@@ -1,6 +1,6 @@
 ---
 title: "Framework recipes"
-description: "Runnable LiveEngine examples for Express, Fastify, NestJS, Next.js, Axum, and Actix Web."
+description: "Runnable LiveEngine examples for Express, Fastify, NestJS, Next.js, Nitro, SvelteKit, Axum, and Actix Web."
 ---
 
 LiveEngine has two integration shapes. Pick the one that matches where your state lives.
@@ -21,6 +21,10 @@ LiveEngine has two integration shapes. Pick the one that matches where your stat
 - [`examples/frameworks/express-server.js`](https://github.com/dixonSolutions/LiveEngine/blob/main/examples/frameworks/express-server.js)
 - [`examples/frameworks/fastify-server.mjs`](https://github.com/dixonSolutions/LiveEngine/blob/main/examples/frameworks/fastify-server.mjs)
 - [`examples/frameworks/nestjs`](https://github.com/dixonSolutions/LiveEngine/tree/main/examples/frameworks/nestjs)
+- [`examples/frameworks/nextjs`](https://github.com/dixonSolutions/LiveEngine/tree/main/examples/frameworks/nextjs)
+- [`examples/frameworks/nitro`](https://github.com/dixonSolutions/LiveEngine/tree/main/examples/frameworks/nitro)
+- [`examples/frameworks/sveltekit`](https://github.com/dixonSolutions/LiveEngine/tree/main/examples/frameworks/sveltekit)
+- [`examples/user-hub`](https://github.com/dixonSolutions/LiveEngine/tree/main/examples/user-hub)
 - [`examples/axum-service.rs`](https://github.com/dixonSolutions/LiveEngine/blob/main/examples/axum-service.rs)
 
 The pages in this section reproduce the examples and explain the decisions behind them.
@@ -36,12 +40,21 @@ The pages in this section reproduce the examples and explain the decisions behin
     Injectable provider, module and controller.
   </Card>
   <Card title="Next.js" icon="arrow-up-right-from-square" href="/frameworks/nextjs">
-    Route handler backed by a central hub.
+    Route handlers plus a client page with live room listing.
+  </Card>
+  <Card title="Nitro" icon="server" href="/frameworks/nitro">
+    Nitro routes for rooms, matchmaking, and ping.
+  </Card>
+  <Card title="SvelteKit" icon="svelte" href="/frameworks/sveltekit">
+    SvelteKit server routes and a client page.
   </Card>
   <Card title="Axum" icon="rust" href="/frameworks/axum">
     Merge `HubService::router` into an existing Axum app.
   </Card>
   <Card title="Actix Web" icon="rust" href="/frameworks/actix">
     Use the engine directly or run the hub beside Actix.
+  </Card>
+  <Card title="User hub interface" icon="window" href="/guides/user-hub">
+    A complete browser interface with rooms and native ping.
   </Card>
 </CardGroup>

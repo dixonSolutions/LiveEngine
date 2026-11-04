@@ -153,6 +153,29 @@ assert_eq!(registration.mode, HubMode::External);
 
 `HubRegistration` uses `deny_unknown_fields`, matching the HTTP JSON parser. Unknown fields are rejected.
 
+## Native ping
+
+The host exposes an unauthenticated `GET /v1/ping` route. Rust clients can use `ping_hub`, which measures round-trip time with `Instant` and returns min, average, max, and jitter:
+
+```rust
+use liveengine::hub::ping_hub;
+use std::time::Duration;
+
+let stats = ping_hub("http://127.0.0.1:8787", 5, Duration::from_secs(3)).await?;
+println!("{:.3} ms avg, {:.3} ms jitter", stats.avg_ms, stats.jitter_ms);
+```
+
+`PingStats` serializes with camelCase field names and includes the individual `samples` plus the last `serverTimeMs`.
+
+The standalone binary exposes the same function as a command:
+
+```sh
+liveengine-hub ping http://127.0.0.1:8787 --samples 5
+liveengine-hub ping http://127.0.0.1:8787 --samples 5 --timeout-ms 3000 --json
+```
+
+Running `liveengine-hub` with no command still serves the hub. Use `liveengine-hub serve` explicitly if you prefer.
+
 ## Standalone binary
 
 The binary is `src/bin/liveengine-hub.rs`, named `liveengine-hub`, and requires the `host` feature:

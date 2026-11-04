@@ -170,11 +170,28 @@ export interface HubClientOptions {
   maxResponseBytes?: number;
   fetch?: typeof globalThis.fetch;
 }
+export interface HubPingOptions {
+  /** Number of probes, 1–32. Default 5. */
+  samples?: number;
+  /** Delay between probes in milliseconds. Default 0. */
+  intervalMs?: number;
+}
+export interface HubPing {
+  protocol: typeof HUB_PROTOCOL;
+  /** Individual round-trip times in milliseconds. */
+  samples: number[];
+  minMs: number;
+  maxMs: number;
+  avgMs: number;
+  jitterMs: number;
+  serverTimeMs?: number;
+}
 export declare const HUB_PROTOCOL: 'liveengine.hub/v1';
 export declare class HubClient {
   constructor(address: string, options: HubClientOptions);
   readonly address: string;
   contract(): Promise<{ protocol: typeof HUB_PROTOCOL; [key: string]: unknown }>;
+  ping(options?: HubPingOptions): Promise<HubPing>;
   list(): Promise<unknown>;
   register(hub: HubDefinition): Promise<unknown>;
   get(id: string): Promise<unknown>;

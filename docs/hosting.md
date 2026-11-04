@@ -4,6 +4,8 @@ The `liveengine-hub` process owns its registry and all registered internal engin
 
 Set `LIVEENGINE_TOKEN` to an unpredictable secret of at least 24 bytes. Internal endpoints and remote endpoints share the `liveengine.hub/v1` protocol. Remote registrations require their own token; registry listing never returns credentials.
 
+`GET /health` and `GET /v1/ping` are unauthenticated. Ping is a stateless latency probe: it returns protocol, server time, native processing time and uptime. Use `HubClient.ping()` or `liveengine-hub ping <url>` to sample it.
+
 `LIVEENGINE_BIND` defaults to `127.0.0.1:8787`. For a LAN device, bind the appropriate interface and connect to the host's LAN address. For a different network, use a reachable HTTPS ingress or a private overlay such as Tailscale. A container test proves process/network isolation; it does not prove a physical device on another network connected.
 
 `LIVEENGINE_ALLOWED_REMOTE_HOSTS` is a comma-separated allowlist for remote registrations and imports. Listing `remote` permits the Compose service hostname. Listing loopback/private hostnames is an explicit authorization to connect to them. Use exact hostnames you control. HTTP redirects are disabled; endpoint paths are appended to the registered base path.

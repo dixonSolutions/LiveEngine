@@ -27,3 +27,29 @@ test('HubClient rejects incompatible contracts, HTTP failures and oversized resp
   await assert.rejects(new HubClient('https://example.com', { ...options, maxResponseBytes: 4, fetch: async () => Response.json({ large: 'payload' }) }).list(), /exceeds/);
   assert.throws(() => new HubClient('https://user:password@example.com', options), /without credentials/);
 });
+
+test('HubClient.ping samples the native ping endpoint and reports RTT statistics', async () => {
+  let calls = 0;
+  const client = new HubClient('https://hub.example', {
+    token: 'secret',
+    fetch: async url => {
+      calls += 1;
+      assert.match(url, /\/v1\/ping$/);
+      await new Promise(resolve => setTimeout(resolve, 4));
+      return Response.json({ protocol: HUB_PROTOCOL, pong: true, serverTimeMs: 1234 });
+    },
+  });
+  const result = await client.ping({ samples: 3 });
+  assert.equal(calls, 3);
+  assert.equal(result.protocol, HUB_PROTOCOL);
+  assert.equal(result.samples.length, 3);
+  assert.equal(result.serverTimeMs, 1234);
+  assert.ok(result.avgMs >= 0);
+  assert.ok(result.minMs <= result.avgMs);
+  assert.ok(result.maxMs >= result.avgMs);
+  await assert.rejects(client.ping({ samples: 0 }), /samples/);
+  await assert.rejects(new HubClient('https://hub.example', {
+    token: 'secret',
+    fetch: async () => Response.json({ protocol: HUB_PROTOCOL, pong: false }),
+  }).ping({ samples: 1 }), /Incompatible ping/);
+});

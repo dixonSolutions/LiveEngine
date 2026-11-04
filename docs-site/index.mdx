@@ -8,7 +8,7 @@ LiveEngine solves two related problems:
 1. **Pairing users with capacity-limited servers.** A deterministic, in-process engine holds users and servers, evaluates requirements in both directions, and pairs users into rooms.
 2. **Routing matchmaking calls across processes.** A hosted registry lets one service own internal engines and attach independently hosted hubs through a uniform, authenticated HTTP contract.
 
-The same runtime can be embedded in a Node.js service, embedded in a Rust/Axum API, or run standalone as the `liveengine-hub` executable. Current release: **0.2.2**.
+The same runtime can be embedded in a Node.js service, embedded in a Rust/Axum API, or run standalone as the `liveengine-hub` executable. Current release: **0.2.3**.
 
 ## What is in the box
 
@@ -19,6 +19,7 @@ The same runtime can be embedded in a Node.js service, embedded in a Rust/Axum A
 | Cargo binary | `liveengine-hub` | Standalone HTTP host and central registry |
 | Container | same image | Central registry, ordinary internal hub host, or remote service |
 | Integration | Gogh Strike bridge | Optional server-side bridge from a browser game to the hub contract |
+| Interface | User hub | Dependency-free browser UI with room listing, matchmaking and native ping |
 
 The former C++/node-gyp implementation has been replaced by Rust. The existing `LiveEngine` and `NativeEngine` Node interfaces remain. Seeded sequences are deterministic within the Rust implementation, but random sequences are **not** byte-for-byte compatible with the previous C++ generator.
 
@@ -63,7 +64,7 @@ const { HubClient } = require('@dixonsolutions/liveengine/hubs');
 
 See [Installation](/node/installation) for the platform matrix and source fallback.
 
-## Honest scope for 0.2.2
+## Honest scope for 0.2.3
 
 LiveEngine is deliberately small and explicit about what it does not do:
 
@@ -73,6 +74,7 @@ LiveEngine is deliberately small and explicit about what it does not do:
 - **`scopeSchema` is a documented subset of JSON Schema**, not a general validator or dynamic code loader.
 - **Remote imports are snapshots.** Registrations added remotely later require another import.
 - **Gogh Strike integration validates matchmaking and connectivity.** Gameplay remains locally simulated; it does not synchronize multiplayer state.
+- **Ping is a latency probe, not a matchmaking input.** Use `HubClient.ping()` or `liveengine-hub ping` to measure a hub; add your own scope/requirement rules if you want ping to influence matching.
 
 ## Where to go next
 

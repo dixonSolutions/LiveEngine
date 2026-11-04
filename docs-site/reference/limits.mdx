@@ -28,6 +28,8 @@ Limits fall into four groups: host configuration, per-engine budgets, protocol/f
 
 `request_timeout` and `max_ttl` are Rust-only. See [Rust configuration](/rust/config).
 
+`/health` and `/v1/ping` bypass authentication and the peer rate budget; the limits above do not apply to those two routes.
+
 ## Entity budget
 
 `max_entities` bounds `users + servers` for each internal engine. Preflight estimates newly added entities before a mutation:

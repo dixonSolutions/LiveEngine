@@ -47,6 +47,7 @@
               "guides/custom-handler",
               "guides/docker",
               "guides/deployment",
+              "guides/user-hub",
               "guides/network-testing",
               "guides/gogh-strike"
             ]
@@ -79,7 +80,9 @@
               "frameworks/express",
               "frameworks/fastify",
               "frameworks/nestjs",
-              "frameworks/nextjs"
+              "frameworks/nextjs",
+              "frameworks/nitro",
+              "frameworks/sveltekit"
             ]
           },
           {

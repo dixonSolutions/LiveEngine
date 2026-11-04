@@ -1,6 +1,6 @@
 ---
-title: "Next.js route handlers"
-description: "Call a central LiveEngine hub from a Next.js App Router route handler."
+title: "Next.js"
+description: "App Router route handlers plus a client page that lists rooms and connects to a central LiveEngine hub."
 ---
 
 Next.js route handlers run in a Node.js or edge runtime and should not own matchmaking state. Use a central hub and the HTTP-only `HubClient`, which does not load the native addon.
@@ -9,20 +9,57 @@ Next.js route handlers run in a Node.js or edge runtime and should not own match
   The edge runtime does not provide Node's `Buffer`, which `HubClient` uses internally to read bounded responses. Use `export const runtime = 'nodejs'` for these routes.
 </Warning>
 
-## Route handler
+## Shared server client
+
+`lib/liveengine.ts`
+
+```ts
+import { HubClient } from '@dixonsolutions/liveengine/hubs';
+
+let client: HubClient | undefined;
+
+export function liveEngine() {
+  const url = process.env.LIVEENGINE_URL;
+  const token = process.env.LIVEENGINE_TOKEN;
+  if (!url || !token) throw new Error('Set LIVEENGINE_URL and LIVEENGINE_TOKEN');
+  client ??= new HubClient(url, { token, timeoutMs: 10_000 });
+  return { client, hubId: process.env.LIVEENGINE_HUB_ID || 'ranked' };
+}
+```
+
+## Server listing
+
+`app/api/liveengine/servers/route.ts`
+
+```ts
+import { NextResponse } from 'next/server';
+import { liveEngine } from '../../../../lib/liveengine';
+
+export const runtime = 'nodejs';
+
+export async function GET() {
+  try {
+    const { client, hubId } = liveEngine();
+    const [servers, stats] = await Promise.all([
+      client.call(hubId, 'listServers'),
+      client.call(hubId, 'stats'),
+    ]);
+    return NextResponse.json({ hubId, servers, stats });
+  } catch (error) {
+    return NextResponse.json({ error: (error as Error).message }, { status: 502 });
+  }
+}
+```
+
+## Matchmaking
 
 `app/api/liveengine/match/route.ts`
 
 ```ts
 import { NextResponse } from 'next/server';
-import { HubClient } from '@dixonsolutions/liveengine/hubs';
+import { liveEngine } from '../../../../lib/liveengine';
 
 export const runtime = 'nodejs';
-
-const hub = new HubClient(process.env.LIVEENGINE_URL!, {
-  token: process.env.LIVEENGINE_TOKEN!,
-  timeoutMs: 10_000,
-});
 
 export async function POST(request: Request) {
   const body = await request.json().catch(() => null);
@@ -30,41 +67,141 @@ export async function POST(request: Request) {
   if (typeof userId !== 'string' || !userId) {
     return NextResponse.json({ error: 'userId is required' }, { status: 400 });
   }
-
-  // Verify the session in your app before trusting userId.
-  await hub.call('ranked', 'upsertUser', [
-    { id: userId, scopes: body.scopes ?? {}, requirements: body.requirements },
-  ]);
-  const result = await hub.call('ranked', 'autoJoin', [userId]);
-
-  if (!result.ok) {
-    return NextResponse.json(result, { status: 409 });
+  try {
+    const { client, hubId } = liveEngine();
+    await client.call(hubId, 'upsertUser', [{
+      id: userId,
+      scopes: body.scopes ?? {},
+      requirements: body.requirements,
+    }]);
+    const result = await client.call<{ ok: boolean; serverId: string | null; reason: string | null }>(
+      hubId,
+      'autoJoin',
+      [userId],
+    );
+    if (!result.ok) return NextResponse.json(result, { status: 409 });
+    const server = await client.call(hubId, 'getServer', [result.serverId]);
+    return NextResponse.json({ ...result, server });
+  } catch (error) {
+    return NextResponse.json({ error: (error as Error).message }, { status: 502 });
   }
-  const server = await hub.call('ranked', 'getServer', [result.serverId]);
-  return NextResponse.json({ ...result, server });
 }
 ```
 
-## Health check
+## Native ping
 
-`app/api/liveengine/health/route.ts`
+`app/api/liveengine/ping/route.ts`
 
 ```ts
 import { NextResponse } from 'next/server';
-import { HubClient } from '@dixonsolutions/liveengine/hubs';
+import { liveEngine } from '../../../../lib/liveengine';
 
 export const runtime = 'nodejs';
 
 export async function GET() {
-  const hub = new HubClient(process.env.LIVEENGINE_URL!, {
-    token: process.env.LIVEENGINE_TOKEN!,
-  });
   try {
-    const contract = await hub.contract();
-    return NextResponse.json({ ok: true, contract });
+    const { client } = liveEngine();
+    return NextResponse.json(await client.ping({ samples: 5 }));
   } catch (error) {
-    return NextResponse.json({ ok: false, error: (error as Error).message }, { status: 502 });
+    return NextResponse.json({ error: (error as Error).message }, { status: 502 });
   }
+}
+```
+
+## Client connection and room list
+
+`app/liveengine/page.tsx`
+
+```tsx
+'use client';
+
+import { useEffect, useState } from 'react';
+
+type Server = {
+  id: string;
+  status: string;
+  capacity: number;
+  free: number;
+  members: string[];
+  scopes: unknown;
+};
+
+type Stats = {
+  users: number;
+  waiting: number;
+  paired: number;
+  servers: number;
+  open: number;
+};
+
+type Ping = {
+  avgMs: number;
+  minMs: number;
+  maxMs: number;
+  jitterMs: number;
+};
+
+export default function LiveEnginePage() {
+  const [userId, setUserId] = useState('player-1');
+  const [servers, setServers] = useState<Server[]>([]);
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [ping, setPing] = useState<Ping | null>(null);
+  const [message, setMessage] = useState('');
+
+  async function load() {
+    const response = await fetch('/api/liveengine/servers', { cache: 'no-store' });
+    const data = await response.json();
+    if (!response.ok) return setMessage(data.error || 'Could not load servers');
+    setServers(data.servers ?? []);
+    setStats(data.stats);
+  }
+
+  useEffect(() => {
+    load();
+    const timer = setInterval(load, 2500);
+    return () => clearInterval(timer);
+  }, []);
+
+  async function connect() {
+    setMessage('Connecting...');
+    const response = await fetch('/api/liveengine/match', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ userId, scopes: { region: 'au' }, requirements: {} }),
+    });
+    const data = await response.json();
+    setMessage(response.ok
+      ? `Matched ${userId} into ${data.serverId}`
+      : data.error || data.reason || 'No match');
+    load();
+  }
+
+  async function samplePing() {
+    const response = await fetch('/api/liveengine/ping', { cache: 'no-store' });
+    const data = await response.json();
+    if (response.ok) setPing(data);
+    else setMessage(data.error || 'Ping failed');
+  }
+
+  return (
+    <main>
+      <h1>LiveEngine matchmaking</h1>
+      <input value={userId} onChange={event => setUserId(event.target.value)} />
+      <button onClick={connect}>Find a match</button>
+      <button onClick={samplePing}>Ping hub</button>
+      <p>{message}</p>
+      {ping && <p>Ping {ping.avgMs.toFixed(1)} ms average</p>}
+      {stats && <p>{stats.paired} paired / {stats.waiting} waiting / {stats.open} open rooms</p>}
+      <ul>
+        {servers.map(server => (
+          <li key={server.id}>
+            <strong>{server.id}</strong> — {server.status}, {server.members.length}/{server.capacity} joined,
+            {' '}{server.free} free — <code>{JSON.stringify(server.scopes)}</code>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
 }
 ```
 
@@ -74,3 +211,5 @@ export async function GET() {
 - The hub token is an **administrative** credential. Keep it in server-side environment variables; never expose it through `NEXT_PUBLIC_*`.
 - Configure the hub with a reachable HTTPS ingress in production. `HubClient` rejects redirects and requires a plain base URL without credentials, query, or fragment.
 - Long-running calls are bounded by `timeoutMs`; return a useful `502`/`504` to the browser instead of hanging.
+
+The complete files are in [`examples/frameworks/nextjs`](https://github.com/dixonSolutions/LiveEngine/tree/main/examples/frameworks/nextjs).

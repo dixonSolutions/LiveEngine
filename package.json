@@ -1,6 +1,6 @@
 {
   "name": "@dixonsolutions/liveengine",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Rust live matchmaking with embedded and standalone hub hosting, custom scopes, and authenticated remote hub registries",
   "main": "lib/index.js",
   "types": "index.d.ts",
@@ -43,6 +43,7 @@
     "docs/hub-contract.schema.json",
     "examples/*.rs",
     "examples/frameworks",
+    "examples/user-hub",
     "docs/*.md"
   ],
   "scripts": {

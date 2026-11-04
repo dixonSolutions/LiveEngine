@@ -1,0 +1,109 @@
+---
+title: "Nitro"
+description: "Nitro server routes for room listing, matchmaking, and native hub ping."
+---
+
+Nitro powers Nuxt and can also run as a standalone server. Keep matchmaking state in a central hub and call it from Nitro server routes.
+
+## Shared server client
+
+`server/utils/liveengine.ts`
+
+```ts
+import { HubClient } from '@dixonsolutions/liveengine/hubs';
+
+let client: HubClient | undefined;
+
+export function liveEngine() {
+  const url = process.env.LIVEENGINE_URL;
+  const token = process.env.LIVEENGINE_TOKEN;
+  if (!url || !token) throw new Error('Set LIVEENGINE_URL and LIVEENGINE_TOKEN');
+  client ??= new HubClient(url, { token, timeoutMs: 10_000 });
+  return { client, hubId: process.env.LIVEENGINE_HUB_ID || 'ranked' };
+}
+```
+
+<Note>
+  With a Nitro preset that does not expose `process.env`, use `useRuntimeConfig(event)` and pass the values into `liveEngine()`. Keep the hub token in private runtime config.
+</Note>
+
+## Server listing
+
+`server/routes/api/liveengine/servers.get.ts`
+
+```ts
+import { liveEngine } from '../../../utils/liveengine';
+
+export default defineEventHandler(async () => {
+  const { client, hubId } = liveEngine();
+  const [servers, stats] = await Promise.all([
+    client.call(hubId, 'listServers'),
+    client.call(hubId, 'stats'),
+  ]);
+  return { hubId, servers, stats };
+});
+```
+
+## Matchmaking
+
+`server/routes/api/liveengine/match.post.ts`
+
+```ts
+import { liveEngine } from '../../../utils/liveengine';
+
+interface MatchBody {
+  userId: string;
+  scopes?: Record<string, unknown>;
+  requirements?: unknown;
+}
+
+export default defineEventHandler(async event => {
+  const body = await readBody<MatchBody>(event);
+  if (!body?.userId) {
+    throw createError({ statusCode: 400, statusMessage: 'userId is required' });
+  }
+  const { client, hubId } = liveEngine();
+  await client.call(hubId, 'upsertUser', [{
+    id: body.userId,
+    scopes: body.scopes ?? {},
+    requirements: body.requirements,
+  }]);
+  const result = await client.call<{ ok: boolean; serverId: string | null; reason: string | null }>(
+    hubId,
+    'autoJoin',
+    [body.userId],
+  );
+  if (!result.ok) {
+    throw createError({ statusCode: 409, statusMessage: result.reason || 'no_fit', data: result });
+  }
+  const server = await client.call(hubId, 'getServer', [result.serverId]);
+  return { ...result, server };
+});
+```
+
+## Native ping
+
+`server/routes/api/liveengine/ping.get.ts`
+
+```ts
+import { liveEngine } from '../../../utils/liveengine';
+
+export default defineEventHandler(async () => {
+  const { client } = liveEngine();
+  return client.ping({ samples: 5 });
+});
+```
+
+## Client page
+
+Fetch these routes from a Nuxt page or any browser client:
+
+```ts
+const rooms = await $fetch('/api/liveengine/servers');
+const result = await $fetch('/api/liveengine/match', {
+  method: 'POST',
+  body: { userId: 'alice', scopes: { region: 'au' }, requirements: {} },
+});
+```
+
+The complete files are in [`examples/frameworks/nitro`](https://github.com/dixonSolutions/LiveEngine/tree/main/examples/frameworks/nitro).

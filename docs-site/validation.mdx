@@ -1,6 +1,6 @@
 ---
 title: "Validation record"
-description: "What was actually observed for 0.2.2, and what remains unverified."
+description: "What was actually observed for 0.2.3, and what remains unverified."
 ---
 
 Validation performed on **2026-11-04**. This is a record of observed checks, not a guarantee for other environments. Registry publication and trust configuration are separate account operations.
@@ -29,9 +29,15 @@ Validation performed on **2026-11-04**. This is a record of observed checks, not
 - Unauthenticated access is denied.
 - Executed locally with Podman using the standard Dockerfile; Docker execution is also configured in CI.
 
+### Native ping and user hub
+
+- `/v1/ping` is unauthenticated and reports native processing time.
+- Rust `ping_hub`, the `liveengine-hub ping` command, and the Node `HubClient.ping()` sampler all passed against a live hub.
+- The dependency-free user hub interface listed rooms, joined a match, left, created a demo room, and rendered live ping samples in a headless browser with no page errors.
+
 ### Cross-network connectivity
 
-- GitHub Actions run [41788025360](https://github.com/dixonSolutions/LiveEngine/actions/runs/41788025360) succeeded.
+- GitHub Actions run [41797208954](https://github.com/dixonSolutions/LiveEngine/actions/runs/41797208954) succeeded.
 - A GitHub-hosted runner connected over HTTPS to the local service through a temporary Cloudflare tunnel.
 - The runner created a hub/room/player, paired the player, and deleted the test hub.
 - The tunnel was stopped and its temporary repository secret removed after the check.

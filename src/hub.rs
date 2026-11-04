@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -304,6 +304,7 @@ impl HubService {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/health", get(health))
+            .route("/v1/ping", get(ping))
             .route("/v1/contract", get(contract))
             .route("/v1/contract/schema", get(contract_schema))
             .route("/v1/hubs", get(list_hubs).post(register_hub))
@@ -378,7 +379,7 @@ async fn secure_request(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if request.uri().path() == "/health" {
+    if matches!(request.uri().path(), "/health" | "/v1/ping") {
         return next.run(request).await;
     }
     let peer = request
@@ -438,9 +439,28 @@ async fn health(State(state): State<Arc<Inner>>) -> Json<Value> {
         serde_json::json!({"status":"ok","protocol":HUB_PROTOCOL,"uptimeSeconds":state.boot.elapsed().as_secs()}),
     )
 }
+
+/// Lightweight, unauthenticated latency probe. The server reports its own
+/// processing time so callers can separate server work from network RTT.
+async fn ping(State(state): State<Arc<Inner>>) -> Json<Value> {
+    let started = Instant::now();
+    let server_time_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let processing_micros = started.elapsed().as_micros() as u64;
+    Json(serde_json::json!({
+        "protocol": HUB_PROTOCOL,
+        "pong": true,
+        "serverTimeMs": server_time_ms,
+        "processingMicros": processing_micros,
+        "uptimeSeconds": state.boot.elapsed().as_secs(),
+    }))
+}
+
 async fn contract() -> Json<Value> {
     Json(
-        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/registries/import"],"schema":"/v1/contract/schema"}),
+        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/registries/import"],"schema":"/v1/contract/schema"}),
     )
 }
 async fn contract_schema() -> Response {
@@ -950,6 +970,95 @@ fn endpoint(base: &Url, suffix: &str) -> Result<Url, String> {
     let path = format!("{}/{}", base.path().trim_end_matches('/'), suffix);
     url.set_path(&path);
     Ok(url)
+}
+
+/// Native round-trip latency samples for a hub's `/v1/ping` endpoint.
+///
+/// The measurement is performed by the Rust process, so callers do not need a
+/// JavaScript runtime. The endpoint is unauthenticated and returns only timing
+/// metadata.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PingStats {
+    pub samples: Vec<f64>,
+    pub min_ms: f64,
+    pub max_ms: f64,
+    pub avg_ms: f64,
+    pub jitter_ms: f64,
+    pub server_time_ms: Option<u64>,
+}
+
+pub async fn ping_hub(
+    address: &str,
+    samples: usize,
+    timeout: Duration,
+) -> Result<PingStats, String> {
+    if !(1..=32).contains(&samples) {
+        return Err("samples must be between 1 and 32".into());
+    }
+    if timeout.is_zero() {
+        return Err("timeout must be greater than zero".into());
+    }
+    let base =
+        Url::parse(address).map_err(|_| "address must be an absolute HTTP(S) URL".to_string())?;
+    if !matches!(base.scheme(), "http" | "https")
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+    {
+        return Err("address must be a plain HTTP(S) base URL".into());
+    }
+    let url = endpoint(&base, "v1/ping")?;
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("could not create HTTP client: {e}"))?;
+    let mut rtts = Vec::with_capacity(samples);
+    let mut server_time_ms = None;
+    for _ in 0..samples {
+        let started = Instant::now();
+        let response = client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|e| format!("ping request failed: {e}"))?;
+        let value = read_remote_json(response, 64 * 1024)
+            .await
+            .map_err(|e| e.trim_start_matches("remote: ").to_string())?;
+        if value.get("protocol").and_then(Value::as_str) != Some(HUB_PROTOCOL)
+            || value.get("pong").and_then(Value::as_bool) != Some(true)
+        {
+            return Err("incompatible ping response".into());
+        }
+        server_time_ms = value.get("serverTimeMs").and_then(Value::as_u64);
+        rtts.push(round_ms(started.elapsed().as_secs_f64() * 1000.0));
+    }
+    let min_ms = rtts.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_ms = rtts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let avg_ms = rtts.iter().sum::<f64>() / rtts.len() as f64;
+    let jitter_ms = if rtts.len() < 2 {
+        0.0
+    } else {
+        rtts.windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .sum::<f64>()
+            / (rtts.len() - 1) as f64
+    };
+    Ok(PingStats {
+        samples: rtts,
+        min_ms: round_ms(min_ms),
+        max_ms: round_ms(max_ms),
+        avg_ms: round_ms(avg_ms),
+        jitter_ms: round_ms(jitter_ms),
+        server_time_ms,
+    })
+}
+
+fn round_ms(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
 }
 
 async fn remote_get(state: &Inner, url: Url, token: &str) -> Result<Value, String> {

@@ -10,7 +10,7 @@ export HUB=http://127.0.0.1:8787
 export TOKEN="$LIVEENGINE_TOKEN"
 ```
 
-Every route except `/health` requires:
+Every route except `/health` and `/v1/ping` requires:
 
 ```http
 Authorization: Bearer <token>
@@ -38,6 +38,36 @@ curl --fail --silent "$HUB/health"
 | --- | --- |
 | `200` | Running |
 
+## GET /v1/ping
+
+Unauthenticated latency probe. It does not consume a rate slot or expose state.
+
+```sh
+curl --fail --silent "$HUB/v1/ping"
+```
+
+```json
+{
+  "protocol": "liveengine.hub/v1",
+  "pong": true,
+  "serverTimeMs": 1793782157480,
+  "processingMicros": 0,
+  "uptimeSeconds": 42
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `protocol` | Protocol version |
+| `pong` | Always `true` on success |
+| `serverTimeMs` | Server wall clock in Unix milliseconds |
+| `processingMicros` | Native handler time before serialization |
+| `uptimeSeconds` | Host uptime |
+
+| Status | Meaning |
+| --- | --- |
+| `200` | Pong |
+
 ## GET /v1/contract
 
 Capability handshake.
@@ -52,6 +82,7 @@ curl --silent -H "Authorization: Bearer $TOKEN" "$HUB/v1/contract"
   "version": 1,
   "endpoints": [
     "/health",
+    "/v1/ping",
     "/v1/contract",
     "/v1/hubs",
     "/v1/hubs/{id}",

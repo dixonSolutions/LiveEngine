@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LiveEngine User Hub</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <div>
+        <h1>LiveEngine</h1>
+        <p>User hub</p>
+      </div>
+    </div>
+    <div class="hub-status">
+      <span id="status-dot" class="dot connecting" aria-hidden="true"></span>
+      <span id="hub-label">Connecting to hub...</span>
+      <span id="ping-badge" class="badge">-- ms</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel join-panel" aria-labelledby="join-title">
+      <div class="panel-head">
+        <h2 id="join-title">Join the hub</h2>
+        <span class="hint">Your hub token stays on the server</span>
+      </div>
+      <label class="field">
+        <span>User ID</span>
+        <input id="user-id" autocomplete="off" spellcheck="false" maxlength="64" placeholder="player-1">
+      </label>
+      <div class="field-grid">
+        <label class="field">
+          <span>Scopes (JSON)</span>
+          <textarea id="scopes" rows="6" spellcheck="false">{"region":"au"}</textarea>
+        </label>
+        <label class="field">
+          <span>Requirements (JSON)</span>
+          <textarea id="requirements" rows="6" spellcheck="false">{}</textarea>
+        </label>
+      </div>
+      <label class="check">
+        <input id="auto-match" type="checkbox" checked>
+        <span>Auto-match immediately on join</span>
+      </label>
+      <div class="actions">
+        <button id="find-match" class="primary">Find a match</button>
+        <button id="leave">Leave room</button>
+        <button id="refresh">Refresh</button>
+      </div>
+      <p id="join-message" class="message" role="status"></p>
+    </section>
+
+    <section class="panel session-panel" aria-labelledby="session-title">
+      <div class="panel-head">
+        <h2 id="session-title">Your session</h2>
+        <span id="session-state" class="pill">idle</span>
+      </div>
+      <div class="session-grid">
+        <div><span class="label">User</span><strong id="session-user">--</strong></div>
+        <div><span class="label">Room</span><strong id="session-room">--</strong></div>
+        <div><span class="label">Members</span><strong id="session-members">--</strong></div>
+        <div><span class="label">Free seats</span><strong id="session-free">--</strong></div>
+      </div>
+      <div id="matched-scopes" class="code-block">No active room</div>
+    </section>
+
+    <section class="panel ping-panel" aria-labelledby="ping-title">
+      <div class="panel-head">
+        <h2 id="ping-title">Native ping</h2>
+        <span id="ping-updated" class="hint">Not sampled</span>
+      </div>
+      <div class="ping-grid">
+        <div><span class="label">Average</span><strong id="ping-avg">--</strong></div>
+        <div><span class="label">Min</span><strong id="ping-min">--</strong></div>
+        <div><span class="label">Max</span><strong id="ping-max">--</strong></div>
+        <div><span class="label">Jitter</span><strong id="ping-jitter">--</strong></div>
+      </div>
+      <div id="ping-bars" class="ping-bars" aria-label="Ping samples"></div>
+      <div class="actions">
+        <button id="ping-now">Ping now</button>
+        <span class="hint">Round-trip to <code id="hub-id">hub</code> over the server bridge</span>
+      </div>
+    </section>
+
+    <section class="panel rooms-panel" aria-labelledby="rooms-title">
+      <div class="panel-head">
+        <h2 id="rooms-title">Rooms</h2>
+        <span id="room-count" class="hint">0 open</span>
+      </div>
+      <div id="rooms" class="room-list">
+        <p class="empty">No rooms yet. Create a demo room below.</p>
+      </div>
+      <div class="demo-room">
+        <h3>Demo room</h3>
+        <p>Create a room to try the interface. The administrative token is used server-side.</p>
+        <div class="demo-row">
+          <input id="demo-capacity" type="number" min="1" max="64" value="2" aria-label="Demo room capacity">
+          <button id="create-room">Create room</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel log-panel" aria-labelledby="log-title">
+      <div class="panel-head">
+        <h2 id="log-title">Event log</h2>
+        <button id="clear-log" class="link">Clear</button>
+      </div>
+      <ol id="log" class="log"></ol>
+    </section>
+  </main>
+
+  <footer>LiveEngine user hub &middot; token stays server-side &middot; state is in memory</footer>
+</body>
+</html>

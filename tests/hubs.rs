@@ -553,3 +553,35 @@ async fn rejects_hub_ids_that_normalize_as_url_path_segments() {
     let (_, list) = request(app, "GET", "/v1/hubs", None, true).await;
     assert_eq!(list["hubs"], json!([]));
 }
+
+#[tokio::test]
+async fn ping_endpoint_is_unauthenticated_and_native_ping_reports_stats() {
+    let service = HubService::new(config()).unwrap();
+    let (status, value) = request(service.router(), "GET", "/v1/ping", None, false).await;
+    assert_eq!(status, 200, "{value}");
+    assert_eq!(value["protocol"], "liveengine.hub/v1");
+    assert_eq!(value["pong"], true);
+    assert!(value["processingMicros"].is_u64());
+    assert!(value["serverTimeMs"].is_u64());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address: SocketAddr = listener.local_addr().unwrap();
+    let app = service.router();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let stats = liveengine::hub::ping_hub(&format!("http://{address}"), 3, Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(stats.samples.len(), 3);
+    assert!(stats.avg_ms >= 0.0);
+    assert!(stats.min_ms <= stats.avg_ms);
+    assert!(stats.max_ms >= stats.avg_ms);
+    assert!(stats.server_time_ms.is_some());
+}
