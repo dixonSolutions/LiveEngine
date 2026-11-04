@@ -8,7 +8,7 @@
   "author": "dixonSolutions",
   "repository": {
     "type": "git",
-    "url": "https://github.com/dixonSolutions/LiveEngine.git"
+    "url": "git+https://github.com/dixonSolutions/LiveEngine.git"
   },
   "homepage": "https://github.com/dixonSolutions/LiveEngine#readme",
   "bugs": {
