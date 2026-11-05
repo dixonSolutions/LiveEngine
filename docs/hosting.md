@@ -67,3 +67,9 @@ For hubs with a `scopeSchema`, user/server upserts are validated before dispatch
 Authenticated `POST /v1/schemas` accepts `{ "id": "game", "version": "1", "schema": { "type": "object" } }`. `GET /v1/schemas` lists definitions, and `GET` or `DELETE /v1/schemas/game@1` retrieves or deletes one. Versions are immutable, and deletion fails while a hub references the version. `liveengine.default@1` is built in.
 
 Hub registration accepts `schemaRef` instead of `scopeSchema`; `userSchema` and `serverSchema` optionally override the shared schema for the corresponding upserts. Registry imports transfer schema definitions and reject conflicting versions; `GET /v1/registry/export` includes definitions without credentials. Schema definitions remain in memory.
+
+## On-demand hubs
+
+Create a template with `POST /v1/templates`, for example `{"name":"game","mode":"internal","ttlSeconds":60}`. List templates with `GET /v1/templates`, retrieve or delete one at `/v1/templates/{name}`. Template credentials are write-only. Register with `{"id":"match-1","template":"game","ifAbsent":true}`; supplied fields override template defaults. A repeated `ifAbsent` registration returns the existing hub without changing it. The server removes expired hubs in the background. Template and hub registries are each bounded by `LIVEENGINE_MAX_HUBS`.
+
+Local central hubs accept `maxHubs` to limit their immediate children, including on-demand registrations. The service-wide `LIVEENGINE_MAX_HUBS` budget also counts central hubs and their descendants. Use `POST /v1/route` with `{ "path": ["central-id"], "op": "register", "body": { "id": "match-1", "template": "game" } }` to create a child from a service template. Nested local paths are limited to eight segments.

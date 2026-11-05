@@ -153,10 +153,12 @@ export declare class LiveEngine extends EventEmitter {
 export declare const nativeVersion: string;
 export default LiveEngine;
 
-export type HubMode = 'internal' | 'external';
+export type HubMode = 'internal' | 'external' | 'central';
 export interface HubDefinition {
   id: string;
-  mode: HubMode;
+  mode?: HubMode;
+  template?: string;
+  ifAbsent?: boolean;
   address?: string;
   remoteHubId?: string;
   remoteToken?: string;
@@ -166,6 +168,7 @@ export interface HubDefinition {
   userSchema?: Record<string, unknown> | boolean;
   serverSchema?: Record<string, unknown> | boolean;
   ttlSeconds?: number;
+  maxHubs?: number;
 }
 export interface HubClientOptions {
   token: string;
@@ -195,6 +198,11 @@ export declare class HubClient {
   readonly address: string;
   contract(): Promise<{ protocol: typeof HUB_PROTOCOL; [key: string]: unknown }>;
   ping(options?: HubPingOptions): Promise<HubPing>;
+  route(path: string[], op: 'register' | 'list' | 'get' | 'delete' | 'call', body?: Record<string, unknown>): Promise<unknown>;
+  listTemplates(): Promise<unknown>;
+  createTemplate(template: Omit<HubDefinition, 'id' | 'template' | 'ifAbsent'> & { name: string; mode: HubMode }): Promise<unknown>;
+  getTemplate(name: string): Promise<unknown>;
+  removeTemplate(name: string): Promise<unknown>;
   listSchemas(): Promise<unknown>;
   createSchema(schema: { id: string; version: string; schema: Record<string, unknown> | boolean }): Promise<unknown>;
   getSchema(id: string): Promise<unknown>;

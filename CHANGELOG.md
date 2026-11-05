@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add hub templates, idempotent creation, background expiry, and per-central child quotas for hosted hubs.
+
 - Add a versioned schema registry and JSON Schema validation for hub scopes, users and servers, with schema transfer during registry imports.
 
 - Release Gogh Strike matchmaking seats on menu return and page hide, and reclaim idle seats. Check API Origins and enforce the bridge body limit in bytes.

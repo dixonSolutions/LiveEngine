@@ -8,15 +8,15 @@
       "type": "string",
       "enum": [
         "internal",
-        "external"
+        "external",
+        "central"
       ]
     },
     "HubRegistration": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "id",
-        "mode"
+        "id"
       ],
       "properties": {
         "id": {
@@ -81,15 +81,49 @@
             "object",
             "boolean"
           ]
+        },
+        "template": {
+          "type": "string"
+        },
+        "ifAbsent": {
+          "type": "boolean",
+          "default": false
+        },
+        "maxHubs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum immediate children of a local central hub."
         }
       },
       "allOf": [
+        {
+          "anyOf": [
+            {
+              "required": [
+                "mode"
+              ]
+            },
+            {
+              "required": [
+                "template"
+              ]
+            }
+          ]
+        },
         {
           "if": {
             "properties": {
               "mode": {
                 "const": "external"
               }
+            },
+            "required": [
+              "mode"
+            ],
+            "not": {
+              "required": [
+                "template"
+              ]
             }
           },
           "then": {
@@ -97,8 +131,25 @@
               "address",
               "remoteToken"
             ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "internal"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "not": {
+              "required": [
+                "template"
+              ]
+            }
           },
-          "else": {
+          "then": {
             "not": {
               "anyOf": [
                 {
@@ -186,6 +237,11 @@
             "object",
             "boolean"
           ]
+        },
+        "maxHubs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum immediate children of a local central hub."
         }
       }
     },
@@ -273,6 +329,77 @@
           ]
         }
       }
+    },
+    "HubTemplate": {
+      "type": "object",
+      "required": [
+        "name",
+        "mode"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/HubMode"
+        },
+        "address": {
+          "type": "string",
+          "format": "uri"
+        },
+        "remoteHubId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          }
+        },
+        "remoteToken": {
+          "type": "string",
+          "minLength": 24,
+          "writeOnly": true
+        },
+        "scopes": {
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
+        },
+        "scopeSchema": {
+          "description": "JSON Schema draft 2020-12 for scopes; only local references are allowed.",
+          "type": [
+            "object",
+            "boolean"
+          ]
+        },
+        "ttlSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "schemaRef": {
+          "type": "string"
+        },
+        "userSchema": {
+          "type": [
+            "object",
+            "boolean"
+          ]
+        },
+        "serverSchema": {
+          "type": [
+            "object",
+            "boolean"
+          ]
+        },
+        "maxHubs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum immediate children of a local central hub."
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

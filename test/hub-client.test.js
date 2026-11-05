@@ -53,3 +53,20 @@ test('HubClient.ping samples the native ping endpoint and reports RTT statistics
     fetch: async () => Response.json({ protocol: HUB_PROTOCOL, pong: false }),
   }).ping({ samples: 1 }), /Incompatible ping/);
 });
+
+test('HubClient sends template operations and on-demand registration', async () => {
+  const requests = [];
+  const client = new HubClient('https://hub.example', { token: 'secret', fetch: async (url, init) => {
+    requests.push({ url, init });
+    return Response.json({});
+  } });
+  await client.createTemplate({ name: 'game', mode: 'internal' });
+  await client.listTemplates();
+  await client.getTemplate('game');
+  await client.removeTemplate('game');
+  await client.register({ id: 'one', template: 'game', ifAbsent: true });
+  await client.route(['central'], 'register', { id: 'two', template: 'game', ifAbsent: true });
+  assert.deepEqual(requests.map(r => r.init.method), ['POST', 'GET', 'GET', 'DELETE', 'POST', 'POST']);
+  assert.deepEqual(JSON.parse(requests[4].init.body), { id: 'one', template: 'game', ifAbsent: true });
+  assert.deepEqual(JSON.parse(requests[5].init.body), { path: ['central'], op: 'register', body: { id: 'two', template: 'game', ifAbsent: true } });
+});

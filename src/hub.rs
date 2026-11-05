@@ -6,7 +6,10 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -209,6 +212,7 @@ pub struct HubRegistration {
 pub enum HubMode {
     Internal,
     External,
+    Central,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -230,6 +234,8 @@ pub struct HubInfo {
     pub user_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_hubs: Option<usize>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -255,6 +261,8 @@ struct HubRecord {
     expires_at: Option<Instant>,
     handler: Option<Arc<Mutex<Box<dyn HubHandler>>>>,
     remote_token: Option<String>,
+    child: Option<Arc<Inner>>,
+    _slot: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 struct RateEntry {
@@ -273,10 +281,14 @@ struct Inner {
     config: HubConfig,
     hubs: RwLock<HashMap<String, HubRecord>>,
     schemas: RwLock<HashMap<String, Value>>,
+    templates: Arc<RwLock<HashMap<String, Value>>>,
+    reaper_started: AtomicBool,
     client: Client,
     rate: Mutex<HashMap<String, RateEntry>>,
     boot: Instant,
     inflight_calls: Arc<Semaphore>,
+    hub_slots: Arc<Semaphore>,
+    global_max_hubs: usize,
 }
 
 /// Cloneable state for a hosted hub registry.
@@ -294,6 +306,8 @@ impl HubService {
             .build()
             .map_err(|e| format!("could not create HTTP client: {e}"))?;
         let inflight_calls = Arc::new(Semaphore::new(config.max_inflight_calls));
+        let global_max_hubs = config.max_hubs;
+        let hub_slots = Arc::new(Semaphore::new(global_max_hubs));
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
@@ -302,10 +316,14 @@ impl HubService {
                     "liveengine.default@1".to_string(),
                     serde_json::json!({"type":"object"}),
                 )])),
+                templates: Arc::new(RwLock::new(HashMap::new())),
+                reaper_started: AtomicBool::new(false),
                 client,
                 rate: Mutex::new(HashMap::new()),
                 boot: Instant::now(),
                 inflight_calls,
+                global_max_hubs,
+                hub_slots,
             }),
         })
     }
@@ -313,6 +331,7 @@ impl HubService {
     /// Router for embedding in another Axum application. It owns routes rooted
     /// at `/health`, `/v1/contract`, and `/v1/hubs`.
     pub fn router(&self) -> Router {
+        start_reaper(&self.inner);
         Router::new()
             .route("/health", get(health))
             .route("/v1/ping", get(ping))
@@ -320,6 +339,12 @@ impl HubService {
             .route("/v1/contract/schema", get(contract_schema))
             .route("/v1/schemas", get(list_schemas).post(create_schema))
             .route("/v1/schemas/{id}", get(get_schema).delete(delete_schema))
+            .route("/v1/templates", get(list_templates).post(create_template))
+            .route(
+                "/v1/templates/{name}",
+                get(get_template).delete(delete_template),
+            )
+            .route("/v1/route", post(route_hub))
             .route("/v1/hubs", get(list_hubs).post(register_hub))
             .route("/v1/hubs/{id}", get(get_hub).delete(delete_hub))
             .route("/v1/hubs/{id}/call", post(call_hub))
@@ -371,12 +396,15 @@ impl HubService {
             schema_ref: None,
             user_schema: None,
             server_schema: None,
+            max_hubs: None,
         };
-        let record = HubRecord {
+        let mut record = HubRecord {
             info: info.clone(),
             expires_at: ttl.map(|d| Instant::now() + d),
             handler: Some(Arc::new(Mutex::new(Box::new(handler)))),
             remote_token: None,
+            child: None,
+            _slot: None,
         };
         let mut hubs = self.inner.hubs.write().await;
         expire_hubs(&mut hubs);
@@ -386,8 +414,30 @@ impl HubService {
         if hubs.len() >= self.inner.config.max_hubs {
             return Err("hub registry is full".into());
         }
+        record._slot = Some(Arc::new(
+            self.inner
+                .hub_slots
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| "hub registry is full")?,
+        ));
         hubs.insert(registration.id, record);
         Ok(info)
+    }
+}
+
+fn start_reaper(state: &Arc<Inner>) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        if !state.reaper_started.swap(true, Ordering::AcqRel) {
+            let weak = Arc::downgrade(state);
+            runtime.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let Some(state) = weak.upgrade() else { break };
+                    expire_hubs(&mut *state.hubs.write().await);
+                }
+            });
+        }
     }
 }
 
@@ -396,6 +446,7 @@ async fn secure_request(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    start_reaper(&state);
     if matches!(request.uri().path(), "/health" | "/v1/ping") {
         return next.run(request).await;
     }
@@ -477,7 +528,7 @@ async fn ping(State(state): State<Arc<Inner>>) -> Json<Value> {
 
 async fn contract() -> Json<Value> {
     Json(
-        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}"],"schema":"/v1/contract/schema"}),
+        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}","/v1/templates","/v1/templates/{name}","/v1/route"],"schema":"/v1/contract/schema"}),
     )
 }
 async fn contract_schema() -> Response {
@@ -603,6 +654,177 @@ async fn get_hub(State(state): State<Arc<Inner>>, Path(id): Path<String>) -> Res
     }
 }
 
+fn valid_max_hubs(value: Option<&Value>, object: &Map<String, Value>, global: usize) -> bool {
+    match value {
+        None => true,
+        Some(value) => {
+            object.get("mode").and_then(Value::as_str) == Some("central")
+                && value.as_u64().is_some_and(|n| n > 0 && n <= global as u64)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteRequest {
+    path: Vec<String>,
+    op: String,
+    #[serde(default)]
+    body: Value,
+}
+
+async fn route_hub(
+    State(mut state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    payload: Result<Json<RouteRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = payload else {
+        return error(StatusCode::BAD_REQUEST, "invalid route request");
+    };
+    if request.path.len() > 8 {
+        return error(StatusCode::BAD_REQUEST, "route depth exceeded");
+    }
+    for segment in &request.path {
+        let record = {
+            let mut hubs = state.hubs.write().await;
+            expire_hubs(&mut hubs);
+            hubs.get(segment).cloned()
+        };
+        state = match record.and_then(|r| r.child) {
+            Some(child) => child,
+            None => return error(StatusCode::NOT_FOUND, "central hub not found"),
+        };
+    }
+    match request.op.as_str() {
+        "register" => register_hub(State(state), Ok(Json(request.body))).await,
+        "list" => list_hubs(State(state)).await.into_response(),
+        "get" | "delete" => {
+            let Some(id) = request.body.get("id").and_then(Value::as_str) else {
+                return error(StatusCode::BAD_REQUEST, "missing hub id");
+            };
+            if request.op == "get" {
+                get_hub(State(state), Path(id.to_string())).await
+            } else {
+                delete_hub(State(state), Path(id.to_string())).await
+            }
+        }
+        "call" => {
+            let Some(id) = request.body.get("id").and_then(Value::as_str) else {
+                return error(StatusCode::BAD_REQUEST, "missing hub id");
+            };
+            let mut body = request.body.as_object().cloned().unwrap_or_default();
+            let id = id.to_string();
+            body.remove("id");
+            match serde_json::from_value::<CallRequest>(Value::Object(body)) {
+                Ok(call) => call_hub(State(state), Path(id), headers, Ok(Json(call))).await,
+                Err(_) => error(StatusCode::BAD_REQUEST, "invalid call"),
+            }
+        }
+        _ => error(StatusCode::BAD_REQUEST, "invalid route operation"),
+    }
+}
+
+// Templates hold defaults, including write-only remote credentials. Read paths redact them.
+fn public_template(name: &str, template: &Value) -> Value {
+    let mut value = template.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.remove("remoteToken");
+        object.insert("name".into(), Value::String(name.into()));
+    }
+    value
+}
+async fn create_template(
+    State(state): State<Arc<Inner>>,
+    payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(Value::Object(mut object))) = payload else {
+        return error(StatusCode::BAD_REQUEST, "invalid template");
+    };
+    let Some(Value::String(name)) = object.remove("name") else {
+        return error(StatusCode::BAD_REQUEST, "invalid template name");
+    };
+    if schema_key(&name, "1").is_none() || name == "." || name == ".." {
+        return error(StatusCode::BAD_REQUEST, "invalid template name");
+    }
+    if object.contains_key("id")
+        || object.contains_key("template")
+        || object.contains_key("ifAbsent")
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid template fields");
+    }
+    let mut validation = object.clone();
+    validation.insert("id".into(), Value::String("template-validation".into()));
+    if validation
+        .get("schemaRef")
+        .is_some_and(|value| !value.is_string())
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid schemaRef");
+    }
+    validation.remove("schemaRef");
+    let max_hubs = validation.remove("maxHubs");
+    if !valid_max_hubs(max_hubs.as_ref(), &validation, state.global_max_hubs) {
+        return error(StatusCode::BAD_REQUEST, "invalid maxHubs");
+    }
+    let user_schema = validation.remove("userSchema");
+    let server_schema = validation.remove("serverSchema");
+    let Ok(reg) = serde_json::from_value::<HubRegistration>(Value::Object(validation)) else {
+        return error(StatusCode::BAD_REQUEST, "invalid template");
+    };
+    if let Err(e) = validate_registration(&state, &reg) {
+        return error(StatusCode::BAD_REQUEST, &e);
+    }
+    if reg
+        .ttl_seconds
+        .is_some_and(|s| s == 0 || Duration::from_secs(s) > state.config.max_ttl)
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "ttlSeconds is outside configured bounds",
+        );
+    }
+    for schema in [user_schema, server_schema].into_iter().flatten() {
+        if let Err(e) = compile_schema(&schema) {
+            return error(StatusCode::BAD_REQUEST, &e);
+        }
+    }
+    let value = Value::Object(object);
+    let mut templates = state.templates.write().await;
+    if templates.contains_key(&name) {
+        return error(StatusCode::CONFLICT, "template already exists");
+    }
+    if templates.len() >= state.config.max_hubs {
+        return error(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "template registry is full",
+        );
+    }
+    let public = public_template(&name, &value);
+    templates.insert(name, value);
+    (StatusCode::CREATED, Json(public)).into_response()
+}
+async fn list_templates(State(state): State<Arc<Inner>>) -> Json<Value> {
+    let templates = state.templates.read().await;
+    let mut list: Vec<_> = templates
+        .iter()
+        .map(|(name, value)| public_template(name, value))
+        .collect();
+    list.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Json(serde_json::json!({"templates":list}))
+}
+async fn get_template(State(state): State<Arc<Inner>>, Path(name): Path<String>) -> Response {
+    match state.templates.read().await.get(&name) {
+        Some(value) => Json(public_template(&name, value)).into_response(),
+        None => error(StatusCode::NOT_FOUND, "template not found"),
+    }
+}
+async fn delete_template(State(state): State<Arc<Inner>>, Path(name): Path<String>) -> Response {
+    if state.templates.write().await.remove(&name).is_some() {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        error(StatusCode::NOT_FOUND, "template not found")
+    }
+}
+
 async fn register_hub(
     State(state): State<Arc<Inner>>,
     payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
@@ -619,6 +841,37 @@ async fn register_hub(
     let Some(object) = raw.as_object_mut() else {
         return error(StatusCode::BAD_REQUEST, "invalid registration");
     };
+    let if_absent = match object.remove("ifAbsent") {
+        None => false,
+        Some(Value::Bool(value)) => value,
+        _ => return error(StatusCode::BAD_REQUEST, "invalid ifAbsent"),
+    };
+    if if_absent {
+        if let Some(id) = object.get("id").and_then(Value::as_str) {
+            let mut hubs = state.hubs.write().await;
+            expire_hubs(&mut hubs);
+            if let Some(existing) = hubs.get(id) {
+                return Json(public_info(existing)).into_response();
+            }
+        }
+    }
+    if let Some(template) = object.remove("template") {
+        let Some(name) = template.as_str() else {
+            return error(StatusCode::BAD_REQUEST, "invalid template");
+        };
+        let templates = state.templates.read().await;
+        let Some(defaults) = templates.get(name).and_then(Value::as_object) else {
+            return error(StatusCode::NOT_FOUND, "template not found");
+        };
+        for (key, value) in defaults {
+            object.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    let max_hubs_value = object.remove("maxHubs");
+    if !valid_max_hubs(max_hubs_value.as_ref(), object, state.global_max_hubs) {
+        return error(StatusCode::BAD_REQUEST, "invalid maxHubs");
+    }
+    let max_hubs = max_hubs_value.and_then(|v| v.as_u64()).map(|v| v as usize);
     let schema_ref = match object.remove("schemaRef") {
         None => None,
         Some(Value::String(s)) => Some(s),
@@ -669,7 +922,7 @@ async fn register_hub(
                 "internal hubs cannot set address or remoteHubId",
             )
         }
-        HubMode::Internal => None,
+        HubMode::Internal | HubMode::Central => None,
         HubMode::External => reg.address.clone(),
     };
     if let Some(address) = address.as_deref() {
@@ -705,6 +958,30 @@ async fn register_hub(
         schema_ref,
         user_schema,
         server_schema,
+        max_hubs,
+    };
+    let child = if reg.mode == HubMode::Central {
+        let mut config = state.config.clone();
+        config.max_hubs = max_hubs.unwrap_or(state.global_max_hubs);
+        let service = match HubService::new(config) {
+            Ok(service) => service,
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "central initialization failed",
+                )
+            }
+        };
+        let mut inner = Arc::try_unwrap(service.inner).ok().unwrap();
+        inner.global_max_hubs = state.global_max_hubs;
+        inner.hub_slots = state.hub_slots.clone();
+        inner.templates = state.templates.clone();
+        inner.inflight_calls = state.inflight_calls.clone();
+        let child = Arc::new(inner);
+        start_reaper(&child);
+        Some(child)
+    } else {
+        None
     };
     let record = HubRecord {
         info,
@@ -717,15 +994,31 @@ async fn register_hub(
             None
         },
         remote_token: reg.remote_token,
+        child,
+        _slot: None,
     };
     let mut hubs = state.hubs.write().await;
     expire_hubs(&mut hubs);
-    if hubs.contains_key(&id) {
+    if let Some(existing) = hubs.get(&id) {
+        if if_absent {
+            return Json(public_info(existing)).into_response();
+        }
         return error(StatusCode::CONFLICT, "hub id already registered");
     }
     if hubs.len() >= state.config.max_hubs {
         return error(StatusCode::INSUFFICIENT_STORAGE, "hub registry is full");
     }
+    let slot = match state.hub_slots.clone().try_acquire_owned() {
+        Ok(slot) => slot,
+        Err(_) => {
+            return error(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "global hub budget is full",
+            )
+        }
+    };
+    let mut record = record;
+    record._slot = Some(Arc::new(slot));
     hubs.insert(id, record.clone());
     (StatusCode::CREATED, Json(public_info(&record))).into_response()
 }
@@ -890,6 +1183,7 @@ async fn import_registry(
                 .map(str::to_owned),
             user_schema: remote.get("userSchema").cloned(),
             server_schema: remote.get("serverSchema").cloned(),
+            max_hubs: None,
         };
         if info
             .schema_ref
@@ -916,6 +1210,8 @@ async fn import_registry(
             expires_at: None,
             handler: None,
             remote_token: Some(request.token.clone()),
+            child: None,
+            _slot: None,
         });
     }
     let (existing_infos, new_ids) = {
@@ -990,9 +1286,21 @@ async fn import_registry(
             "import id was concurrently registered",
         );
     }
+    let mut slots = Vec::new();
+    for _ in &new_ids {
+        match state.hub_slots.clone().try_acquire_owned() {
+            Ok(slot) => slots.push(Arc::new(slot)),
+            Err(_) => {
+                return error(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "global hub budget is full",
+                )
+            }
+        }
+    }
     schemas.extend(imported_schemas);
     let mut imported = existing_infos;
-    for entry in candidates
+    for mut entry in candidates
         .into_iter()
         .filter(|c| new_ids.contains(&c.info.id))
     {
@@ -1002,6 +1310,7 @@ async fn import_registry(
                 "import id was concurrently registered",
             );
         }
+        entry._slot = slots.pop();
         imported.push(entry.info.clone());
         hubs.insert(entry.info.id.clone(), entry);
     }
@@ -1429,7 +1738,7 @@ fn validate_registration(state: &Inner, r: &HubRegistration) -> Result<(), Strin
         validate_scope_schema(&r.scopes, schema)?;
     }
     match r.mode {
-        HubMode::Internal
+        HubMode::Internal | HubMode::Central
             if r.address.is_some() || r.remote_hub_id.is_some() || r.remote_token.is_some() =>
         {
             return Err("internal hubs cannot set address, remoteHubId, or remoteToken".into())
