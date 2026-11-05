@@ -216,3 +216,130 @@ async fn persistent_link_connects_and_recovers_over_tcp() {
     remote_task.abort();
     std::fs::remove_file(path).unwrap();
 }
+
+#[tokio::test]
+async fn remote_central_ticket_preserves_inherited_channel_schema() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    let remote = HubService::new(HubConfig {
+        token: B.into(),
+        public_url: Some("ws://localhost/v1/live".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let (remote_base, remote_task) = serve(remote).await;
+    let local = HubService::new(HubConfig {
+        token: A.into(),
+        allowed_remote_hosts: vec!["127.0.0.1".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let (base, task) = serve(local).await;
+    assert_eq!(
+        post(
+            &base,
+            A,
+            "/v1/schemas",
+            json!({"id":"message","version":"1","schema":{"type":"integer"}})
+        )
+        .await
+        .status(),
+        201
+    );
+    assert_eq!(post(&base, A, "/v1/hubs", json!({"id":"remote","mode":"central","address":remote_base,"remoteToken":B,"channels":{"updates":{"delivery":"reliable","schemaRef":"message@1"}}})).await.status(), 201);
+    assert_eq!(
+        post(
+            &remote_base,
+            B,
+            "/v1/hubs",
+            json!({"id":"game","mode":"internal"})
+        )
+        .await
+        .status(),
+        201
+    );
+    for (method, args) in [
+        ("upsertUser", json!([{"id":"alice"}])),
+        ("upsertUser", json!([{"id":"bob"}])),
+        ("upsertServer", json!([{"id":"room","capacity":2}])),
+        ("join", json!(["alice", "room"])),
+        ("join", json!(["bob", "room"])),
+    ] {
+        assert_eq!(
+            post(
+                &remote_base,
+                B,
+                "/v1/hubs/game/call",
+                json!({"method":method,"args":args})
+            )
+            .await
+            .status(),
+            200
+        );
+    }
+    async fn connect(
+        base: &str,
+        remote: &str,
+        user: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let issued: Value = post(base, A, "/v1/route", json!({"path":["remote"],"op":"ticket","body":{"id":"game","userId":user,"serverId":"room"}})).await.json().await.unwrap();
+        let (mut socket, _) = connect_async(format!(
+            "{}/v1/live",
+            remote.replacen("http://", "ws://", 1)
+        ))
+        .await
+        .unwrap();
+        socket
+            .send(Message::Text(
+                json!({"type":"auth","ticket":issued["ticket"]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let welcome = socket.next().await.unwrap().unwrap();
+        assert!(welcome.to_string().contains("welcome"));
+        socket
+    }
+    let mut alice = connect(&base, &remote_base, "alice").await;
+    let mut bob = connect(&base, &remote_base, "bob").await;
+    assert!(alice
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .to_string()
+        .contains("presence"));
+    alice
+        .send(Message::Text(
+            json!({"v":1,"type":"message","channel":"updates","seq":1,"payload":42})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(2), bob.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .to_string()
+        .contains("42"));
+    alice
+        .send(Message::Text(
+            json!({"v":1,"type":"message","channel":"updates","seq":2,"payload":"invalid"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert!(!matches!(
+        tokio::time::timeout(Duration::from_secs(2), alice.next())
+            .await
+            .unwrap(),
+        Some(Ok(Message::Text(_)))
+    ));
+    task.abort();
+    remote_task.abort();
+}

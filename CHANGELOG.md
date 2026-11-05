@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preserve inherited live channel policies and referenced schemas when issuing tickets through remote centrals.
+
 - Add persistent ticket-authenticated service links with connection status and retry budgets.
 
 - Pair peers atomically in system rooms, validate peer scopes against the user schema, and remove empty system rooms.

@@ -52,6 +52,7 @@ pub(crate) async fn discover_endpoint(
             op: "discover".into(),
             body,
             inherited_schemas: None,
+            inherited_channels: None,
         })),
     )
     .await
@@ -155,6 +156,7 @@ fn search<'a>(
                             op: "call".into(),
                             body: json!({"id":record.info.remote_hub_id,"method":"listUsers","args":[]}),
                             inherited_schemas: None,
+                            inherited_channels: None,
                         };
                         let response = forward_route(
                             &state,
@@ -218,6 +220,7 @@ fn search<'a>(
                         op: "discover".into(),
                         body: json!({"depth":depth-1,"kind":kind,"requirements":requirements}),
                         inherited_schemas: None,
+                        inherited_channels: None,
                     };
                     let response = forward_route(
                         &state,
@@ -293,6 +296,7 @@ pub(crate) async fn pair_endpoint(
             op: "pair".into(),
             body,
             inherited_schemas: None,
+            inherited_channels: None,
         })),
     ))
     .await
@@ -306,6 +310,18 @@ async fn routed(
     body: Value,
     inherited: [Option<Value>; 3],
 ) -> Result<Value, Response> {
+    routed_with_channels(state, headers, path, op, body, inherited, None).await
+}
+
+async fn routed_with_channels(
+    state: Arc<Inner>,
+    headers: HeaderMap,
+    path: Vec<String>,
+    op: &str,
+    body: Value,
+    inherited: [Option<Value>; 3],
+    inherited_channels: Option<crate::live::ChannelPolicy>,
+) -> Result<Value, Response> {
     let response = Box::pin(route_hub(
         State(state.clone()),
         headers,
@@ -314,6 +330,7 @@ async fn routed(
             op: op.into(),
             body,
             inherited_schemas: Some(inherited),
+            inherited_channels,
         })),
     ))
     .await;
@@ -332,6 +349,7 @@ pub(crate) async fn pair(
     headers: HeaderMap,
     body: Value,
     inherited: [Option<Value>; 3],
+    inherited_channels: Option<crate::live::ChannelPolicy>,
 ) -> Response {
     let Some(subject) = body.get("subject").and_then(Value::as_object) else {
         return error(StatusCode::BAD_REQUEST, "invalid subject");
@@ -616,7 +634,7 @@ pub(crate) async fn pair(
             }
         }
     }
-    let ticket = match routed(state, headers, path, "ticket", json!({"id":hub_id,"userId":id,"serverId":room,"role":if kind == "hub" {"service"} else {"peer"}}), inherited).await { Ok(v) => v, Err(e) => return e };
+    let ticket = match routed_with_channels(state, headers, path, "ticket", json!({"id":hub_id,"userId":id,"serverId":room,"role":if kind == "hub" {"service"} else {"peer"}}), inherited, inherited_channels).await { Ok(v) => v, Err(e) => return e };
     let link = match (kind, peer) {
         ("peer", true) => "peer-peer",
         ("hub", false) => "hub-hub",

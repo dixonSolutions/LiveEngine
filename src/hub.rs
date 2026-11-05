@@ -395,7 +395,7 @@ pub struct HubSpec {
 }
 
 /// User-defined relay channel settings.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LiveChannel {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -405,7 +405,7 @@ pub struct LiveChannel {
     pub max_rate: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum LiveDelivery {
     Reliable,
@@ -1542,6 +1542,8 @@ pub(crate) struct RouteRequest {
     pub(crate) body: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) inherited_schemas: Option<[Option<Value>; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) inherited_channels: Option<crate::live::ChannelPolicy>,
 }
 
 pub(crate) async fn route_hub(
@@ -1553,6 +1555,13 @@ pub(crate) async fn route_hub(
         return error(StatusCode::BAD_REQUEST, "invalid route request");
     };
     let mut inherited = request.inherited_schemas.clone().unwrap_or_default();
+    let mut inherited_channels = request.inherited_channels.clone();
+    if inherited_channels
+        .as_ref()
+        .is_some_and(|p| !p.valid(state.config.max_hubs))
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid inherited channels");
+    }
     if inherited
         .iter()
         .flatten()
@@ -1578,6 +1587,12 @@ pub(crate) async fn route_hub(
             return error(StatusCode::NOT_FOUND, "central hub not found");
         }
         inherited = merge_schemas(&state, &record.info, &inherited).await;
+        if let Some(channels) = &record.info.channels {
+            inherited_channels = crate::live::ChannelPolicy::from_channels(&state, channels).await;
+            if inherited_channels.is_none() {
+                return error(StatusCode::BAD_REQUEST, "invalid inherited channels");
+            }
+        }
         if let Some(child) = record.child {
             state = child;
             continue;
@@ -1590,6 +1605,7 @@ pub(crate) async fn route_hub(
             op: request.op,
             body: request.body,
             inherited_schemas: Some(inherited),
+            inherited_channels,
         };
         return forward_route(
             &state,
@@ -1606,7 +1622,9 @@ pub(crate) async fn route_hub(
     }
     match request.op.as_str() {
         "discover" => crate::pairing::discover(state, headers, request.body).await,
-        "pair" => crate::pairing::pair(state, headers, request.body, inherited).await,
+        "pair" => {
+            crate::pairing::pair(state, headers, request.body, inherited, inherited_channels).await
+        }
         "tree" => {
             tree_response(
                 state,
@@ -1649,6 +1667,7 @@ pub(crate) async fn route_hub(
                 id,
                 headers,
                 serde_json::from_value(Value::Object(body)).ok(),
+                inherited_channels,
             )
             .await
         }
@@ -1880,6 +1899,7 @@ fn tree_nodes<'a>(
                         op: "tree".into(),
                         body: serde_json::json!({"depth":depth-1,"maxNodes":*budget}),
                         inherited_schemas: None,
+                        inherited_channels: None,
                     };
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     let response = tokio::time::timeout(

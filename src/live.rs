@@ -24,6 +24,51 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPolicy {
+    channels: HashMap<String, LiveChannel>,
+    schemas: HashMap<String, Value>,
+}
+impl ChannelPolicy {
+    pub(crate) async fn from_channels(
+        state: &Inner,
+        channels: &HashMap<String, LiveChannel>,
+    ) -> Option<Self> {
+        let schemas = state.schemas.read().await;
+        let mut selected = HashMap::new();
+        for channel in channels.values() {
+            if let Some(id) = &channel.schema_ref {
+                selected.insert(id.clone(), schemas.get(id)?.clone());
+            }
+        }
+        Some(Self {
+            channels: channels.clone(),
+            schemas: selected,
+        })
+    }
+    pub(crate) fn valid(&self, max: usize) -> bool {
+        self.channels.len() <= max
+            && self.schemas.len() <= max
+            && self.channels.iter().all(|(name, channel)| {
+                !name.is_empty()
+                    && name.len() <= 128
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                    && channel.max_rate != Some(0)
+                    && channel
+                        .schema_ref
+                        .as_ref()
+                        .is_none_or(|id| self.schemas.contains_key(id))
+            })
+            && self
+                .schemas
+                .values()
+                .all(|schema| compile_schema(schema).is_ok())
+    }
+}
+
 const MAX_USED: usize = 100_000;
 
 pub(crate) fn live_allowed_origins_from_env() -> Vec<String> {
@@ -56,6 +101,8 @@ pub struct TicketClaims {
     pub role: String,
     pub expiry: u64,
     pub jti: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_channels: Option<ChannelPolicy>,
 }
 
 /// A service-local signer and replay guard. Its key must remain private.
@@ -86,6 +133,17 @@ impl TicketSigner {
         role: String,
         ttl: u64,
     ) -> Result<(String, u64), &'static str> {
+        self.issue_with_channels(hub_path, room, user, role, ttl, None)
+    }
+    fn issue_with_channels(
+        &self,
+        hub_path: Vec<String>,
+        room: String,
+        user: String,
+        role: String,
+        ttl: u64,
+        inherited_channels: Option<ChannelPolicy>,
+    ) -> Result<(String, u64), &'static str> {
         if !matches!(role.as_str(), "peer" | "service" | "watch") || ttl == 0 {
             return Err("invalid ticket parameters");
         }
@@ -99,6 +157,7 @@ impl TicketSigner {
             role,
             expiry,
             jti: URL_SAFE_NO_PAD.encode(random),
+            inherited_channels,
         };
         let encoded = URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&claims).map_err(|_| "cannot encode ticket")?);
@@ -106,10 +165,11 @@ impl TicketSigner {
             &hmac::Key::new(hmac::HMAC_SHA256, &self.key),
             encoded.as_bytes(),
         );
-        Ok((
-            format!("{}.{}", encoded, URL_SAFE_NO_PAD.encode(mac.as_ref())),
-            expiry,
-        ))
+        let ticket = format!("{}.{}", encoded, URL_SAFE_NO_PAD.encode(mac.as_ref()));
+        if ticket.len() > 16384 {
+            return Err("ticket exceeds size limit");
+        }
+        Ok((ticket, expiry))
     }
     /// Verify signature, expiry and binding, consuming the ticket on success.
     pub fn verify(
@@ -187,13 +247,14 @@ pub(crate) async fn ticket_hub(
     headers: HeaderMap,
     payload: Result<Json<TicketRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    issue_ticket(state, id, headers, payload.ok().map(|Json(v)| v)).await
+    issue_ticket(state, id, headers, payload.ok().map(|Json(v)| v), None).await
 }
 pub(crate) async fn issue_ticket(
     state: Arc<Inner>,
     id: String,
     headers: HeaderMap,
     request: Option<TicketRequest>,
+    mut inherited_channels: Option<ChannelPolicy>,
 ) -> Response {
     let Some(request) = request else {
         return error(StatusCode::BAD_REQUEST, "invalid ticket request");
@@ -212,6 +273,16 @@ pub(crate) async fn issue_ticket(
     let Some(record) = record else {
         return error(StatusCode::NOT_FOUND, "hub not found");
     };
+    if let Some(channels) = &record.info.channels {
+        if record.handler.is_some() {
+            inherited_channels = None;
+        } else {
+            inherited_channels = ChannelPolicy::from_channels(&state, channels).await;
+            if inherited_channels.is_none() {
+                return error(StatusCode::BAD_REQUEST, "invalid channel policy");
+            }
+        }
+    }
     if let Some(handler) = record.handler {
         let permit = match state.inflight_calls.clone().try_acquire_owned() {
             Ok(p) => p,
@@ -250,12 +321,13 @@ pub(crate) async fn issue_ticket(
         };
         let mut path = state.hub_path.clone();
         path.push(id);
-        match state.ticket_signer.issue(
+        match state.ticket_signer.issue_with_channels(
             path,
             request.server_id,
             request.user_id,
             request.role,
             state.config.ticket_ttl.as_secs(),
+            inherited_channels,
         ) {
             Ok((ticket, expires_at)) => {
                 Json(serde_json::json!({"ticket":ticket,"url":url,"expiresAt":expires_at}))
@@ -281,6 +353,7 @@ pub(crate) async fn issue_ticket(
                 op: "ticket".into(),
                 body,
                 inherited_schemas: None,
+                inherited_channels,
             },
         )
         .await
@@ -476,6 +549,7 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
     if claims.role == "watch" {
         return;
     }
+    let inherited_channels = claims.inherited_channels;
     let key = (claims.hub_path, claims.room);
     let user = claims.user;
     let Some((record, channels)) = resolve(&state, &key.0).await else {
@@ -484,6 +558,8 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
     if !paired(&record, &user, &key.1).await {
         return;
     }
+    let local_channels = channels.is_some();
+    let channels = channels.or_else(|| inherited_channels.as_ref().map(|p| p.channels.clone()));
     let mut validators = HashMap::new();
     if let Some(channels) = &channels {
         let schemas = state.schemas.read().await;
@@ -491,7 +567,11 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
         cache.retain(|id, _| schemas.contains_key(id));
         for (name, channel) in channels {
             if let Some(id) = &channel.schema_ref {
-                let Some(schema) = schemas.get(id) else {
+                let Some(schema) = (if local_channels {
+                    schemas.get(id)
+                } else {
+                    inherited_channels.as_ref().and_then(|p| p.schemas.get(id))
+                }) else {
                     return;
                 };
                 if !cache.get(id).is_some_and(|(saved, _)| saved == schema) {
