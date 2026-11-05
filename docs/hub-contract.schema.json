@@ -551,6 +551,78 @@
           "minimum": 1
         }
       }
+    },
+    "LinkDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "address",
+        "remoteToken",
+        "hubId",
+        "userId",
+        "serverId"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+        },
+        "address": {
+          "type": "string",
+          "format": "uri"
+        },
+        "remoteToken": {
+          "type": "string",
+          "minLength": 24,
+          "writeOnly": true
+        },
+        "hubId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "serverId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "LinkInfo": {
+      "type": "object",
+      "required": [
+        "id",
+        "hubId",
+        "userId",
+        "serverId",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "hubId": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string"
+        },
+        "serverId": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "connecting",
+            "connected",
+            "unreachable"
+          ]
+        }
+      }
     }
   }
 }

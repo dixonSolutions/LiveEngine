@@ -507,13 +507,14 @@ pub(crate) struct Inner {
     inherited: [Option<Value>; 3],
     imports: Arc<RwLock<Vec<ImportRegistryRequest>>>,
     persistence_lock: Arc<tokio::sync::Mutex<()>>,
-    mutation_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) mutation_lock: Arc<tokio::sync::Mutex<()>>,
     durable: bool,
     root: bool,
     pub(crate) ticket_signer: Arc<TicketSigner>,
     pub(crate) hub_path: Vec<String>,
     pub(crate) live_rooms: Arc<LiveRooms>,
     pub(crate) registry_upstreams: Arc<crate::live_registry::Upstreams>,
+    pub(crate) links: Arc<crate::links::Links>,
 }
 
 /// Cloneable state for a hosted hub registry.
@@ -574,6 +575,7 @@ impl HubService {
                 hub_path: Vec::new(),
                 live_rooms: Arc::new(LiveRooms::default()),
                 registry_upstreams: Default::default(),
+                links: Default::default(),
             }),
         };
         if let Some(snapshot) = snapshot {
@@ -648,6 +650,7 @@ impl HubService {
     /// at `/health` and `/v1/{ping,contract,schemas,templates,route,tree,hubs,registries,registry}`.
     pub fn router(&self) -> Router {
         start_reaper(&self.inner);
+        crate::links::start(&self.inner);
         Router::new()
             .route("/health", get(health))
             .route("/v1/ping", get(ping))
@@ -667,6 +670,16 @@ impl HubService {
             .route("/v1/route", post(route_hub))
             .route("/v1/discover", post(crate::pairing::discover_endpoint))
             .route("/v1/pair", post(crate::pairing::pair_endpoint))
+            .route(
+                "/v1/links",
+                get(crate::links::list)
+                    .post(crate::links::create)
+                    .delete(crate::links::delete_query),
+            )
+            .route(
+                "/v1/links/{id}",
+                get(crate::links::get_one).delete(crate::links::delete_one),
+            )
             .route("/v1/tree", get(get_tree))
             .route("/v1/hubs", get(list_hubs).post(register_hub))
             .route("/v1/hubs/{id}", get(get_hub).delete(delete_hub))
@@ -803,6 +816,8 @@ struct Snapshot {
     templates: HashMap<String, Value>,
     imports: Vec<ImportRegistryRequest>,
     hubs: Vec<SavedHub>,
+    #[serde(default)]
+    links: Vec<crate::links::LinkDefinition>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -850,6 +865,7 @@ fn restore_snapshot(state: &Arc<Inner>, snapshot: Snapshot) -> Result<(), String
     {
         return Err("state file exceeds registry limits".into());
     }
+    crate::links::restore(state, &snapshot.links)?;
     for schema in snapshot.schemas.values() {
         compile_schema(schema).map_err(|_| "invalid state file schema")?;
     }
@@ -929,6 +945,7 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
             inner.ticket_signer = state.ticket_signer.clone();
             inner.live_rooms = state.live_rooms.clone();
             inner.registry_upstreams = state.registry_upstreams.clone();
+            inner.links = state.links.clone();
             inner.hub_path = state
                 .hub_path
                 .iter()
@@ -1027,6 +1044,7 @@ struct Definitions {
     templates: HashMap<String, Value>,
     imports: Vec<ImportRegistryRequest>,
     children: Vec<(Arc<Inner>, Definitions)>,
+    links: Vec<crate::links::LinkDefinition>,
 }
 
 impl Definitions {
@@ -1046,6 +1064,7 @@ impl Definitions {
                 templates: state.templates.read().await.clone(),
                 imports: state.imports.read().await.clone(),
                 children,
+                links: state.links.definitions().await,
             }
         })
     }
@@ -1062,6 +1081,7 @@ impl Definitions {
             *state.schemas.write().await = definitions.schemas;
             *state.templates.write().await = definitions.templates;
             *state.imports.write().await = definitions.imports;
+            state.links.replace(definitions.links).await;
         })
     }
 }
@@ -1101,6 +1121,7 @@ async fn persist(state: &Inner) -> Result<(), String> {
         templates: state.templates.read().await.clone(),
         imports: state.imports.read().await.clone(),
         hubs: snapshot_hubs(state).await,
+        links: state.links.definitions().await,
     };
     let bytes = serde_json::to_vec(&snapshot).map_err(|_| "cannot encode state file")?;
     let path = path.clone();
@@ -1337,7 +1358,7 @@ async fn ping(State(state): State<Arc<Inner>>) -> Json<Value> {
 
 async fn contract() -> Json<Value> {
     Json(
-        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/hubs/{id}/tickets","/v1/tickets/watch","/v1/live/registry","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}","/v1/templates","/v1/templates/{name}","/v1/route","/v1/tree"],"schema":"/v1/contract/schema"}),
+        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/hubs/{id}/tickets","/v1/tickets/watch","/v1/live/registry","/v1/links","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}","/v1/templates","/v1/templates/{name}","/v1/route","/v1/tree"],"schema":"/v1/contract/schema"}),
     )
 }
 async fn contract_schema() -> Response {
@@ -2274,6 +2295,7 @@ async fn register_hub_inherited(
         inner.ticket_signer = state.ticket_signer.clone();
         inner.live_rooms = state.live_rooms.clone();
         inner.registry_upstreams = state.registry_upstreams.clone();
+        inner.links = state.links.clone();
         inner.hub_path = state
             .hub_path
             .iter()

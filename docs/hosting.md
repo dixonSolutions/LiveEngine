@@ -152,3 +152,19 @@ The response reports the clamped `effectiveDepth`. Nodes at the boundary have
 upstream subscriptions for matching destinations and forwarding traces. Lost
 connections mark their branch unreachable and reconnect with backoff while the
 rest of the tree remains live. Forwarding traces reject loops.
+
+### Service links
+
+An administrator can create a persistent outbound link with `POST /v1/links`:
+`{"id":"link-a","address":"https://remote.example","remoteToken":"...","hubId":"game","userId":"service-user","serverId":"room"}`.
+The service user must already be paired in the remote room. The remote host must
+be on `LIVEENGINE_ALLOWED_REMOTE_HOSTS`. The initiating service requests a new
+service-role ticket over the authenticated HTTP API for each connection, then
+sends only that ticket in the WebSocket authentication frame. Use HTTPS for
+remote connections. `GET /v1/links` and `GET /v1/links/{id}` report
+`connecting`, `connected`, or `unreachable`; `DELETE /v1/links/{id}` or
+`DELETE /v1/links?id=link-a` removes the definition. Reads omit the remote
+address and credential. Definitions and credentials are stored in the private
+state file, while connection status is rebuilt on startup. Links retry with
+bounded exponential backoff and enforce per-link frame and inbound rate limits.
+This link lifecycle does not yet forward room messages between services.
