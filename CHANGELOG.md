@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Roll back registry definition changes when writing the state file fails.
+
 - Add a typed Rust hub specification for registration through the HTTP service path.
 
 - Bound registry list and export responses, publish instance identities atomically, and prune expired bridge rate limits.

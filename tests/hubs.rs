@@ -1147,3 +1147,222 @@ async fn list_and_export_respect_response_size_limit() {
     .await;
     assert_eq!(status, 413);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rollback_failed_definition_writes_and_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    if std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .unwrap()
+        .stdout
+        == b"0\n"
+    {
+        eprintln!("skipping rollback permission test as root");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "liveengine-rollback-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let cfg = HubConfig {
+        state_file: Some(dir.join("state.json")),
+        ..config()
+    };
+    let service = HubService::new(cfg.clone()).unwrap();
+    service.initialize_state().await.unwrap();
+    let app = service.router();
+    let cases = [
+        (
+            "/v1/hubs",
+            "/v1/hubs/rollback-hub",
+            json!({"id":"rollback-hub","mode":"internal"}),
+        ),
+        (
+            "/v1/schemas",
+            "/v1/schemas/rollback@1",
+            json!({"id":"rollback","version":"1","schema":{"type":"object"}}),
+        ),
+        (
+            "/v1/templates",
+            "/v1/templates/rollback",
+            json!({"name":"rollback","mode":"internal"}),
+        ),
+    ];
+    for (collection, item, body) in cases {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert_eq!(
+            request(app.clone(), "POST", collection, Some(body.clone()), true)
+                .await
+                .0,
+            500
+        );
+        assert_eq!(request(app.clone(), "GET", item, None, true).await.0, 404);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            request(app.clone(), "POST", collection, Some(body), true)
+                .await
+                .0,
+            201
+        );
+        let restarted = HubService::new(cfg.clone()).unwrap().router();
+        assert_eq!(request(restarted, "GET", item, None, true).await.0, 200);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert_eq!(
+            request(app.clone(), "DELETE", item, None, true).await.0,
+            500
+        );
+        assert_eq!(request(app.clone(), "GET", item, None, true).await.0, 200);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            request(app.clone(), "DELETE", item, None, true).await.0,
+            204
+        );
+        let restarted = HubService::new(cfg.clone()).unwrap().router();
+        assert_eq!(request(restarted, "GET", item, None, true).await.0, 404);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rollback_nested_route_write() {
+    use std::os::unix::fs::PermissionsExt;
+    if std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .unwrap()
+        .stdout
+        == b"0\n"
+    {
+        eprintln!("skipping rollback permission test as root");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "liveengine-rollback-nested-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let cfg = HubConfig {
+        state_file: Some(dir.join("state.json")),
+        ..config()
+    };
+    let service = HubService::new(cfg.clone()).unwrap();
+    service.initialize_state().await.unwrap();
+    let app = service.router();
+    assert_eq!(
+        request(
+            app.clone(),
+            "POST",
+            "/v1/hubs",
+            Some(json!({"id":"parent","mode":"central"})),
+            true
+        )
+        .await
+        .0,
+        201
+    );
+    let create = json!({"path":["parent"],"op":"register","body":{"id":"child","mode":"internal"}});
+    let get = json!({"path":["parent"],"op":"get","body":{"id":"child"}});
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    assert_eq!(
+        request(app.clone(), "POST", "/v1/route", Some(create.clone()), true)
+            .await
+            .0,
+        500
+    );
+    assert_eq!(
+        request(app.clone(), "POST", "/v1/route", Some(get.clone()), true)
+            .await
+            .0,
+        404
+    );
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        request(app.clone(), "POST", "/v1/route", Some(create), true)
+            .await
+            .0,
+        201
+    );
+    let restarted = HubService::new(cfg).unwrap().router();
+    assert_eq!(
+        request(restarted, "POST", "/v1/route", Some(get), true)
+            .await
+            .0,
+        200
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rollback_failed_public_internal_registration() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .unwrap()
+        .stdout
+        == b"0\n"
+    {
+        eprintln!("skipping rollback permission test as root");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "liveengine-rollback-public-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let cfg = HubConfig {
+        state_file: Some(dir.join("state.json")),
+        ..config()
+    };
+    let service = HubService::new(cfg.clone()).unwrap();
+    service.initialize_state().await.unwrap();
+    let registration = HubRegistration {
+        id: "public-rollback".into(),
+        mode: HubMode::Internal,
+        address: None,
+        remote_token: None,
+        remote_hub_id: None,
+        scopes: json!({}),
+        scope_schema: None,
+        ttl_seconds: None,
+    };
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(service
+        .register_internal(registration.clone(), EchoHandler)
+        .await
+        .is_err());
+    assert_eq!(
+        request(
+            service.router(),
+            "GET",
+            "/v1/hubs/public-rollback",
+            None,
+            true
+        )
+        .await
+        .0,
+        404
+    );
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    service
+        .register_internal(registration, EchoHandler)
+        .await
+        .unwrap();
+    let restarted = HubService::new(cfg).unwrap().router();
+    assert_eq!(
+        request(restarted, "GET", "/v1/hubs/public-rollback", None, true)
+            .await
+            .0,
+        200
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

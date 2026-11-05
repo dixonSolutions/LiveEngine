@@ -422,6 +422,8 @@ struct Inner {
     inherited: [Option<Value>; 3],
     imports: Arc<RwLock<Vec<ImportRegistryRequest>>>,
     persistence_lock: Arc<tokio::sync::Mutex<()>>,
+    mutation_lock: Arc<tokio::sync::Mutex<()>>,
+    durable: bool,
     root: bool,
 }
 
@@ -451,6 +453,7 @@ impl HubService {
             .as_ref()
             .map(|s| s.instance_id.clone())
             .unwrap_or(instance_id);
+        let durable = config.state_file.is_some();
         let service = Self {
             inner: Arc::new(Inner {
                 config,
@@ -471,6 +474,8 @@ impl HubService {
                 inherited: [None, None, None],
                 imports: Arc::new(RwLock::new(Vec::new())),
                 persistence_lock: Arc::new(tokio::sync::Mutex::new(())),
+                mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+                durable,
                 root: true,
             }),
         };
@@ -482,6 +487,11 @@ impl HubService {
 
     /// Create or verify the initial durable snapshot before accepting requests.
     pub async fn initialize_state(&self) -> Result<(), String> {
+        let _guard = if self.inner.durable {
+            Some(self.inner.mutation_lock.lock().await)
+        } else {
+            None
+        };
         persist(&self.inner).await
     }
 
@@ -585,6 +595,16 @@ impl HubService {
         {
             return Err("internal hubs cannot set remote address, id, or token".into());
         }
+        let _guard = if self.inner.durable {
+            Some(self.inner.mutation_lock.lock().await)
+        } else {
+            None
+        };
+        let before = if self.inner.durable {
+            Some(Definitions::capture(&self.inner).await)
+        } else {
+            None
+        };
         let ttl = registration.ttl_seconds.map(Duration::from_secs);
         if ttl.is_some_and(|ttl| ttl.is_zero() || ttl > self.inner.config.max_ttl) {
             return Err("ttlSeconds is outside configured bounds".into());
@@ -619,7 +639,12 @@ impl HubService {
                 existing.handler = record.handler;
                 let restored = existing.info.clone();
                 drop(hubs);
-                persist(&self.inner).await?;
+                if let Err(err) = persist(&self.inner).await {
+                    if let Some(before) = before {
+                        Definitions::restore(&self.inner, before).await;
+                    }
+                    return Err(err);
+                }
                 return Ok(restored);
             }
             return Err("hub id already registered".into());
@@ -636,7 +661,12 @@ impl HubService {
         ));
         hubs.insert(registration.id, record);
         drop(hubs);
-        persist(&self.inner).await?;
+        if let Err(err) = persist(&self.inner).await {
+            if let Some(before) = before {
+                Definitions::restore(&self.inner, before).await;
+            }
+            return Err(err);
+        }
         Ok(info)
     }
 }
@@ -769,6 +799,8 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
             inner.templates = state.templates.clone();
             inner.imports = state.imports.clone();
             inner.persistence_lock = state.persistence_lock.clone();
+            inner.mutation_lock = state.mutation_lock.clone();
+            inner.durable = state.durable;
             inner.inflight_calls = state.inflight_calls.clone();
             inner.instance_id = state.instance_id.clone();
             let schemas = state
@@ -857,6 +889,73 @@ fn snapshot_hubs(
         saved
     })
 }
+struct Definitions {
+    hubs: HashMap<String, HubRecord>,
+    schemas: HashMap<String, Value>,
+    templates: HashMap<String, Value>,
+    imports: Vec<ImportRegistryRequest>,
+    children: Vec<(Arc<Inner>, Definitions)>,
+}
+
+impl Definitions {
+    fn capture(
+        state: &Inner,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Self> + Send + '_>> {
+        Box::pin(async move {
+            let hubs = state.hubs.read().await.clone();
+            let mut children = Vec::new();
+            for child in hubs.values().filter_map(|record| record.child.clone()) {
+                let definitions = Self::capture(&child).await;
+                children.push((child, definitions));
+            }
+            Self {
+                hubs,
+                schemas: state.schemas.read().await.clone(),
+                templates: state.templates.read().await.clone(),
+                imports: state.imports.read().await.clone(),
+                children,
+            }
+        })
+    }
+
+    fn restore(
+        state: &Inner,
+        definitions: Self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            for (child, definitions) in definitions.children {
+                Self::restore(&child, definitions).await;
+            }
+            *state.hubs.write().await = definitions.hubs;
+            *state.schemas.write().await = definitions.schemas;
+            *state.templates.write().await = definitions.templates;
+            *state.imports.write().await = definitions.imports;
+        })
+    }
+}
+
+fn expire_tree(
+    state: &Inner,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+    Box::pin(async move {
+        let (mut changed, children) = {
+            let mut hubs = state.hubs.write().await;
+            let before = hubs.len();
+            expire_hubs(&mut hubs);
+            (
+                before != hubs.len(),
+                hubs.values()
+                    .filter_map(|record| record.child.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for child in children {
+            changed |= expire_tree(&child).await;
+        }
+        changed
+    })
+}
+
 async fn persist(state: &Inner) -> Result<(), String> {
     let Some(path) = &state.config.state_file else {
         return Ok(());
@@ -908,10 +1007,19 @@ async fn persist_request(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let mutation = request.method() == axum::http::Method::POST
-        || request.method() == axum::http::Method::DELETE;
+    let path = request.uri().path();
+    let mutation = (request.method() == axum::http::Method::POST
+        || request.method() == axum::http::Method::DELETE)
+        && path != "/v1/ping"
+        && !(path.starts_with("/v1/hubs/") && path.ends_with("/call"));
+    if !mutation || state.config.state_file.is_none() {
+        return next.run(request).await;
+    }
+    let _guard = state.mutation_lock.lock().await;
+    let before = Definitions::capture(&state).await;
     let response = next.run(request).await;
-    if mutation && response.status().is_success() && persist(&state).await.is_err() {
+    if response.status().is_success() && persist(&state).await.is_err() {
+        Definitions::restore(&state, before).await;
         return error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "cannot persist state file",
@@ -921,6 +1029,9 @@ async fn persist_request(
 }
 
 fn start_reaper(state: &Arc<Inner>) {
+    if state.durable && !state.root {
+        return;
+    }
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         if !state.reaper_started.swap(true, Ordering::AcqRel) {
             let weak = Arc::downgrade(state);
@@ -929,14 +1040,30 @@ fn start_reaper(state: &Arc<Inner>) {
                 loop {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     let Some(state) = weak.upgrade() else { break };
-                    let expired = {
-                        let mut hubs = state.hubs.write().await;
-                        let before = hubs.len();
-                        expire_hubs(&mut hubs);
-                        before != hubs.len()
-                    };
-                    if expired {
-                        let _ = persist(&state).await;
+                    {
+                        let _guard = if state.durable {
+                            Some(state.mutation_lock.lock().await)
+                        } else {
+                            None
+                        };
+                        let before = if state.durable {
+                            Some(Definitions::capture(&state).await)
+                        } else {
+                            None
+                        };
+                        let expired = if state.durable {
+                            expire_tree(&state).await
+                        } else {
+                            let mut hubs = state.hubs.write().await;
+                            let count = hubs.len();
+                            expire_hubs(&mut hubs);
+                            count != hubs.len()
+                        };
+                        if expired && persist(&state).await.is_err() {
+                            if let Some(before) = before {
+                                Definitions::restore(&state, before).await;
+                            }
+                        }
                     }
                     let imports = if state.root {
                         state.imports.read().await.clone()
@@ -951,14 +1078,30 @@ fn start_reaper(state: &Arc<Inner>) {
                             .get(&key)
                             .is_none_or(|last| last.elapsed() >= interval)
                         {
-                            last_refresh.insert(key, Instant::now());
+                            let _guard = if state.durable {
+                                Some(state.mutation_lock.lock().await)
+                            } else {
+                                None
+                            };
+                            let before = if state.durable {
+                                Some(Definitions::capture(&state).await)
+                            } else {
+                                None
+                            };
+                            if !state.durable {
+                                last_refresh.insert(key.clone(), Instant::now());
+                            }
                             let result = tokio::time::timeout(
                                 state.config.request_timeout,
                                 import_registry(State(state.clone()), Ok(Json(request))),
                             )
                             .await;
                             if result.is_ok_and(|response| response.status().is_success()) {
-                                let _ = persist(&state).await;
+                                if persist(&state).await.is_ok() {
+                                    last_refresh.insert(key, Instant::now());
+                                } else if let Some(before) = before {
+                                    Definitions::restore(&state, before).await;
+                                }
                             }
                         }
                     }
@@ -1907,6 +2050,8 @@ async fn register_hub_inherited(
         inner.root = false;
         inner.imports = state.imports.clone();
         inner.persistence_lock = state.persistence_lock.clone();
+        inner.mutation_lock = state.mutation_lock.clone();
+        inner.durable = state.durable;
         inner.instance_id = state.instance_id.clone();
         inner.inherited = merge_schemas(&state, &info, &[None, None, None]).await;
         let child = Arc::new(inner);
