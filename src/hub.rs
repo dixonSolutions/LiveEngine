@@ -100,6 +100,10 @@ pub struct HubConfig {
     pub public_url: Option<String>,
     /// Allowed browser WebSocket origins.
     pub live_allowed_origins: Vec<String>,
+    /// WebRTC ICE server objects supplied to authenticated peers.
+    pub ice_servers: Vec<Value>,
+    /// Shared coturn REST secret, never sent to peers.
+    pub turn_secret: Option<String>,
     /// Seed for engines created by internal hub registrations.
     pub seed: u64,
 }
@@ -128,6 +132,8 @@ impl Default for HubConfig {
             ticket_ttl: Duration::from_secs(60),
             public_url: None,
             live_allowed_origins: Vec::new(),
+            ice_servers: Vec::new(),
+            turn_secret: None,
             seed: 0,
         }
     }
@@ -152,6 +158,11 @@ impl HubConfig {
             ..Self::default()
         };
         config.live_allowed_origins = live_allowed_origins_from_env();
+        if let Ok(servers) = std::env::var("LIVEENGINE_ICE_SERVERS") {
+            config.ice_servers = serde_json::from_str(&servers)
+                .map_err(|_| "LIVEENGINE_ICE_SERVERS must be a JSON array".to_string())?;
+        }
+        config.turn_secret = std::env::var("LIVEENGINE_TURN_SECRET").ok();
         config.public_url = std::env::var("LIVEENGINE_PUBLIC_URL").ok();
         config.ticket_ttl = ticket_ttl_from_env()?;
         config.max_depth = env_limit("LIVEENGINE_MAX_DEPTH", config.max_depth)?;
@@ -192,6 +203,31 @@ impl HubConfig {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if self.ice_servers.len() > 32
+            || serde_json::to_vec(&self.ice_servers).map_or(true, |v| v.len() > 16384)
+            || self.ice_servers.iter().any(|server| {
+                let Some(object) = server.as_object() else {
+                    return true;
+                };
+                match object.get("urls") {
+                    Some(Value::String(url)) => url.is_empty(),
+                    Some(Value::Array(urls)) => {
+                        urls.is_empty()
+                            || urls.len() > 32
+                            || urls
+                                .iter()
+                                .any(|u| !u.as_str().is_some_and(|s| !s.is_empty()))
+                    }
+                    _ => true,
+                }
+            })
+            || self
+                .turn_secret
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || s.len() > 4096)
+        {
+            return Err("invalid ICE servers or TURN secret".into());
+        }
         if self.token.len() < 24 {
             return Err("LIVEENGINE_TOKEN must be at least 24 bytes".into());
         }

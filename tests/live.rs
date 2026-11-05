@@ -254,11 +254,21 @@ mod sockets {
         setup_channels(ttl, None).await
     }
     async fn setup_channels(ttl: u64, channels: Option<Value>) -> Fixture {
+        setup_config(ttl, channels, vec![], None).await
+    }
+    async fn setup_config(
+        ttl: u64,
+        channels: Option<Value>,
+        ice_servers: Vec<Value>,
+        turn_secret: Option<String>,
+    ) -> Fixture {
         let service = HubService::new(HubConfig {
             token: TOKEN.into(),
             public_url: Some("ws://localhost/v1/live".into()),
             ticket_ttl: Duration::from_secs(ttl),
             live_allowed_origins: vec!["https://allowed.test".into()],
+            ice_servers,
+            turn_secret,
             ..HubConfig::default()
         })
         .unwrap();
@@ -402,6 +412,102 @@ mod sockets {
             .is_err());
         b.close(None).await.unwrap();
         assert_eq!(read(&mut a).await["event"], "leave");
+    }
+    #[tokio::test]
+    async fn signalling_is_targeted_and_rejects_cross_room_and_oversize() {
+        let f = setup_channels(60, Some(json!({"data":{"delivery":"reliable"}}))).await;
+        let mut a = auth(&f, &ticket(&f, "alice").await).await;
+        read(&mut a).await;
+        let mut b = auth(&f, &ticket(&f, "bob").await).await;
+        read(&mut b).await;
+        read(&mut a).await;
+        let mut c = auth(&f, &ticket(&f, "carol").await).await;
+        read(&mut c).await;
+        read(&mut a).await;
+        read(&mut b).await;
+        for kind in ["signal.offer", "signal.answer", "signal.ice"] {
+            let frame = json!({"v":1,"type":kind,"channel":"signalling","to":"bob","seq":1,"payload":{"opaque":"sdp"}});
+            a.send(Message::Text(frame.to_string().into()))
+                .await
+                .unwrap();
+            let received = read(&mut b).await;
+            assert_eq!(received["type"], kind);
+            assert_eq!(received["payload"], frame["payload"]);
+            assert_eq!(received["from"], "alice");
+            assert!(tokio::time::timeout(Duration::from_millis(100), c.next())
+                .await
+                .is_err());
+        }
+        for (method, args) in [
+            ("upsertUser", json!([{"id":"dave"}])),
+            ("upsertServer", json!([{"id":"other"}])),
+            ("join", json!(["dave", "other"])),
+        ] {
+            assert_eq!(
+                post(
+                    &f.client,
+                    &f.base,
+                    "/v1/hubs/game/call",
+                    json!({"method":method,"args":args})
+                )
+                .await
+                .0,
+                200
+            );
+        }
+        let (_, issued) = post(
+            &f.client,
+            &f.base,
+            "/v1/hubs/game/tickets",
+            json!({"userId":"dave","serverId":"other"}),
+        )
+        .await;
+        let mut d = auth(&f, issued["ticket"].as_str().unwrap()).await;
+        read(&mut d).await;
+        a.send(Message::Text(json!({"v":1,"type":"signal.offer","channel":"signal","to":"dave","seq":1,"payload":null}).to_string().into())).await.unwrap();
+        closed(&mut a).await;
+        assert!(tokio::time::timeout(Duration::from_millis(100), d.next())
+            .await
+            .is_err());
+        b.send(Message::Text(json!({"v":1,"type":"signal.ice","channel":"signal","to":"carol","seq":1,"payload":"x".repeat(17000)}).to_string().into())).await.unwrap();
+        closed(&mut b).await;
+    }
+
+    #[tokio::test]
+    async fn turn_credentials_have_coturn_format_and_expiry() {
+        use base64::engine::general_purpose::STANDARD;
+        use ring::hmac;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secret = "test-turn-secret-at-least-24-characters";
+        let servers = vec![
+            json!({"urls":"stun:stun.example.test"}),
+            json!({"urls":["turn:turn.example.test", "turns:turn.example.test"]}),
+        ];
+        let f = setup_config(60, None, servers, Some(secret.into())).await;
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut a = auth(&f, &ticket(&f, "alice").await).await;
+        let welcome = read(&mut a).await;
+        assert!(!welcome.to_string().contains(secret));
+        assert_eq!(welcome["iceServers"][0]["urls"], "stun:stun.example.test");
+        let turn = &welcome["iceServers"][1];
+        let username = turn["username"].as_str().unwrap();
+        let expiry: u64 = username.split(':').next().unwrap().parse().unwrap();
+        assert!(expiry >= before + 3600 && expiry <= before + 3602);
+        assert!(username.contains(":alice:"));
+        let signature = STANDARD
+            .decode(turn["credential"].as_str().unwrap())
+            .unwrap();
+        hmac::verify(
+            &hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, secret.as_bytes()),
+            username.as_bytes(),
+            &signature,
+        )
+        .unwrap();
+        let mut b = auth(&f, &ticket(&f, "bob").await).await;
+        assert_ne!(read(&mut b).await["iceServers"][1]["username"], username);
     }
     #[tokio::test]
     async fn spoof_from_is_rejected() {

@@ -9,7 +9,10 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use rand::{rngs::OsRng, RngCore};
 use ring::hmac;
 use serde::{Deserialize, Serialize};
@@ -375,6 +378,32 @@ fn limit(name: &str, default: usize) -> usize {
         .min(16_777_216)
 }
 
+fn ice_servers(config: &crate::hub::HubConfig, user: &str) -> Option<Vec<Value>> {
+    let mut servers = config.ice_servers.clone();
+    if let Some(secret) = &config.turn_secret {
+        // A random suffix avoids collisions when the same identity connects to multiple rooms.
+        let expiry = now().ok()?.checked_add(3600)?;
+        let username = format!("{}:{}:{}", expiry, user, rand::random::<u64>());
+        let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, secret.as_bytes());
+        let credential = STANDARD.encode(hmac::sign(&key, username.as_bytes()).as_ref());
+        for server in &mut servers {
+            let object = server.as_object_mut()?;
+            let is_turn = |url: &str| url.starts_with("turn:") || url.starts_with("turns:");
+            let has_turn = match object.get("urls")? {
+                Value::String(url) => is_turn(url),
+                Value::Array(urls) => urls.iter().any(|url| url.as_str().is_some_and(is_turn)),
+                _ => false,
+            };
+            if has_turn {
+                object.insert("username".into(), Value::String(username.clone()));
+                object.insert("credential".into(), Value::String(credential.clone()));
+                object.remove("credentialType");
+            }
+        }
+    }
+    Some(servers)
+}
+
 async fn resolve(
     state: &Arc<Inner>,
     path: &[String],
@@ -492,7 +521,11 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
                 .filter(|(k, u)| k == &key && u != &user)
                 .map(|(_, u)| u.clone()),
         );
-        let welcome = serde_json::json!({"type":"welcome","peers":peers}).to_string();
+        let Some(ice_servers) = ice_servers(&state.config, &user) else {
+            return;
+        };
+        let welcome = serde_json::json!({"type":"welcome","peers":peers,"iceServers":ice_servers})
+            .to_string();
         if tx.try_send(Message::Text(welcome.into())).is_err() {
             return;
         }
@@ -582,6 +615,26 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
             break;
         }
         let channel = object["channel"].as_str().unwrap();
+        let frame_type = object["type"].as_str().unwrap();
+        let signal = matches!(frame_type, "signal.offer" | "signal.answer" | "signal.ice");
+        if frame_type.starts_with("signal.") && !signal {
+            break;
+        }
+        if signal {
+            let Some(target) = object.get("to").and_then(Value::as_str) else {
+                break;
+            };
+            if target == user || text.len() > limit("LIVEENGINE_SIGNAL_MAX_BYTES", 16384) {
+                break;
+            }
+            let rooms = state.live_rooms.rooms.lock().await;
+            let Some(queue) = rooms.get(&key).and_then(|room| room.get(target)) else {
+                break;
+            };
+            object.insert("from".into(), Value::String(user.clone()));
+            queue.send(Message::Text(value.to_string().into()), false);
+            continue;
+        }
         let mut lossy = false;
         if let Some(channels) = &channels {
             let Some(definition) = channels.get(channel) else {

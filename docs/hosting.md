@@ -116,3 +116,19 @@ The live relay bounds per-connection traffic with `LIVEENGINE_LIVE_MAX_FRAME_BYT
 `LIVEENGINE_LIVE_RESUME_MILLIS` (500) control liveness and presence. Values must
 be positive integers. A full queue drops lossy messages; reliable delivery
 closes the slow consumer. Reconnection requires a new ticket.
+
+For WebRTC negotiation, send `signal.offer`, `signal.answer`, and `signal.ice`
+using the normal envelope with a `to` peer in the same room. These opaque,
+reliable signalling frames bypass application channel schemas, but share the
+connection's message and byte rate limits. An invalid or absent target closes
+the sender. `LIVEENGINE_SIGNAL_MAX_BYTES` limits each complete signalling frame
+(default 16384); the live frame limit also applies. The hub carries signalling,
+not media, and does not terminate WebRTC.
+
+Set `LIVEENGINE_ICE_SERVERS` to a JSON array of browser ICE server objects, for
+example `[{"urls":"stun:stun.example.org"},{"urls":"turn:turn.example.org"}]`.
+The authenticated welcome frame contains this array as `iceServers`. With
+`LIVEENGINE_TURN_SECRET`, TURN entries receive per-connection coturn REST
+credentials: a username beginning with a Unix expiry one hour in the future,
+and a base64 HMAC-SHA1 password. Configure coturn with the same secret and keep
+it private. Browsers behind strict NAT may need a reachable TURN server.
