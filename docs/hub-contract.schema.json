@@ -93,6 +93,12 @@
           "type": "integer",
           "minimum": 1,
           "description": "Maximum immediate children of a local central hub."
+        },
+        "liveDepth": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16,
+          "description": "Maximum live registry depth for a central, bounded by the service maximum."
         }
       },
       "allOf": [
@@ -523,6 +529,26 @@
           "items": {
             "$ref": "#/$defs/TreeBranch"
           }
+        }
+      }
+    },
+    "WatchRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "depth"
+      ],
+      "properties": {
+        "path": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 1
         }
       }
     }

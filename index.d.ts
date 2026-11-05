@@ -171,6 +171,7 @@ export interface HubDefinition {
   channels?: Record<string, LiveChannel>;
   ttlSeconds?: number;
   maxHubs?: number;
+  liveDepth?: number;
 }
 export interface HubSchema { id: string; version: string; schema: Record<string, unknown> | boolean; }
 export type HubTemplate = Omit<HubDefinition, 'id' | 'template' | 'ifAbsent'> & { name: string; mode: HubMode };

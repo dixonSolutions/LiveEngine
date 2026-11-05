@@ -86,7 +86,7 @@ impl TicketSigner {
         role: String,
         ttl: u64,
     ) -> Result<(String, u64), &'static str> {
-        if !matches!(role.as_str(), "peer" | "service") || ttl == 0 {
+        if !matches!(role.as_str(), "peer" | "service" | "watch") || ttl == 0 {
             return Err("invalid ticket parameters");
         }
         let expiry = now()?.checked_add(ttl).ok_or("invalid ticket lifetime")?;
@@ -118,9 +118,13 @@ impl TicketSigner {
         hub_path: &[String],
         room: &str,
     ) -> Result<TicketClaims, &'static str> {
-        self.verify_inner(ticket, Some((hub_path, room)))
+        let claims = self.verify_inner(ticket, Some((hub_path, room)))?;
+        if claims.role == "watch" {
+            return Err("invalid ticket");
+        }
+        Ok(claims)
     }
-    fn verify_inner(
+    pub(crate) fn verify_inner(
         &self,
         ticket: &str,
         binding: Option<(&[String], &str)>,
@@ -145,7 +149,7 @@ impl TicketSigner {
         let now = now()?;
         if claims.expiry <= now
             || binding.is_some_and(|(path, room)| claims.hub_path != path || claims.room != room)
-            || !matches!(claims.role.as_str(), "peer" | "service")
+            || !matches!(claims.role.as_str(), "peer" | "service" | "watch")
             || claims.jti.is_empty()
         {
             return Err("invalid ticket");
@@ -469,6 +473,9 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
     let Ok(claims) = state.ticket_signer.verify_inner(&auth.ticket, None) else {
         return;
     };
+    if claims.role == "watch" {
+        return;
+    }
     let key = (claims.hub_path, claims.room);
     let user = claims.user;
     let Some((record, channels)) = resolve(&state, &key.0).await else {

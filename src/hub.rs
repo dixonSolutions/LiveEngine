@@ -81,6 +81,7 @@ pub struct HubConfig {
     pub allowed_remote_hosts: Vec<String>,
     pub max_hubs: usize,
     pub max_depth: usize,
+    pub live_tree_depth: usize,
     pub instance_id: Option<String>,
     /// Optional durable registry snapshot path.
     pub state_file: Option<std::path::PathBuf>,
@@ -115,6 +116,7 @@ impl Default for HubConfig {
             allowed_remote_hosts: Vec::new(),
             max_hubs: 256,
             max_depth: 8,
+            live_tree_depth: 3,
             instance_id: None,
             state_file: None,
             max_request_bytes: 1024 * 1024,
@@ -166,6 +168,11 @@ impl HubConfig {
         config.public_url = std::env::var("LIVEENGINE_PUBLIC_URL").ok();
         config.ticket_ttl = ticket_ttl_from_env()?;
         config.max_depth = env_limit("LIVEENGINE_MAX_DEPTH", config.max_depth)?;
+        config.live_tree_depth = env_limit(
+            crate::live_registry::LIVE_TREE_DEPTH_ENV,
+            config.live_tree_depth,
+        )?
+        .min(config.max_depth);
         config.state_file = std::env::var_os("LIVEENGINE_STATE_FILE").map(Into::into);
         config.instance_id = if config.state_file.is_some() {
             std::env::var("LIVEENGINE_INSTANCE_ID").ok()
@@ -241,7 +248,8 @@ impl HubConfig {
         {
             return Err("invalid LIVEENGINE_INSTANCE_ID".into());
         }
-        if self.max_hubs == 0
+        if self.live_tree_depth == 0
+            || self.max_hubs == 0
             || self.max_request_bytes == 0
             || self.max_response_bytes == 0
             || self.max_args == 0
@@ -380,6 +388,8 @@ pub struct HubSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_hubs: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
     pub if_absent: bool,
 }
@@ -433,6 +443,8 @@ pub struct HubInfo {
     pub channels: Option<HashMap<String, LiveChannel>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_hubs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_depth: Option<usize>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stale: bool,
 }
@@ -646,6 +658,10 @@ impl HubService {
                 "/v1/templates/{name}",
                 get(get_template).delete(delete_template),
             )
+            .route(
+                "/v1/tickets/watch",
+                post(crate::live_registry::watch_ticket),
+            )
             .route("/v1/route", post(route_hub))
             .route("/v1/tree", get(get_tree))
             .route("/v1/hubs", get(list_hubs).post(register_hub))
@@ -666,6 +682,10 @@ impl HubService {
                 secure_request,
             ))
             .route("/v1/live", get(live_socket))
+            .route(
+                "/v1/live/registry",
+                get(crate::live_registry::registry_socket),
+            )
             .with_state(self.inner.clone())
     }
 
@@ -717,6 +737,7 @@ impl HubService {
             server_schema: None,
             channels: None,
             max_hubs: None,
+            live_depth: None,
             stale: false,
         };
         let mut record = HubRecord {
@@ -1311,7 +1332,7 @@ async fn ping(State(state): State<Arc<Inner>>) -> Json<Value> {
 
 async fn contract() -> Json<Value> {
     Json(
-        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/hubs/{id}/tickets","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}","/v1/templates","/v1/templates/{name}","/v1/route","/v1/tree"],"schema":"/v1/contract/schema"}),
+        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/hubs/{id}/tickets","/v1/tickets/watch","/v1/live/registry","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}","/v1/templates","/v1/templates/{name}","/v1/route","/v1/tree"],"schema":"/v1/contract/schema"}),
     )
 }
 async fn contract_schema() -> Response {
@@ -1587,6 +1608,7 @@ async fn route_hub(
                 delete_hub(State(state), Path(id.to_string())).await
             }
         }
+        "watchTicket" => crate::live_registry::issue_watch(state, request.body).await,
         "ticket" => {
             let Some(id) = request.body.get("id").and_then(Value::as_str) else {
                 return error(StatusCode::BAD_REQUEST, "missing hub id");
@@ -1961,6 +1983,15 @@ async fn create_template(
         return error(StatusCode::BAD_REQUEST, "invalid schemaRef");
     }
     validation.remove("schemaRef");
+    if let Some(depth) = validation.remove("liveDepth") {
+        if !depth
+            .as_u64()
+            .is_some_and(|n| n > 0 && n <= state.config.max_depth as u64)
+            || validation.get("mode").and_then(Value::as_str) != Some("central")
+        {
+            return error(StatusCode::BAD_REQUEST, "invalid liveDepth");
+        }
+    }
     let max_hubs = validation.remove("maxHubs");
     if !valid_max_hubs(max_hubs.as_ref(), &validation, state.global_max_hubs) {
         return error(StatusCode::BAD_REQUEST, "invalid maxHubs");
@@ -2080,6 +2111,17 @@ async fn register_hub_inherited(
             object.entry(key.clone()).or_insert_with(|| value.clone());
         }
     }
+    let live_depth = match object.remove("liveDepth") {
+        None => None,
+        Some(Value::Number(n))
+            if n.as_u64()
+                .is_some_and(|v| v > 0 && v <= state.config.max_depth as u64)
+                && object.get("mode").and_then(Value::as_str) == Some("central") =>
+        {
+            Some(n.as_u64().unwrap() as usize)
+        }
+        _ => return error(StatusCode::BAD_REQUEST, "invalid liveDepth"),
+    };
     let max_hubs_value = object.remove("maxHubs");
     if !valid_max_hubs(max_hubs_value.as_ref(), object, state.global_max_hubs) {
         return error(StatusCode::BAD_REQUEST, "invalid maxHubs");
@@ -2194,6 +2236,7 @@ async fn register_hub_inherited(
         server_schema,
         channels,
         max_hubs,
+        live_depth,
         stale: false,
     };
     let child = if reg.mode == HubMode::Central && info.address.is_none() {
@@ -2452,6 +2495,7 @@ async fn import_registry(
             server_schema: remote.get("serverSchema").cloned(),
             channels: None,
             max_hubs: None,
+            live_depth: None,
             stale: false,
         };
         if info

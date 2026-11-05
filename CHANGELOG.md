@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add scoped live registry subscriptions for local hub trees.
+
 - Add room-scoped WebRTC signalling and ephemeral coturn credentials in live welcomes.
 
 - Enforce live channel schemas, rate and connection budgets, liveness, membership and reconnect presence.

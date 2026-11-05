@@ -132,3 +132,21 @@ The authenticated welcome frame contains this array as `iceServers`. With
 credentials: a username beginning with a Unix expiry one hour in the future,
 and a base64 HMAC-SHA1 password. Configure coturn with the same secret and keep
 it private. Browsers behind strict NAT may need a reachable TURN server.
+
+### Live local registry subscriptions
+
+`GET /v1/live/registry` upgrades to a WebSocket. Send an authentication frame
+`{"type":"auth","token":"<admin bearer>"}` or `{"type":"auth","ticket":"<watch ticket>"}`,
+then `{"path":[],"depth":3}`. The first response is a `snapshot`; subsequent
+`added`, `removed`, `updated`, and `status` frames have increasing `seq` values.
+Send `{"type":"resnapshot"}` after detecting a gap. Frames contain hub IDs,
+modes, status, room and member counts, and `childrenLive`; they omit addresses
+and credentials. `POST /v1/tickets/watch` issues a short-lived, single-use
+read-only ticket for `{path,depth}`; the `watchTicket` route operation issues
+one relative to its central. Tickets must be sent in the first frame, not URLs.
+
+`LIVEENGINE_LIVE_TREE_DEPTH` defaults to 3 and is capped by
+`LIVEENGINE_MAX_DEPTH`. A local central can set `liveDepth` within the maximum.
+The response reports the clamped `effectiveDepth`. Nodes at the boundary have
+`childrenLive:false`; use `/v1/tree` to fetch beyond it. This release streams
+local trees; remote centrals appear as unreachable branches in this stream.

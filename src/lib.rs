@@ -5,6 +5,8 @@ pub mod engine;
 pub mod hub;
 #[cfg(feature = "host")]
 pub mod live;
+#[cfg(feature = "host")]
+pub mod live_registry;
 #[cfg(feature = "node")]
 mod node;
 pub mod rules;
