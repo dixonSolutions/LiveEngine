@@ -39,7 +39,8 @@ const RATE_WINDOW_MS = 60_000;
 const JOIN_LIMIT = 10;
 const serverId = process.env.GOGH_MATCH_SERVER_ID || 'gogh-strike-local';
 const capacity = Number(process.env.GOGH_MATCH_CAPACITY || 12);
-const idleMs = 3 * 60_000;
+const configuredIdleMs = Number(process.env.GOGH_IDLE_MS);
+const idleMs = Number.isFinite(configuredIdleMs) && configuredIdleMs > 0 ? configuredIdleMs : 3 * 60_000;
 const seats = new Map();
 const seatOperations = new Map();
 
@@ -151,7 +152,7 @@ const reaper = setInterval(async () => {
       });
     } catch { /* Retry on the next sweep. */ }
   }
-}, 30_000);
+}, Math.min(30_000, idleMs / 2));
 reaper.unref();
 
 const server = http.createServer(async (req, res) => {

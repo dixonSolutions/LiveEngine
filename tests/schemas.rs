@@ -231,3 +231,101 @@ async fn registry_import_transfers_schemas_and_rejects_conflicts() {
     local_task.abort();
     other_task.abort();
 }
+
+#[tokio::test]
+async fn default_schema_accepts_arbitrary_object_scopes() {
+    let (base, task) = server().await;
+    let c = reqwest::Client::new();
+    assert_eq!(
+        req(
+            &c,
+            &base,
+            reqwest::Method::POST,
+            "/v1/hubs",
+            Some(json!({
+                "id":"default", "mode":"internal", "schemaRef":"liveengine.default@1",
+                "scopes":{"nested":{"values":[1, true, null]}, "text":"anything"}
+            }))
+        )
+        .await
+        .0,
+        201
+    );
+    for (method, scopes) in [
+        ("upsertUser", json!({"anything":[1, {"nested":false}]})),
+        ("upsertServer", json!({"other":null, "number":42})),
+        ("upsertUser", json!({})),
+    ] {
+        assert_eq!(
+            req(
+                &c,
+                &base,
+                reqwest::Method::POST,
+                "/v1/hubs/default/call",
+                Some(json!({
+                    "method":method, "args":[{"id":method,"scopes":scopes}]
+                }))
+            )
+            .await
+            .0,
+            200
+        );
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn inline_scope_schema_enforces_documented_subset() {
+    let (base, task) = server().await;
+    let c = reqwest::Client::new();
+    let schema = json!({"type":"object", "required":["region"], "additionalProperties":false,
+        "properties":{"region":{"type":"string", "enum":["au","nz"]}, "rating":{"type":"number"}, "active":{"type":"boolean"}}});
+    for (id, scopes, expected) in [
+        (
+            "valid",
+            json!({"region":"au", "rating":3, "active":true}),
+            201,
+        ),
+        ("missing", json!({}), 400),
+        ("enum", json!({"region":"other"}), 400),
+        ("type", json!({"region":"au", "rating":"high"}), 400),
+        ("extra", json!({"region":"au", "extra":1}), 400),
+    ] {
+        assert_eq!(
+            req(
+                &c,
+                &base,
+                reqwest::Method::POST,
+                "/v1/hubs",
+                Some(json!({
+                    "id":id, "mode":"internal", "scopes":scopes, "scopeSchema":schema
+                }))
+            )
+            .await
+            .0,
+            expected,
+            "{id}"
+        );
+    }
+    for (scopes, expected) in [
+        (json!({"region":"nz"}), 200),
+        (json!({"region":"other"}), 400),
+        (json!({}), 400),
+    ] {
+        assert_eq!(
+            req(
+                &c,
+                &base,
+                reqwest::Method::POST,
+                "/v1/hubs/valid/call",
+                Some(json!({
+                    "method":"upsertUser", "args":[{"id":"user", "scopes":scopes}]
+                }))
+            )
+            .await
+            .0,
+            expected
+        );
+    }
+    task.abort();
+}

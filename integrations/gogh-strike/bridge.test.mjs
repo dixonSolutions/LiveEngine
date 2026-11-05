@@ -135,17 +135,6 @@ test('bridge serves the game and keeps the service bearer token server-side', as
   assert.equal(repeated.status, 200);
   assert.equal((await repeated.json()).existing, true);
 
-  const statusAttack = await fetch(`${base}/api/liveengine/status`, {headers: {Origin: 'https://attacker.example'}});
-  assert.equal(statusAttack.status, 403);
-  const oversized = await rawPost(bridgePort, {'Content-Type': 'application/json', Origin: base}, JSON.stringify({userId: 'x', padding: 'é'.repeat(9000)}));
-  assert.equal(oversized, 413);
-  const leave = await fetch(`${base}/api/liveengine/leave`, {
-    method: 'POST', headers: {'Content-Type': 'application/json', Origin: base}, body: JSON.stringify({userId: 'player-1'}),
-  });
-  assert.equal(leave.status, 200);
-  assert.equal(users.has('player-1'), false);
-  assert.equal(calls.at(-1).method, 'leave');
-
   const externalPort = await freePort();
   const externalChild = spawn(process.execPath, [bridge], {
     cwd: root,
@@ -174,5 +163,65 @@ test('bridge serves the game and keeps the service bearer token server-side', as
     });
   } finally {
     externalChild.kill('SIGTERM');
+  }
+});
+
+
+test('bridge rejects hostile Origin on status requests', async () => {
+  const base = `http://127.0.0.1:${bridgePort}`;
+  const statusAttack = await fetch(`${base}/api/liveengine/status`, {headers: {Origin: 'https://attacker.example'}});
+  assert.equal(statusAttack.status, 403);
+});
+
+test('bridge enforces the request body byte limit', async () => {
+  const base = `http://127.0.0.1:${bridgePort}`;
+  const oversized = await rawPost(bridgePort, {'Content-Type': 'application/json', Origin: base}, JSON.stringify({userId: 'x', padding: 'é'.repeat(9000)}));
+  assert.equal(oversized, 413);
+});
+
+test('bridge releases a seat on leave', async () => {
+  const base = `http://127.0.0.1:${bridgePort}`;
+  const leave = await fetch(`${base}/api/liveengine/leave`, {
+    method: 'POST', headers: {'Content-Type': 'application/json', Origin: base}, body: JSON.stringify({userId: 'player-1'}),
+  });
+  assert.equal(leave.status, 200);
+  assert.equal(users.has('player-1'), false);
+  assert.equal(calls.at(-1).method, 'leave');
+});
+
+test('bridge reaps idle seats while retaining seats with heartbeats', async () => {
+  const port = await freePort();
+  const base = `http://127.0.0.1:${port}`;
+  const reaperChild = spawn(process.execPath, [bridge], {
+    cwd: root,
+    env: {...process.env, PORT: String(port), HOST: '127.0.0.1', GOGH_STRIKE_ROOT: root,
+      GOGH_IDLE_MS: '600', LIVEENGINE_URL: `http://127.0.0.1:${upstreamPort}`,
+      LIVEENGINE_TOKEN: 'test-administrator-token-long-enough', LIVEENGINE_HUB_ID: 'gogh-reaper'},
+    stdio: 'ignore',
+  });
+  const post = (action, userId) => fetch(`${base}/api/liveengine/${action}`, {
+    method: 'POST', headers: {'Content-Type': 'application/json', Origin: base}, body: JSON.stringify({userId}),
+  });
+  try {
+    let ready = false;
+    for (let i = 0; i < 60; i++) {
+      try { if ((await fetch(`${base}/health`)).ok) { ready = true; break; } } catch {}
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.equal(ready, true);
+    assert.equal((await post('join', 'idle-player')).status, 200);
+    assert.equal((await post('join', 'active-player')).status, 200);
+    let reaped = false;
+    for (let i = 0; i < 7; i++) {
+      await new Promise(resolve => setTimeout(resolve, 200));
+      assert.equal((await post('heartbeat', 'active-player')).status, 200);
+      if (!users.has('idle-player')) { reaped = true; break; }
+    }
+    assert.equal(reaped, true);
+    assert.equal(users.has('active-player'), true);
+    assert.equal(calls.some(call => call.method === 'leave' && call.args[0] === 'idle-player'), true);
+    assert.equal(calls.some(call => call.method === 'leave' && call.args[0] === 'active-player'), false);
+  } finally {
+    reaperChild.kill('SIGTERM');
   }
 });

@@ -161,7 +161,7 @@ export interface HubDefinition {
   remoteHubId?: string;
   remoteToken?: string;
   scopes?: Record<string, unknown>;
-  scopeSchema?: Record<string, unknown>;
+  scopeSchema?: Record<string, unknown> | boolean;
   schemaRef?: string;
   userSchema?: Record<string, unknown> | boolean;
   serverSchema?: Record<string, unknown> | boolean;
