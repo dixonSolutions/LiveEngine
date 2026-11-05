@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Speed up first-match searches that use an indexed equality requirement.
+
+- Extend live registry trees across remote centrals with shared upstream subscriptions, reconnects, and loop protection.
+
 - Add scoped live registry subscriptions for local hub trees.
 
 - Add room-scoped WebRTC signalling and ephemeral coturn credentials in live welcomes.

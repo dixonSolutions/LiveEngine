@@ -311,6 +311,34 @@ impl Engine {
                         .find(|r| r.get("op").and_then(Value::as_str) == Some("eq"))
                 })
             };
+            // The equality index is already ordered by server arrival. Avoid cloning
+            // and sorting it for every user when only the first match is needed.
+            if *strategy == "first" && *limit == 1 {
+                if let Some(r) = eq_rule {
+                    let key = Self::scope_key(r["key"].as_str().unwrap_or(""), &r["value"]);
+                    if let Some(ids) = self.server_eq.get(&key) {
+                        for (_, sid) in ids {
+                            let Some(s) = self.servers.get(sid) else {
+                                continue;
+                            };
+                            if !self.available(s) {
+                                continue;
+                            }
+                            self.evaluated += 1;
+                            if rules::evaluate(&s.req, &u.scopes)
+                                && rules::evaluate(&u.req, &s.scopes)
+                            {
+                                return vec![Match {
+                                    id: sid.clone(),
+                                    score: s.seq as f64,
+                                    load: s.members.len(),
+                                }];
+                            }
+                        }
+                    }
+                    return out;
+                }
+            }
             let mut ids: Vec<_> = if let Some(r) = eq_rule {
                 let key = Self::scope_key(r["key"].as_str().unwrap_or(""), &r["value"]);
                 self.server_eq.get(&key).cloned().unwrap_or_default()

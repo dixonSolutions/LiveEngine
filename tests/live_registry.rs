@@ -2,6 +2,10 @@
 use futures_util::{SinkExt, StreamExt};
 use liveengine::hub::{HubConfig, HubService};
 use serde_json::{json, Value};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 const TOKEN: &str = "registry-admin-token-at-least-24-characters";
@@ -36,6 +40,83 @@ async fn setup() -> Fixture {
         client: reqwest::Client::new(),
         task,
     }
+}
+
+async fn remote_service(addr: Option<std::net::SocketAddr>, count: Arc<AtomicUsize>) -> Fixture {
+    let service = HubService::new(HubConfig {
+        token: TOKEN.into(),
+        live_tree_depth: 8,
+        allowed_remote_hosts: vec!["127.0.0.1".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let listener =
+        tokio::net::TcpListener::bind(addr.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()))
+            .await
+            .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = service.router().layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let count = count.clone();
+            async move {
+                if req.uri().path() == "/v1/live/registry" {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+                next.run(req).await
+            }
+        },
+    ));
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    Fixture {
+        base: format!("http://{addr}"),
+        ws: format!("ws://{addr}/v1/live/registry"),
+        client: reqwest::Client::new(),
+        task,
+    }
+}
+
+async fn wait_for(ws: &mut Socket, predicate: impl Fn(&Value) -> bool) -> Value {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = read(ws).await;
+            if predicate(&frame) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+async fn proxy(
+    addr: Option<std::net::SocketAddr>,
+    target: std::net::SocketAddr,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener =
+        tokio::net::TcpListener::bind(addr.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()))
+            .await
+            .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let Ok((mut incoming, _)) = accepted else { break };
+                    connections.spawn(async move {
+                        if let Ok(mut outgoing) = tokio::net::TcpStream::connect(target).await {
+                            let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+                        }
+                    });
+                }
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            }
+        }
+    });
+    (addr, task)
 }
 async fn post(f: &Fixture, route: &str, body: Value) -> Value {
     let response = f
@@ -173,4 +254,126 @@ async fn local_tree_snapshots_diffs_depth_scope_and_resnapshot() {
     let removed = read(&mut deep).await;
     assert_eq!(removed["type"], "removed");
     assert_eq!(removed["seq"], 3);
+}
+
+#[tokio::test]
+async fn remote_tree_updates_recovers_and_shares_upstream() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let leaf = remote_service(None, count.clone()).await;
+    let target = leaf.base.trim_start_matches("http://").parse().unwrap();
+    let (addr, proxy_task) = proxy(None, target).await;
+    let middle = remote_service(None, Arc::new(AtomicUsize::new(0))).await;
+    let root = remote_service(None, Arc::new(AtomicUsize::new(0))).await;
+    post(&middle, "/v1/hubs", json!({"id":"leaf","mode":"central","address":format!("http://{addr}"),"remoteToken":TOKEN})).await;
+    post(
+        &root,
+        "/v1/hubs",
+        json!({"id":"middle","mode":"central","address":middle.base,"remoteToken":TOKEN}),
+    )
+    .await;
+    let mut a = connect(&root, json!({"type":"auth","token":TOKEN}), json!([]), 4).await;
+    let mut b = connect(&root, json!({"type":"auth","token":TOKEN}), json!([]), 4).await;
+    read(&mut a).await;
+    read(&mut b).await;
+    wait_for(&mut a, |v| {
+        v["path"] == json!(["middle", "leaf"]) && v["hub"]["status"] == "ok"
+    })
+    .await;
+    post(&leaf, "/v1/hubs", json!({"id":"game","mode":"internal"})).await;
+    let added = wait_for(&mut a, |v| {
+        v["path"] == json!(["middle", "leaf", "game"]) && v["type"] == "added"
+    })
+    .await;
+    assert!(!added.to_string().contains(TOKEN));
+    wait_for(&mut b, |v| {
+        v["path"] == json!(["middle", "leaf", "game"]) && v["type"] == "added"
+    })
+    .await;
+    let ticket = post(
+        &root,
+        "/v1/tickets/watch",
+        json!({"path":["middle","leaf"],"depth":1}),
+    )
+    .await["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut scoped = connect(
+        &root,
+        json!({"type":"auth","ticket":ticket}),
+        json!(["middle", "leaf"]),
+        1,
+    )
+    .await;
+    let first = read(&mut scoped).await;
+    if first["hubs"].as_array().unwrap().is_empty() {
+        wait_for(&mut scoped, |v| {
+            v["path"] == json!(["game"]) && v["type"] == "added"
+        })
+        .await;
+    } else {
+        assert_eq!(first["hubs"][0]["id"], "game");
+    }
+    scoped.close(None).await.unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    proxy_task.abort();
+    let _ = proxy_task.await;
+    wait_for(&mut a, |v| {
+        v["path"] == json!(["middle", "leaf"]) && v["hub"]["status"] == "unreachable"
+    })
+    .await;
+    post(&root, "/v1/hubs", json!({"id":"local","mode":"internal"})).await;
+    wait_for(&mut a, |v| {
+        v["path"] == json!(["local"]) && v["type"] == "added"
+    })
+    .await;
+    let (_, proxy_task) = proxy(Some(addr), target).await;
+    post(&leaf, "/v1/hubs", json!({"id":"back","mode":"internal"})).await;
+    wait_for(&mut a, |v| {
+        v["path"] == json!(["middle", "leaf", "back"]) && v["type"] == "added"
+    })
+    .await;
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    a.close(None).await.unwrap();
+    b.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut c = connect(&root, json!({"type":"auth","token":TOKEN}), json!([]), 4).await;
+    read(&mut c).await;
+    wait_for(&mut c, |v| {
+        v["path"] == json!(["middle", "leaf", "back"]) && v["type"] == "added"
+    })
+    .await;
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+    proxy_task.abort();
+}
+
+#[tokio::test]
+async fn remote_registry_refuses_trace_loops() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let f = remote_service(None, Arc::new(AtomicUsize::new(0))).await;
+    let mut request = f.ws.as_str().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("x-liveengine-trace", "repeated,repeated".parse().unwrap());
+    let error = connect_async(request).await.unwrap_err();
+    assert!(
+        matches!(error, tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 508)
+    );
+    post(
+        &f,
+        "/v1/hubs",
+        json!({"id":"self","mode":"central","address":f.base,"remoteToken":TOKEN}),
+    )
+    .await;
+    let mut ws = connect(&f, json!({"type":"auth","token":TOKEN}), json!([]), 4).await;
+    let snapshot = read(&mut ws).await;
+    assert_eq!(snapshot["hubs"][0]["status"], "unreachable");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    ws.send(Message::Text(
+        json!({"type":"resnapshot"}).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let snapshot = read(&mut ws).await;
+    assert_eq!(snapshot["hubs"][0]["status"], "unreachable");
 }

@@ -133,7 +133,7 @@ credentials: a username beginning with a Unix expiry one hour in the future,
 and a base64 HMAC-SHA1 password. Configure coturn with the same secret and keep
 it private. Browsers behind strict NAT may need a reachable TURN server.
 
-### Live local registry subscriptions
+### Live registry subscriptions
 
 `GET /v1/live/registry` upgrades to a WebSocket. Send an authentication frame
 `{"type":"auth","token":"<admin bearer>"}` or `{"type":"auth","ticket":"<watch ticket>"}`,
@@ -148,5 +148,7 @@ one relative to its central. Tickets must be sent in the first frame, not URLs.
 `LIVEENGINE_LIVE_TREE_DEPTH` defaults to 3 and is capped by
 `LIVEENGINE_MAX_DEPTH`. A local central can set `liveDepth` within the maximum.
 The response reports the clamped `effectiveDepth`. Nodes at the boundary have
-`childrenLive:false`; use `/v1/tree` to fetch beyond it. This release streams
-local trees; remote centrals appear as unreachable branches in this stream.
+`childrenLive:false`; use `/v1/tree` to fetch beyond it. Remote centrals share
+upstream subscriptions for matching destinations and forwarding traces. Lost
+connections mark their branch unreachable and reconnect with backoff while the
+rest of the tree remains live. Forwarding traces reject loops.

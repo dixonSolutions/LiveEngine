@@ -513,6 +513,7 @@ pub(crate) struct Inner {
     pub(crate) ticket_signer: Arc<TicketSigner>,
     pub(crate) hub_path: Vec<String>,
     pub(crate) live_rooms: Arc<LiveRooms>,
+    pub(crate) registry_upstreams: Arc<crate::live_registry::Upstreams>,
 }
 
 /// Cloneable state for a hosted hub registry.
@@ -572,6 +573,7 @@ impl HubService {
                 ticket_signer: Arc::new(TicketSigner::new(signing_key)),
                 hub_path: Vec::new(),
                 live_rooms: Arc::new(LiveRooms::default()),
+                registry_upstreams: Default::default(),
             }),
         };
         if let Some(snapshot) = snapshot {
@@ -924,6 +926,7 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
             inner.instance_id = state.instance_id.clone();
             inner.ticket_signer = state.ticket_signer.clone();
             inner.live_rooms = state.live_rooms.clone();
+            inner.registry_upstreams = state.registry_upstreams.clone();
             inner.hub_path = state
                 .hub_path
                 .iter()
@@ -1648,7 +1651,7 @@ fn valid_trace_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
 }
 
-fn trace(state: &Inner, headers: &HeaderMap) -> Result<(), StatusCode> {
+pub(crate) fn trace(state: &Inner, headers: &HeaderMap) -> Result<(), StatusCode> {
     let Some(value) = headers.get("x-liveengine-trace") else {
         return Ok(());
     };
@@ -1669,7 +1672,7 @@ fn trace(state: &Inner, headers: &HeaderMap) -> Result<(), StatusCode> {
     }
     Ok(())
 }
-fn outgoing_trace(state: &Inner, headers: &HeaderMap) -> String {
+pub(crate) fn outgoing_trace(state: &Inner, headers: &HeaderMap) -> String {
     match headers
         .get("x-liveengine-trace")
         .and_then(|v| v.to_str().ok())
@@ -2266,6 +2269,7 @@ async fn register_hub_inherited(
         inner.instance_id = state.instance_id.clone();
         inner.ticket_signer = state.ticket_signer.clone();
         inner.live_rooms = state.live_rooms.clone();
+        inner.registry_upstreams = state.registry_upstreams.clone();
         inner.hub_path = state
             .hub_path
             .iter()
@@ -2852,7 +2856,7 @@ async fn remote_handshake(
     Ok(())
 }
 
-fn validated_remote_url(state: &Inner, address: &str) -> Result<Url, String> {
+pub(crate) fn validated_remote_url(state: &Inner, address: &str) -> Result<Url, String> {
     if address.len() > 2048 {
         return Err("remote address is too long".into());
     }
@@ -2886,7 +2890,7 @@ fn validated_remote_url(state: &Inner, address: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-fn endpoint(base: &Url, suffix: &str) -> Result<Url, String> {
+pub(crate) fn endpoint(base: &Url, suffix: &str) -> Result<Url, String> {
     let mut url = base.clone();
     let path = format!("{}/{}", base.path().trim_end_matches('/'), suffix);
     url.set_path(&path);
