@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Issue short-lived, signed, single-use live room tickets to paired users.
+
 - Accept and validate channel declarations in hosted hub definitions and protect their referenced schemas from deletion.
 
 - Roll back registry definition changes when writing the state file fails.

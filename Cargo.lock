@@ -672,6 +672,7 @@ name = "liveengine"
 version = "0.2.4"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "futures-util",
  "jsonschema",
  "napi",
@@ -680,6 +681,7 @@ dependencies = [
  "rand 0.8.8",
  "rand_chacha",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "subtle",

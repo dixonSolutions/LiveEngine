@@ -31,6 +31,7 @@ use tokio::sync::{RwLock, Semaphore};
 use url::Url;
 
 use crate::engine::Engine;
+use crate::live::{issue_ticket, ticket_hub, ticket_ttl_from_env, TicketClaims, TicketSigner};
 
 pub const HUB_PROTOCOL: &str = "liveengine.hub/v1";
 
@@ -92,6 +93,8 @@ pub struct HubConfig {
     pub rate_limit_window: Duration,
     pub rate_limit_peers: usize,
     pub max_ttl: Duration,
+    pub ticket_ttl: Duration,
+    pub public_url: Option<String>,
     /// Seed for engines created by internal hub registrations.
     pub seed: u64,
 }
@@ -117,6 +120,8 @@ impl Default for HubConfig {
             rate_limit_window: Duration::from_secs(60),
             rate_limit_peers: 4096,
             max_ttl: Duration::from_secs(24 * 60 * 60),
+            ticket_ttl: Duration::from_secs(60),
+            public_url: None,
             seed: 0,
         }
     }
@@ -140,6 +145,8 @@ impl HubConfig {
             allowed_remote_hosts,
             ..Self::default()
         };
+        config.public_url = std::env::var("LIVEENGINE_PUBLIC_URL").ok();
+        config.ticket_ttl = ticket_ttl_from_env()?;
         config.max_depth = env_limit("LIVEENGINE_MAX_DEPTH", config.max_depth)?;
         config.state_file = std::env::var_os("LIVEENGINE_STATE_FILE").map(Into::into);
         config.instance_id = if config.state_file.is_some() {
@@ -203,6 +210,7 @@ impl HubConfig {
             || self.rate_limit_peers == 0
             || self.rate_limit_window.is_zero()
             || self.request_timeout.is_zero()
+            || self.ticket_ttl.is_zero()
         {
             return Err("hub limits and timeouts must be greater than zero".into());
         }
@@ -406,11 +414,11 @@ struct ImportRegistryRequest {
 }
 
 #[derive(Clone)]
-struct HubRecord {
-    info: HubInfo,
+pub(crate) struct HubRecord {
+    pub(crate) info: HubInfo,
     expires_at: Option<Instant>,
-    handler: Option<Arc<Mutex<Box<dyn HubHandler>>>>,
-    remote_token: Option<String>,
+    pub(crate) handler: Option<Arc<Mutex<Box<dyn HubHandler>>>>,
+    pub(crate) remote_token: Option<String>,
     child: Option<Arc<Inner>>,
     custom: bool,
     _slot: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -428,16 +436,16 @@ enum HandlerCallError {
     Call(String),
 }
 
-struct Inner {
-    config: HubConfig,
-    hubs: RwLock<HashMap<String, HubRecord>>,
+pub(crate) struct Inner {
+    pub(crate) config: HubConfig,
+    pub(crate) hubs: RwLock<HashMap<String, HubRecord>>,
     schemas: Arc<RwLock<HashMap<String, Value>>>,
     templates: Arc<RwLock<HashMap<String, Value>>>,
     reaper_started: AtomicBool,
     client: Client,
     rate: Mutex<HashMap<String, RateEntry>>,
     boot: Instant,
-    inflight_calls: Arc<Semaphore>,
+    pub(crate) inflight_calls: Arc<Semaphore>,
     hub_slots: Arc<Semaphore>,
     global_max_hubs: usize,
     instance_id: String,
@@ -447,6 +455,8 @@ struct Inner {
     mutation_lock: Arc<tokio::sync::Mutex<()>>,
     durable: bool,
     root: bool,
+    pub(crate) ticket_signer: Arc<TicketSigner>,
+    pub(crate) hub_path: Vec<String>,
 }
 
 /// Cloneable state for a hosted hub registry.
@@ -476,6 +486,10 @@ impl HubService {
             .map(|s| s.instance_id.clone())
             .unwrap_or(instance_id);
         let durable = config.state_file.is_some();
+        let signing_key = snapshot
+            .as_ref()
+            .and_then(|s| s.signing_key)
+            .unwrap_or_else(TicketSigner::random_key);
         let service = Self {
             inner: Arc::new(Inner {
                 config,
@@ -499,12 +513,24 @@ impl HubService {
                 mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
                 durable,
                 root: true,
+                ticket_signer: Arc::new(TicketSigner::new(signing_key)),
+                hub_path: Vec::new(),
             }),
         };
         if let Some(snapshot) = snapshot {
             restore_snapshot(&service.inner, snapshot)?;
         }
         Ok(service)
+    }
+
+    /// Verify and consume a ticket for a room on this service.
+    pub fn verify_ticket(
+        &self,
+        ticket: &str,
+        hub_path: &[String],
+        room: &str,
+    ) -> Result<TicketClaims, &'static str> {
+        self.inner.ticket_signer.verify(ticket, hub_path, room)
     }
 
     /// Create or verify the initial durable snapshot before accepting requests.
@@ -580,6 +606,7 @@ impl HubService {
             .route("/v1/hubs", get(list_hubs).post(register_hub))
             .route("/v1/hubs/{id}", get(get_hub).delete(delete_hub))
             .route("/v1/hubs/{id}/call", post(call_hub))
+            .route("/v1/hubs/{id}/tickets", post(ticket_hub))
             .route("/v1/registries/import", post(import_registry))
             .route("/v1/registry/export", get(export_registry))
             .layer(axum::extract::DefaultBodyLimit::max(
@@ -699,6 +726,8 @@ impl HubService {
 struct Snapshot {
     version: u8,
     instance_id: String,
+    #[serde(default)]
+    signing_key: Option<[u8; 32]>,
     schemas: HashMap<String, Value>,
     templates: HashMap<String, Value>,
     imports: Vec<ImportRegistryRequest>,
@@ -826,6 +855,13 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
             inner.durable = state.durable;
             inner.inflight_calls = state.inflight_calls.clone();
             inner.instance_id = state.instance_id.clone();
+            inner.ticket_signer = state.ticket_signer.clone();
+            inner.hub_path = state
+                .hub_path
+                .iter()
+                .cloned()
+                .chain(std::iter::once(info.id.clone()))
+                .collect();
             let schemas = state
                 .schemas
                 .try_read()
@@ -987,6 +1023,7 @@ async fn persist(state: &Inner) -> Result<(), String> {
     let snapshot = Snapshot {
         version: 1,
         instance_id: state.instance_id.clone(),
+        signing_key: Some(state.ticket_signer.key()),
         schemas: state.schemas.read().await.clone(),
         templates: state.templates.read().await.clone(),
         imports: state.imports.read().await.clone(),
@@ -1227,7 +1264,7 @@ async fn ping(State(state): State<Arc<Inner>>) -> Json<Value> {
 
 async fn contract() -> Json<Value> {
     Json(
-        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}","/v1/templates","/v1/templates/{name}","/v1/route","/v1/tree"],"schema":"/v1/contract/schema"}),
+        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/hubs/{id}/tickets","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}","/v1/templates","/v1/templates/{name}","/v1/route","/v1/tree"],"schema":"/v1/contract/schema"}),
     )
 }
 async fn contract_schema() -> Response {
@@ -1404,13 +1441,13 @@ fn valid_max_hubs(value: Option<&Value>, object: &Map<String, Value>, global: us
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct RouteRequest {
-    path: Vec<String>,
-    op: String,
+pub(crate) struct RouteRequest {
+    pub(crate) path: Vec<String>,
+    pub(crate) op: String,
     #[serde(default)]
-    body: Value,
+    pub(crate) body: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    inherited_schemas: Option<[Option<Value>; 3]>,
+    pub(crate) inherited_schemas: Option<[Option<Value>; 3]>,
 }
 
 async fn route_hub(
@@ -1503,6 +1540,21 @@ async fn route_hub(
                 delete_hub(State(state), Path(id.to_string())).await
             }
         }
+        "ticket" => {
+            let Some(id) = request.body.get("id").and_then(Value::as_str) else {
+                return error(StatusCode::BAD_REQUEST, "missing hub id");
+            };
+            let mut body = request.body.as_object().cloned().unwrap_or_default();
+            let id = id.to_string();
+            body.remove("id");
+            issue_ticket(
+                state,
+                id,
+                headers,
+                serde_json::from_value(Value::Object(body)).ok(),
+            )
+            .await
+        }
         "call" => {
             let Some(id) = request.body.get("id").and_then(Value::as_str) else {
                 return error(StatusCode::BAD_REQUEST, "missing hub id");
@@ -1557,7 +1609,7 @@ fn outgoing_trace(state: &Inner, headers: &HeaderMap) -> String {
         None => state.instance_id.clone(),
     }
 }
-fn header_depth(headers: &HeaderMap) -> Option<usize> {
+pub(crate) fn header_depth(headers: &HeaderMap) -> Option<usize> {
     match headers.get("x-liveengine-depth") {
         None => Some(0),
         Some(v) => v.to_str().ok()?.parse::<usize>().ok().filter(|n| *n <= 16),
@@ -1611,7 +1663,7 @@ fn enforce_schemas(schemas: &[Option<Value>; 3], call: &CallRequest) -> Result<(
     }
     Ok(())
 }
-async fn forward_route(
+pub(crate) async fn forward_route(
     state: &Inner,
     address: &str,
     token: &str,
@@ -2122,6 +2174,13 @@ async fn register_hub_inherited(
         inner.mutation_lock = state.mutation_lock.clone();
         inner.durable = state.durable;
         inner.instance_id = state.instance_id.clone();
+        inner.ticket_signer = state.ticket_signer.clone();
+        inner.hub_path = state
+            .hub_path
+            .iter()
+            .cloned()
+            .chain(std::iter::once(info.id.clone()))
+            .collect();
         inner.inherited = merge_schemas(&state, &info, &[None, None, None]).await;
         let child = Arc::new(inner);
         start_reaper(&child);
@@ -3090,7 +3149,7 @@ fn public_info(record: &HubRecord) -> HubInfo {
         .map(|at| at.saturating_duration_since(Instant::now()).as_secs());
     info
 }
-fn expire_hubs(hubs: &mut HashMap<String, HubRecord>) {
+pub(crate) fn expire_hubs(hubs: &mut HashMap<String, HubRecord>) {
     let now = Instant::now();
     hubs.retain(|_, r| r.expires_at.is_none_or(|at| at > now));
 }
@@ -3276,7 +3335,7 @@ fn env_limit(name: &str, default: usize) -> Result<usize, String> {
         Err(_) => Ok(default),
     }
 }
-fn error(status: StatusCode, message: &str) -> Response {
+pub(crate) fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({"error":message}))).into_response()
 }
 
