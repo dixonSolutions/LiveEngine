@@ -665,6 +665,8 @@ impl HubService {
                 post(crate::live_registry::watch_ticket),
             )
             .route("/v1/route", post(route_hub))
+            .route("/v1/discover", post(crate::pairing::discover_endpoint))
+            .route("/v1/pair", post(crate::pairing::pair_endpoint))
             .route("/v1/tree", get(get_tree))
             .route("/v1/hubs", get(list_hubs).post(register_hub))
             .route("/v1/hubs/{id}", get(get_hub).delete(delete_hub))
@@ -1521,7 +1523,7 @@ pub(crate) struct RouteRequest {
     pub(crate) inherited_schemas: Option<[Option<Value>; 3]>,
 }
 
-async fn route_hub(
+pub(crate) async fn route_hub(
     State(mut state): State<Arc<Inner>>,
     mut headers: HeaderMap,
     payload: Result<Json<RouteRequest>, axum::extract::rejection::JsonRejection>,
@@ -1582,6 +1584,8 @@ async fn route_hub(
         headers.insert("x-liveengine-depth", value);
     }
     match request.op.as_str() {
+        "discover" => crate::pairing::discover(state, headers, request.body).await,
+        "pair" => crate::pairing::pair(state, headers, request.body, inherited).await,
         "tree" => {
             tree_response(
                 state,

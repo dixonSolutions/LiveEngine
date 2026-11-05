@@ -9,6 +9,8 @@ pub mod live;
 pub mod live_registry;
 #[cfg(feature = "node")]
 mod node;
+#[cfg(feature = "host")]
+pub mod pairing;
 pub mod rules;
 
 pub use engine::Engine;

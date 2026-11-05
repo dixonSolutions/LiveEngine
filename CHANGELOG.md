@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add authenticated, bounded discovery and engine-backed pairing of hubs and peers through nested registries.
+
 - Speed up first-match searches that use an indexed equality requirement.
 
 - Extend live registry trees across remote centrals with shared upstream subscriptions, reconnects, and loop protection.
