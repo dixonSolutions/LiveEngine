@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add remote and local nested central routing, bounded tree discovery, loop detection, and inherited schemas.
+
 - Add hub templates, idempotent creation, background expiry, and per-central child quotas for hosted hubs.
 
 - Add a versioned schema registry and JSON Schema validation for hub scopes, users and servers, with schema transfer during registry imports.

@@ -400,6 +400,60 @@
         }
       },
       "additionalProperties": false
+    },
+    "RouteRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "op"
+      ],
+      "properties": {
+        "path": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string"
+          }
+        },
+        "op": {
+          "enum": [
+            "get",
+            "list",
+            "register",
+            "delete",
+            "call",
+            "tree"
+          ]
+        },
+        "body": {
+          "type": "object"
+        }
+      }
+    },
+    "TreeBranch": {
+      "type": "object",
+      "required": [
+        "hub",
+        "status"
+      ],
+      "properties": {
+        "hub": {
+          "$ref": "#/$defs/HubInfo"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "error"
+          ]
+        },
+        "hubs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TreeBranch"
+          }
+        }
+      }
     }
   }
 }

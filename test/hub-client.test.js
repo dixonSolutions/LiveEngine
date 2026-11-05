@@ -70,3 +70,16 @@ test('HubClient sends template operations and on-demand registration', async () 
   assert.deepEqual(JSON.parse(requests[4].init.body), { id: 'one', template: 'game', ifAbsent: true });
   assert.deepEqual(JSON.parse(requests[5].init.body), { path: ['central'], op: 'register', body: { id: 'two', template: 'game', ifAbsent: true } });
 });
+
+test('HubClient requests nested routes and tree discovery', async () => {
+  const requests = [];
+  const client = new HubClient('https://hub.example', { token: 'secret', fetch: async (url, init) => {
+    requests.push({ url, init });
+    return Response.json({ hubs: [] });
+  } });
+  await client.tree(3);
+  await client.route(['eu', 'games'], 'tree', { depth: 2 });
+  assert.equal(requests[0].url, 'https://hub.example/v1/tree?depth=3');
+  assert.equal(requests[0].init.headers.authorization, 'Bearer secret');
+  assert.deepEqual(JSON.parse(requests[1].init.body), { path: ['eu', 'games'], op: 'tree', body: { depth: 2 } });
+});

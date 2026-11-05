@@ -15,7 +15,7 @@ use std::{
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -76,6 +76,8 @@ pub struct HubConfig {
     /// Exact remote host names or IP addresses permitted for registration.
     pub allowed_remote_hosts: Vec<String>,
     pub max_hubs: usize,
+    pub max_depth: usize,
+    pub instance_id: Option<String>,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     pub max_args: usize,
@@ -98,6 +100,8 @@ impl Default for HubConfig {
             token: String::new(),
             allowed_remote_hosts: Vec::new(),
             max_hubs: 256,
+            max_depth: 8,
+            instance_id: None,
             max_request_bytes: 1024 * 1024,
             max_response_bytes: 4 * 1024 * 1024,
             max_args: 256,
@@ -133,6 +137,8 @@ impl HubConfig {
             allowed_remote_hosts,
             ..Self::default()
         };
+        config.max_depth = env_limit("LIVEENGINE_MAX_DEPTH", config.max_depth)?;
+        config.instance_id = Some(instance_id_from_env()?);
         config.max_hubs = env_limit("LIVEENGINE_MAX_HUBS", config.max_hubs)?;
         config.max_request_bytes =
             env_limit("LIVEENGINE_MAX_BODY_BYTES", config.max_request_bytes)?;
@@ -167,6 +173,16 @@ impl HubConfig {
         if self.token.len() < 24 {
             return Err("LIVEENGINE_TOKEN must be at least 24 bytes".into());
         }
+        if self.max_depth == 0 || self.max_depth > 16 {
+            return Err("LIVEENGINE_MAX_DEPTH must be between 1 and 16".into());
+        }
+        if self
+            .instance_id
+            .as_ref()
+            .is_some_and(|id| !valid_trace_id(id))
+        {
+            return Err("invalid LIVEENGINE_INSTANCE_ID".into());
+        }
         if self.max_hubs == 0
             || self.max_request_bytes == 0
             || self.max_response_bytes == 0
@@ -183,6 +199,59 @@ impl HubConfig {
             return Err("hub limits and timeouts must be greater than zero".into());
         }
         Ok(())
+    }
+}
+
+fn instance_id_from_env() -> Result<String, String> {
+    if let Ok(id) = std::env::var("LIVEENGINE_INSTANCE_ID") {
+        return Ok(id);
+    }
+    use std::hash::{Hash, Hasher};
+    use std::io::Write;
+    let path = if let Ok(file) = std::env::var("LIVEENGINE_INSTANCE_ID_FILE") {
+        std::path::PathBuf::from(file)
+    } else if let Ok(file) = std::env::var("LIVEENGINE_STATE_FILE") {
+        std::path::PathBuf::from(format!("{file}.instance-id"))
+    } else {
+        let root = std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+            })
+            .ok_or("cannot locate instance id storage; set LIVEENGINE_INSTANCE_ID")?;
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        std::env::var("LIVEENGINE_BIND")
+            .unwrap_or_else(|_| "127.0.0.1:8787".into())
+            .hash(&mut hash);
+        root.join("liveengine")
+            .join(format!("instance-{:016x}", hash.finish()))
+    };
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|_| "cannot create instance id directory")?;
+    }
+    let id = format!("{:032x}", rand::random::<u128>());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            file.write_all(id.as_bytes())
+                .and_then(|_| file.sync_all())
+                .map_err(|_| "cannot persist instance id")?;
+            Ok(id)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read_to_string(&path).map_err(|_| "cannot read instance id")?;
+            if !valid_trace_id(&existing) {
+                return Err("invalid persisted instance id".into());
+            }
+            Ok(existing)
+        }
+        Err(_) => Err("cannot persist instance id".into()),
     }
 }
 
@@ -280,7 +349,7 @@ enum HandlerCallError {
 struct Inner {
     config: HubConfig,
     hubs: RwLock<HashMap<String, HubRecord>>,
-    schemas: RwLock<HashMap<String, Value>>,
+    schemas: Arc<RwLock<HashMap<String, Value>>>,
     templates: Arc<RwLock<HashMap<String, Value>>>,
     reaper_started: AtomicBool,
     client: Client,
@@ -289,6 +358,8 @@ struct Inner {
     inflight_calls: Arc<Semaphore>,
     hub_slots: Arc<Semaphore>,
     global_max_hubs: usize,
+    instance_id: String,
+    inherited: [Option<Value>; 3],
 }
 
 /// Cloneable state for a hosted hub registry.
@@ -308,14 +379,18 @@ impl HubService {
         let inflight_calls = Arc::new(Semaphore::new(config.max_inflight_calls));
         let global_max_hubs = config.max_hubs;
         let hub_slots = Arc::new(Semaphore::new(global_max_hubs));
+        let instance_id = config
+            .instance_id
+            .clone()
+            .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
                 hubs: RwLock::new(HashMap::new()),
-                schemas: RwLock::new(HashMap::from([(
+                schemas: Arc::new(RwLock::new(HashMap::from([(
                     "liveengine.default@1".to_string(),
                     serde_json::json!({"type":"object"}),
-                )])),
+                )]))),
                 templates: Arc::new(RwLock::new(HashMap::new())),
                 reaper_started: AtomicBool::new(false),
                 client,
@@ -324,6 +399,8 @@ impl HubService {
                 inflight_calls,
                 global_max_hubs,
                 hub_slots,
+                instance_id,
+                inherited: [None, None, None],
             }),
         })
     }
@@ -345,6 +422,7 @@ impl HubService {
                 get(get_template).delete(delete_template),
             )
             .route("/v1/route", post(route_hub))
+            .route("/v1/tree", get(get_tree))
             .route("/v1/hubs", get(list_hubs).post(register_hub))
             .route("/v1/hubs/{id}", get(get_hub).delete(delete_hub))
             .route("/v1/hubs/{id}/call", post(call_hub))
@@ -474,6 +552,12 @@ async fn secure_request(
     if !equal {
         return error(StatusCode::UNAUTHORIZED, "unauthorized");
     }
+    if header_depth(request.headers()).is_none() {
+        return error(StatusCode::BAD_REQUEST, "invalid forwarding depth");
+    }
+    if let Err(status) = trace(&state, request.headers()) {
+        return error(status, "invalid or repeated forwarding trace");
+    }
     match tokio::time::timeout(state.config.request_timeout, next.run(request)).await {
         Ok(response) => response,
         Err(_) => error(
@@ -528,7 +612,7 @@ async fn ping(State(state): State<Arc<Inner>>) -> Json<Value> {
 
 async fn contract() -> Json<Value> {
     Json(
-        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}","/v1/templates","/v1/templates/{name}","/v1/route"],"schema":"/v1/contract/schema"}),
+        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}","/v1/templates","/v1/templates/{name}","/v1/route","/v1/tree"],"schema":"/v1/contract/schema"}),
     )
 }
 async fn contract_schema() -> Response {
@@ -608,12 +692,7 @@ async fn delete_schema(State(state): State<Arc<Inner>>, Path(id): Path<String>) 
     if id == "liveengine.default@1" {
         return error(StatusCode::CONFLICT, "built-in schema cannot be deleted");
     }
-    let mut hubs = state.hubs.write().await;
-    expire_hubs(&mut hubs);
-    if hubs
-        .values()
-        .any(|h| h.info.schema_ref.as_deref() == Some(&id))
-    {
+    if schema_used(&state, &id).await {
         return error(StatusCode::CONFLICT, "schema is in use");
     }
     if schemas.remove(&id).is_some() {
@@ -621,6 +700,30 @@ async fn delete_schema(State(state): State<Arc<Inner>>, Path(id): Path<String>) 
     } else {
         error(StatusCode::NOT_FOUND, "schema not found")
     }
+}
+
+fn schema_used<'a>(
+    state: &'a Inner,
+    id: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+    Box::pin(async move {
+        let records: Vec<_> = {
+            let mut hubs = state.hubs.write().await;
+            expire_hubs(&mut hubs);
+            hubs.values().cloned().collect()
+        };
+        for record in records {
+            if record.info.schema_ref.as_deref() == Some(id) {
+                return true;
+            }
+            if let Some(child) = record.child {
+                if schema_used(&child, id).await {
+                    return true;
+                }
+            }
+        }
+        false
+    })
 }
 
 async fn export_registry(State(state): State<Arc<Inner>>) -> Json<Value> {
@@ -664,39 +767,96 @@ fn valid_max_hubs(value: Option<&Value>, object: &Map<String, Value>, global: us
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RouteRequest {
     path: Vec<String>,
     op: String,
     #[serde(default)]
     body: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inherited_schemas: Option<[Option<Value>; 3]>,
 }
 
 async fn route_hub(
     State(mut state): State<Arc<Inner>>,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     payload: Result<Json<RouteRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Ok(Json(request)) = payload else {
         return error(StatusCode::BAD_REQUEST, "invalid route request");
     };
-    if request.path.len() > 8 {
-        return error(StatusCode::BAD_REQUEST, "route depth exceeded");
+    let mut inherited = request.inherited_schemas.clone().unwrap_or_default();
+    if inherited
+        .iter()
+        .flatten()
+        .any(|schema| compile_schema(schema).is_err())
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid inherited schema");
     }
-    for segment in &request.path {
+    let mut depth = header_depth(&headers).unwrap_or(usize::MAX);
+    for (index, segment) in request.path.iter().enumerate() {
+        depth = depth.saturating_add(1);
+        if depth > state.config.max_depth {
+            return error(StatusCode::LOOP_DETECTED, "route depth exceeded");
+        }
         let record = {
             let mut hubs = state.hubs.write().await;
             expire_hubs(&mut hubs);
             hubs.get(segment).cloned()
         };
-        state = match record.and_then(|r| r.child) {
-            Some(child) => child,
-            None => return error(StatusCode::NOT_FOUND, "central hub not found"),
+        let Some(record) = record else {
+            return error(StatusCode::NOT_FOUND, "central hub not found");
         };
+        if record.info.mode != HubMode::Central {
+            return error(StatusCode::NOT_FOUND, "central hub not found");
+        }
+        inherited = merge_schemas(&state, &record.info, &inherited).await;
+        if let Some(child) = record.child {
+            state = child;
+            continue;
+        }
+        let Some(address) = record.info.address.as_deref() else {
+            return error(StatusCode::BAD_GATEWAY, "central address missing");
+        };
+        let forwarded = RouteRequest {
+            path: request.path[index + 1..].to_vec(),
+            op: request.op,
+            body: request.body,
+            inherited_schemas: Some(inherited),
+        };
+        return forward_route(
+            &state,
+            address,
+            record.remote_token.as_deref().unwrap_or(""),
+            &headers,
+            depth,
+            &forwarded,
+        )
+        .await;
+    }
+    if let Ok(value) = depth.to_string().parse() {
+        headers.insert("x-liveengine-depth", value);
     }
     match request.op.as_str() {
-        "register" => register_hub(State(state), Ok(Json(request.body))).await,
+        "tree" => {
+            tree_response(
+                state,
+                headers,
+                request
+                    .body
+                    .get("depth")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1) as usize,
+                request
+                    .body
+                    .get("maxNodes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(u64::MAX) as usize,
+            )
+            .await
+        }
+        "register" => register_hub_inherited(state, Ok(Json(request.body)), inherited).await,
         "list" => list_hubs(State(state)).await.into_response(),
         "get" | "delete" => {
             let Some(id) = request.body.get("id").and_then(Value::as_str) else {
@@ -716,12 +876,288 @@ async fn route_hub(
             let id = id.to_string();
             body.remove("id");
             match serde_json::from_value::<CallRequest>(Value::Object(body)) {
-                Ok(call) => call_hub(State(state), Path(id), headers, Ok(Json(call))).await,
+                Ok(call) => call_hub_inherited(state, id, headers, Ok(Json(call)), inherited).await,
                 Err(_) => error(StatusCode::BAD_REQUEST, "invalid call"),
             }
         }
         _ => error(StatusCode::BAD_REQUEST, "invalid route operation"),
     }
+}
+
+fn valid_trace_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+}
+
+fn trace(state: &Inner, headers: &HeaderMap) -> Result<(), StatusCode> {
+    let Some(value) = headers.get("x-liveengine-trace") else {
+        return Ok(());
+    };
+    let value = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+    if value.len() > 1040 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let ids: Vec<_> = value.split(',').collect();
+    if ids.len() > state.config.max_depth || ids.iter().any(|id| !valid_trace_id(id)) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut seen = std::collections::HashSet::new();
+    if ids
+        .iter()
+        .any(|id| !seen.insert(*id) || *id == state.instance_id)
+    {
+        return Err(StatusCode::LOOP_DETECTED);
+    }
+    Ok(())
+}
+fn outgoing_trace(state: &Inner, headers: &HeaderMap) -> String {
+    match headers
+        .get("x-liveengine-trace")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(value) => format!("{value},{}", state.instance_id),
+        None => state.instance_id.clone(),
+    }
+}
+fn header_depth(headers: &HeaderMap) -> Option<usize> {
+    match headers.get("x-liveengine-depth") {
+        None => Some(0),
+        Some(v) => v.to_str().ok()?.parse::<usize>().ok().filter(|n| *n <= 16),
+    }
+}
+async fn merge_schemas(
+    state: &Inner,
+    info: &HubInfo,
+    inherited: &[Option<Value>; 3],
+) -> [Option<Value>; 3] {
+    let schemas = state.schemas.read().await;
+    let explicit = info
+        .schema_ref
+        .as_ref()
+        .and_then(|id| schemas.get(id))
+        .or(info.scope_schema.as_ref())
+        .cloned();
+    let base = explicit
+        .clone()
+        .or_else(|| state.inherited[0].clone())
+        .or_else(|| inherited[0].clone());
+    let user = info
+        .user_schema
+        .clone()
+        .or_else(|| explicit.clone())
+        .or_else(|| state.inherited[1].clone())
+        .or_else(|| inherited[1].clone())
+        .or_else(|| base.clone());
+    let server = info
+        .server_schema
+        .clone()
+        .or(explicit)
+        .or_else(|| state.inherited[2].clone())
+        .or_else(|| inherited[2].clone())
+        .or_else(|| base.clone());
+    [base, user, server]
+}
+fn enforce_schemas(schemas: &[Option<Value>; 3], call: &CallRequest) -> Result<(), String> {
+    if call.method == "generateUsers" && schemas.iter().any(Option::is_some) {
+        return Err("generateUsers requires an unbound hub".into());
+    }
+    let schema = if call.method.contains("User") {
+        &schemas[1]
+    } else if call.method.contains("Server") {
+        &schemas[2]
+    } else {
+        &schemas[0]
+    };
+    if let Some(schema) = schema {
+        validate_call_scopes(schema, call)?;
+    }
+    Ok(())
+}
+async fn forward_route(
+    state: &Inner,
+    address: &str,
+    token: &str,
+    headers: &HeaderMap,
+    depth: usize,
+    request: &RouteRequest,
+) -> Response {
+    let _permit = match state.inflight_calls.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "hub call capacity is busy"),
+    };
+    let url =
+        match validated_remote_url(state, address).and_then(|base| endpoint(&base, "v1/route")) {
+            Ok(url) => url,
+            Err(_) => return error(StatusCode::BAD_GATEWAY, "invalid remote address"),
+        };
+    let response = match state
+        .client
+        .post(url)
+        .bearer_auth(token)
+        .header("x-liveengine-trace", outgoing_trace(state, headers))
+        .header("x-liveengine-depth", depth.to_string())
+        .json(request)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return error(StatusCode::BAD_GATEWAY, "remote request failed"),
+    };
+    let status = response.status();
+    if status == StatusCode::NO_CONTENT {
+        return status.into_response();
+    }
+    if !status.is_success() {
+        return error(status, "remote route failed");
+    }
+    match read_remote_json(response, state.config.max_response_bytes).await {
+        Ok(value) => (status, Json(value)).into_response(),
+        Err(_) => error(StatusCode::BAD_GATEWAY, "invalid remote response"),
+    }
+}
+#[derive(Deserialize)]
+struct TreeQuery {
+    depth: Option<usize>,
+}
+async fn get_tree(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Query(query): Query<TreeQuery>,
+) -> Response {
+    tree_response(state, headers, query.depth.unwrap_or(1), usize::MAX).await
+}
+async fn tree_response(
+    state: Arc<Inner>,
+    headers: HeaderMap,
+    depth: usize,
+    max_nodes: usize,
+) -> Response {
+    let base = header_depth(&headers).unwrap_or(usize::MAX);
+    if depth > state.config.max_depth || base.saturating_add(depth) > state.config.max_depth {
+        return error(StatusCode::BAD_REQUEST, "tree depth exceeded");
+    }
+    let mut budget = state.global_max_hubs.min(1024).min(max_nodes);
+    let deadline = Instant::now() + state.config.request_timeout / 2;
+    let branches = tree_nodes(state.clone(), headers, depth, base, &mut budget, deadline).await;
+    let value = serde_json::json!({"status":"ok","hubs":branches});
+    if serde_json::to_vec(&value).map_or(true, |v| v.len() > state.config.max_response_bytes) {
+        return error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "tree exceeds configured response size limit",
+        );
+    }
+    Json(value).into_response()
+}
+fn tree_nodes<'a>(
+    state: Arc<Inner>,
+    headers: HeaderMap,
+    depth: usize,
+    base: usize,
+    budget: &'a mut usize,
+    deadline: Instant,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Value>> + Send + 'a>> {
+    Box::pin(async move {
+        if depth == 0 || *budget == 0 {
+            return vec![];
+        }
+        let mut records: Vec<_> = {
+            let mut hubs = state.hubs.write().await;
+            expire_hubs(&mut hubs);
+            hubs.values().cloned().collect()
+        };
+        records.sort_by(|a, b| a.info.id.cmp(&b.info.id));
+        let mut result = Vec::new();
+        let count = records.len();
+        for (index, record) in records.into_iter().enumerate() {
+            if *budget == 0 {
+                break;
+            }
+            *budget -= 1;
+            let mut branch = serde_json::json!({"hub":public_info(&record),"status":"ok"});
+            if record.info.mode == HubMode::Central {
+                if let Some(child) = record.child.filter(|_| depth > 1) {
+                    branch["hubs"] = Value::Array(
+                        tree_nodes(
+                            child,
+                            headers.clone(),
+                            depth - 1,
+                            base + 1,
+                            budget,
+                            deadline,
+                        )
+                        .await,
+                    );
+                } else if let Some(address) = record.info.address.as_deref() {
+                    let req = RouteRequest {
+                        path: vec![],
+                        op: "tree".into(),
+                        body: serde_json::json!({"depth":depth-1,"maxNodes":*budget}),
+                        inherited_schemas: None,
+                    };
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let response = tokio::time::timeout(
+                        remaining / (count - index) as u32,
+                        forward_route(
+                            &state,
+                            address,
+                            record.remote_token.as_deref().unwrap_or(""),
+                            &headers,
+                            base + 1,
+                            &req,
+                        ),
+                    )
+                    .await;
+                    if let Ok(response) = response {
+                        if !response.status().is_success() {
+                            branch["status"] = "error".into();
+                            result.push(branch);
+                            continue;
+                        }
+                        let bytes = axum::body::to_bytes(
+                            response.into_body(),
+                            state.config.max_response_bytes,
+                        )
+                        .await;
+                        if let Ok(value) = bytes
+                            .ok()
+                            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                            .ok_or(())
+                        {
+                            let children = value
+                                .get("hubs")
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+                            branch["hubs"] = Value::Array(truncate_tree(children, budget));
+                        } else {
+                            branch["status"] = "error".into();
+                        }
+                    } else {
+                        branch["status"] = "error".into();
+                    }
+                }
+            }
+            result.push(branch);
+        }
+        result
+    })
+}
+fn truncate_tree(nodes: Vec<Value>, budget: &mut usize) -> Vec<Value> {
+    let mut result = Vec::new();
+    for mut node in nodes {
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        if let Some(children) = node.get_mut("hubs").and_then(Value::as_array_mut) {
+            *children = truncate_tree(std::mem::take(children), budget);
+        }
+        result.push(node);
+    }
+    result
 }
 
 // Templates hold defaults, including write-only remote credentials. Read paths redact them.
@@ -829,6 +1265,14 @@ async fn register_hub(
     State(state): State<Arc<Inner>>,
     payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    register_hub_inherited(state, payload, [None, None, None]).await
+}
+
+async fn register_hub_inherited(
+    state: Arc<Inner>,
+    payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+    inherited: [Option<Value>; 3],
+) -> Response {
     let Json(mut raw) = match payload {
         Ok(v) => v,
         Err(e) => {
@@ -895,7 +1339,11 @@ async fn register_hub(
             Some(s) => Some(s.clone()),
             None => return error(StatusCode::BAD_REQUEST, "schema not found"),
         },
-        None => reg.scope_schema.clone(),
+        None => reg
+            .scope_schema
+            .clone()
+            .or_else(|| state.inherited[0].clone())
+            .or_else(|| inherited[0].clone()),
     };
     if let Some(schema) = &effective {
         if let Err(e) = validate_scope_schema(&reg.scopes, schema) {
@@ -922,12 +1370,24 @@ async fn register_hub(
                 "internal hubs cannot set address or remoteHubId",
             )
         }
-        HubMode::Internal | HubMode::Central => None,
+        HubMode::Internal => None,
+        HubMode::Central => reg.address.clone(),
         HubMode::External => reg.address.clone(),
     };
     if let Some(address) = address.as_deref() {
         let remote_token = reg.remote_token.as_deref().unwrap_or("");
-        if let Err(message) = remote_handshake(&state, address, &remote_id, remote_token).await {
+        if let Err(message) = remote_handshake(
+            &state,
+            address,
+            if reg.mode == HubMode::Central {
+                ""
+            } else {
+                &remote_id
+            },
+            remote_token,
+        )
+        .await
+        {
             return error(StatusCode::BAD_GATEWAY, &message);
         }
     }
@@ -960,7 +1420,7 @@ async fn register_hub(
         server_schema,
         max_hubs,
     };
-    let child = if reg.mode == HubMode::Central {
+    let child = if reg.mode == HubMode::Central && info.address.is_none() {
         let mut config = state.config.clone();
         config.max_hubs = max_hubs.unwrap_or(state.global_max_hubs);
         let service = match HubService::new(config) {
@@ -976,7 +1436,10 @@ async fn register_hub(
         inner.global_max_hubs = state.global_max_hubs;
         inner.hub_slots = state.hub_slots.clone();
         inner.templates = state.templates.clone();
+        inner.schemas = state.schemas.clone();
         inner.inflight_calls = state.inflight_calls.clone();
+        inner.instance_id = state.instance_id.clone();
+        inner.inherited = merge_schemas(&state, &info, &[None, None, None]).await;
         let child = Arc::new(inner);
         start_reaper(&child);
         Some(child)
@@ -1334,6 +1797,16 @@ async fn call_hub(
     headers: HeaderMap,
     payload: Result<Json<CallRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    call_hub_inherited(state, id, headers, payload, [None, None, None]).await
+}
+
+async fn call_hub_inherited(
+    state: Arc<Inner>,
+    id: String,
+    headers: HeaderMap,
+    payload: Result<Json<CallRequest>, axum::extract::rejection::JsonRejection>,
+    inherited: [Option<Value>; 3],
+) -> Response {
     let Json(call) = match payload {
         Ok(v) => v,
         Err(e) => return error(StatusCode::BAD_REQUEST, &format!("invalid call: {e}")),
@@ -1380,51 +1853,17 @@ async fn call_hub(
     let Some(record) = record else {
         return error(StatusCode::NOT_FOUND, "hub not found");
     };
-    let schemas = state.schemas.read().await;
-    let base = record
-        .info
-        .schema_ref
-        .as_ref()
-        .and_then(|id| schemas.get(id))
-        .or(record.info.scope_schema.as_ref());
-    let schema = if call.method.contains("User") {
-        record.info.user_schema.as_ref().or(base)
-    } else if call.method.contains("Server") {
-        record.info.server_schema.as_ref().or(base)
-    } else {
-        base
-    };
-    if call.method == "generateUsers"
-        && (base.is_some()
-            || record.info.user_schema.is_some()
-            || record.info.server_schema.is_some())
-    {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "generateUsers requires an unbound hub",
-        );
-    }
-    if let Some(schema) = schema {
-        if let Err(message) = validate_call_scopes(schema, &call) {
-            return error(StatusCode::BAD_REQUEST, &message);
-        }
+    let schemas = merge_schemas(&state, &record.info, &inherited).await;
+    if let Err(message) = enforce_schemas(&schemas, &call) {
+        return error(StatusCode::BAD_REQUEST, &message);
     }
     let permit = match state.inflight_calls.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "hub call capacity is busy"),
     };
-    let hop = match headers
-        .get("x-liveengine-hop")
-        .and_then(|v| v.to_str().ok())
-    {
-        None => 0,
-        Some(value) => match value.parse::<u8>() {
-            Ok(hop) if hop <= 2 => hop,
-            _ => return error(StatusCode::BAD_REQUEST, "invalid forwarding hop"),
-        },
-    };
-    if record.info.mode == HubMode::External && hop >= 2 {
-        return error(StatusCode::LOOP_DETECTED, "forwarding hop limit reached");
+    let depth = header_depth(&headers).unwrap_or(usize::MAX);
+    if record.handler.is_none() && depth >= state.config.max_depth {
+        return error(StatusCode::LOOP_DETECTED, "forwarding depth exceeded");
     }
     let result = if let Some(handler) = record.handler {
         let config = state.config.clone();
@@ -1472,7 +1911,8 @@ async fn call_hub(
             address,
             &record.info.remote_hub_id,
             record.remote_token.as_deref().unwrap_or(""),
-            hop + 1,
+            &headers,
+            depth + 1,
             &call,
         )
         .await
@@ -1483,6 +1923,9 @@ async fn call_hub(
                 return error(StatusCode::PAYLOAD_TOO_LARGE, &reason);
             }
             Json(serde_json::json!({"result":value})).into_response()
+        }
+        Err(message) if message == "remote: remote returned HTTP 508 Loop Detected" => {
+            error(StatusCode::LOOP_DETECTED, "remote forwarding loop")
         }
         Err(message) if message.starts_with("remote:") => error(
             StatusCode::BAD_GATEWAY,
@@ -1509,6 +1952,9 @@ async fn remote_handshake(
     let contract = remote_get(state, endpoint(&base, "v1/contract")?, token).await?;
     if contract.get("protocol").and_then(Value::as_str) != Some(HUB_PROTOCOL) {
         return Err("remote contract protocol mismatch".into());
+    }
+    if remote_id.is_empty() {
+        return Ok(());
     }
     let _hub = remote_get(
         state,
@@ -1691,7 +2137,8 @@ async fn forward_call(
     address: &str,
     remote_id: &str,
     token: &str,
-    hop: u8,
+    headers: &HeaderMap,
+    depth: usize,
     call: &CallRequest,
 ) -> Result<Value, String> {
     let base = validated_remote_url(state, address).map_err(|e| format!("remote: {e}"))?;
@@ -1701,7 +2148,8 @@ async fn forward_call(
         .client
         .post(url)
         .bearer_auth(token)
-        .header("x-liveengine-hop", hop.to_string())
+        .header("x-liveengine-trace", outgoing_trace(state, headers))
+        .header("x-liveengine-depth", depth.to_string())
         .json(call)
         .send()
         .await
@@ -1738,10 +2186,22 @@ fn validate_registration(state: &Inner, r: &HubRegistration) -> Result<(), Strin
         validate_scope_schema(&r.scopes, schema)?;
     }
     match r.mode {
-        HubMode::Internal | HubMode::Central
+        HubMode::Internal
             if r.address.is_some() || r.remote_hub_id.is_some() || r.remote_token.is_some() =>
         {
             return Err("internal hubs cannot set address, remoteHubId, or remoteToken".into())
+        }
+        HubMode::Central
+            if r.address.is_none() && (r.remote_token.is_some() || r.remote_hub_id.is_some()) =>
+        {
+            return Err("local central cannot set remote credentials or id".into())
+        }
+        HubMode::Central
+            if r.address.is_some()
+                && (r.remote_token.as_ref().is_none_or(|t| t.len() < 24)
+                    || r.remote_hub_id.is_some()) =>
+        {
+            return Err("remote central requires remoteToken and no remoteHubId".into())
         }
         HubMode::External if r.address.is_none() => {
             return Err("external hubs require address".into())

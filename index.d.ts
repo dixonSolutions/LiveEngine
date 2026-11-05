@@ -198,7 +198,8 @@ export declare class HubClient {
   readonly address: string;
   contract(): Promise<{ protocol: typeof HUB_PROTOCOL; [key: string]: unknown }>;
   ping(options?: HubPingOptions): Promise<HubPing>;
-  route(path: string[], op: 'register' | 'list' | 'get' | 'delete' | 'call', body?: Record<string, unknown>): Promise<unknown>;
+  tree(depth?: number): Promise<unknown>;
+  route(path: string[], op: 'register' | 'list' | 'get' | 'delete' | 'call' | 'tree', body?: Record<string, unknown>): Promise<unknown>;
   listTemplates(): Promise<unknown>;
   createTemplate(template: Omit<HubDefinition, 'id' | 'template' | 'ifAbsent'> & { name: string; mode: HubMode }): Promise<unknown>;
   getTemplate(name: string): Promise<unknown>;
