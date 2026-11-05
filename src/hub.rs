@@ -474,6 +474,8 @@ pub(crate) struct HubRecord {
     expires_at: Option<Instant>,
     pub(crate) handler: Option<Arc<Mutex<Box<dyn HubHandler>>>>,
     pub(crate) remote_token: Option<String>,
+    /// SHA-256 hex digests of link credentials; the raw tokens are never stored.
+    pub(crate) link_credentials: Vec<String>,
     pub(crate) child: Option<Arc<Inner>>,
     custom: bool,
     _slot: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -685,6 +687,10 @@ impl HubService {
             .route("/v1/hubs/{id}", get(get_hub).delete(delete_hub))
             .route("/v1/hubs/{id}/call", post(call_hub))
             .route("/v1/hubs/{id}/tickets", post(ticket_hub))
+            .route(
+                "/v1/hubs/{id}/link-credentials",
+                post(crate::links::issue_credential).delete(crate::links::revoke_credentials),
+            )
             .route("/v1/registries/import", post(import_registry))
             .route("/v1/registry/export", get(export_registry))
             .layer(axum::extract::DefaultBodyLimit::max(
@@ -762,6 +768,7 @@ impl HubService {
             expires_at: ttl.map(|d| Instant::now() + d),
             handler: Some(Arc::new(Mutex::new(Box::new(handler)))),
             remote_token: None,
+            link_credentials: Vec::new(),
             child: None,
             custom: true,
             _slot: None,
@@ -824,6 +831,8 @@ struct Snapshot {
 struct SavedHub {
     info: HubInfo,
     remote_token: Option<String>,
+    #[serde(default)]
+    link_credentials: Vec<String>,
     expires_at: Option<u64>,
     children: Vec<SavedHub>,
     #[serde(default)]
@@ -992,6 +1001,7 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
                 .expires_at
                 .map(|t| Instant::now() + Duration::from_secs(t - now)),
             remote_token: saved.remote_token,
+            link_credentials: saved.link_credentials,
             custom: saved.custom,
             child,
             _slot: Some(Arc::new(slot)),
@@ -1030,6 +1040,7 @@ fn snapshot_hubs(
             saved.push(SavedHub {
                 info: record.info,
                 remote_token: record.remote_token,
+                link_credentials: record.link_credentials,
                 expires_at,
                 children,
                 custom: record.custom,
@@ -1295,8 +1306,19 @@ async fn secure_request(
         difference |= supplied.get(index).copied().unwrap_or(0) ^ expected_byte;
     }
     let equal = bool::from(supplied.len().ct_eq(&expected.len())) && difference == 0;
+    let mut request = request;
     if !equal {
-        return error(StatusCode::UNAUTHORIZED, "unauthorized");
+        let Some(auth) = crate::links::credential_auth(
+            &state,
+            request.method(),
+            request.uri().path(),
+            request.headers(),
+        )
+        .await
+        else {
+            return error(StatusCode::UNAUTHORIZED, "unauthorized");
+        };
+        request.extensions_mut().insert(auth);
     }
     if header_depth(request.headers()).is_none() {
         return error(StatusCode::BAD_REQUEST, "invalid forwarding depth");
@@ -1358,7 +1380,7 @@ async fn ping(State(state): State<Arc<Inner>>) -> Json<Value> {
 
 async fn contract() -> Json<Value> {
     Json(
-        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/hubs/{id}/tickets","/v1/tickets/watch","/v1/live/registry","/v1/links","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}","/v1/templates","/v1/templates/{name}","/v1/route","/v1/tree"],"schema":"/v1/contract/schema"}),
+        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/hubs/{id}/tickets","/v1/hubs/{id}/link-credentials","/v1/tickets/watch","/v1/live/registry","/v1/links","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}","/v1/templates","/v1/templates/{name}","/v1/route","/v1/tree"],"schema":"/v1/contract/schema"}),
     )
 }
 async fn contract_schema() -> Response {
@@ -2340,6 +2362,7 @@ async fn register_hub_inherited(
             None
         },
         remote_token: reg.remote_token,
+        link_credentials: Vec::new(),
         custom: false,
         child,
         _slot: None,
@@ -2573,6 +2596,7 @@ async fn import_registry(
             expires_at: None,
             handler: None,
             remote_token: Some(request.token.clone()),
+            link_credentials: Vec::new(),
             child: None,
             custom: false,
             _slot: None,

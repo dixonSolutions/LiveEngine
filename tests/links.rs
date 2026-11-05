@@ -151,7 +151,13 @@ async fn persistent_link_connects_and_recovers_over_tcp() {
         401
     );
     assert_eq!(post(&base, A, "/v1/links", json!({"id":"denied","address":"http://disallowed.example","remoteToken":B,"hubId":"game","userId":"service","serverId":"room"})).await.status(), 400);
-    assert_eq!(post(&base,A,"/v1/links",json!({"id":"link","address":proxy_base,"remoteToken":B,"hubId":"game","userId":"service","serverId":"room"})).await.status(),201);
+    let credential: Value = post(&remote_base, B, "/v1/hubs/game/link-credentials", json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let credential = credential["token"].as_str().unwrap().to_string();
+    assert_eq!(post(&base,A,"/v1/links",json!({"id":"link","address":proxy_base,"remoteToken":credential,"hubId":"game","userId":"service","serverId":"room"})).await.status(),201);
     status(&base, "connected").await;
     assert_eq!(
         post(
@@ -190,7 +196,7 @@ async fn persistent_link_connects_and_recovers_over_tcp() {
         .json()
         .await
         .unwrap();
-    assert!(!list.to_string().contains(B));
+    assert!(!list.to_string().contains(&credential));
     assert_eq!(
         reqwest::Client::new()
             .delete(format!("{base2}/v1/links/link"))
@@ -210,7 +216,7 @@ async fn persistent_link_connects_and_recovers_over_tcp() {
         .lock()
         .unwrap()
         .iter()
-        .all(|frame| !frame.contains(A) && !frame.contains(B)));
+        .all(|frame| !frame.contains(A) && !frame.contains(B) && !frame.contains(&credential)));
     task2.abort();
     proxy_task.abort();
     remote_task.abort();
@@ -342,4 +348,278 @@ async fn remote_central_ticket_preserves_inherited_channel_schema() {
     ));
     task.abort();
     remote_task.abort();
+}
+
+async fn credential_remote(
+    state_file: Option<std::path::PathBuf>,
+) -> (String, tokio::task::JoinHandle<()>, String) {
+    let remote = HubService::new(HubConfig {
+        token: B.into(),
+        public_url: Some("ws://localhost/v1/live".into()),
+        state_file,
+        ..Default::default()
+    })
+    .unwrap();
+    remote.initialize_state().await.unwrap();
+    let (base, task) = serve(remote).await;
+    for id in ["game", "other"] {
+        assert_eq!(
+            post(&base, B, "/v1/hubs", json!({"id":id,"mode":"internal"}))
+                .await
+                .status(),
+            201
+        );
+        for (method, args) in [
+            ("upsertUser", json!([{"id":"service"}])),
+            ("upsertServer", json!([{"id":"room","capacity":2}])),
+            ("join", json!(["service", "room"])),
+        ] {
+            assert_eq!(
+                post(
+                    &base,
+                    B,
+                    &format!("/v1/hubs/{id}/call"),
+                    json!({"method":method,"args":args})
+                )
+                .await
+                .status(),
+                200
+            );
+        }
+    }
+    let created = post(&base, B, "/v1/hubs/game/link-credentials", json!({})).await;
+    assert_eq!(created.status(), 201);
+    let token = created.json::<Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (base, task, token)
+}
+fn service_ticket() -> Value {
+    json!({"userId":"service","serverId":"room","role":"service"})
+}
+
+#[tokio::test]
+async fn link_credential_gets_a_service_ticket_only() {
+    let (base, task, token) = credential_remote(None).await;
+    let response = post(&base, &token, "/v1/hubs/game/tickets", service_ticket()).await;
+    assert_eq!(response.status(), 200);
+    assert!(response.json::<Value>().await.unwrap()["ticket"].is_string());
+    // Refused for role peer.
+    let peer = post(
+        &base,
+        &token,
+        "/v1/hubs/game/tickets",
+        json!({"userId":"service","serverId":"room","role":"peer"}),
+    )
+    .await;
+    assert_eq!(peer.status(), 403);
+    // Refused for another hub.
+    assert_eq!(
+        post(&base, &token, "/v1/hubs/other/tickets", service_ticket())
+            .await
+            .status(),
+        401
+    );
+    // Refused on every admin route.
+    let client = reqwest::Client::new();
+    let get = |path: &'static str| {
+        client
+            .get(format!("{base}{path}"))
+            .bearer_auth(&token)
+            .send()
+    };
+    assert_eq!(get("/v1/hubs").await.unwrap().status(), 401);
+    assert_eq!(get("/v1/registry/export").await.unwrap().status(), 401);
+    assert_eq!(get("/v1/links").await.unwrap().status(), 401);
+    assert_eq!(
+        post(
+            &base,
+            &token,
+            "/v1/hubs",
+            json!({"id":"x","mode":"internal"})
+        )
+        .await
+        .status(),
+        401
+    );
+    assert_eq!(
+        post(
+            &base,
+            &token,
+            "/v1/hubs/game/call",
+            json!({"method":"getUser","args":["service"]})
+        )
+        .await
+        .status(),
+        401
+    );
+    assert_eq!(
+        post(&base, &token, "/v1/hubs/game/link-credentials", json!({}))
+            .await
+            .status(),
+        401
+    );
+    assert_eq!(
+        client
+            .delete(format!("{base}/v1/hubs/game"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        client
+            .delete(format!("{base}/v1/hubs/game/link-credentials"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    // The hub is intact and the admin token still works.
+    assert_eq!(
+        client
+            .get(format!("{base}/v1/hubs/game"))
+            .bearer_auth(B)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    // A made-up token is refused.
+    assert_eq!(
+        post(
+            &base,
+            "not-a-real-credential-0123456789",
+            "/v1/hubs/game/tickets",
+            service_ticket()
+        )
+        .await
+        .status(),
+        401
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn link_credential_revoke_stops_it() {
+    let (base, task, token) = credential_remote(None).await;
+    assert_eq!(
+        post(&base, &token, "/v1/hubs/game/tickets", service_ticket())
+            .await
+            .status(),
+        200
+    );
+    let client = reqwest::Client::new();
+    assert_eq!(
+        client
+            .delete(format!("{base}/v1/hubs/game/link-credentials"))
+            .bearer_auth(B)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    assert_eq!(
+        post(&base, &token, "/v1/hubs/game/tickets", service_ticket())
+            .await
+            .status(),
+        401
+    );
+    assert_eq!(
+        client
+            .delete(format!("{base}/v1/hubs/missing/link-credentials"))
+            .bearer_auth(B)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn link_credential_raw_token_is_never_stored_or_echoed() {
+    let path = std::env::temp_dir().join(format!("liveengine-credential-{}.json", rand_suffix()));
+    let (base, task, token) = credential_remote(Some(path.clone())).await;
+    let client = reqwest::Client::new();
+    let mut bodies = vec![];
+    for path in [
+        "/v1/hubs",
+        "/v1/hubs/game",
+        "/v1/registry/export",
+        "/v1/tree",
+    ] {
+        bodies.push(
+            client
+                .get(format!("{base}{path}"))
+                .bearer_auth(B)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        );
+    }
+    bodies.push(
+        post(&base, &token, "/v1/hubs/game/tickets", service_ticket())
+            .await
+            .text()
+            .await
+            .unwrap(),
+    );
+    assert!(bodies.iter().all(|body| !body.contains(&token)));
+    let state = std::fs::read_to_string(&path).unwrap();
+    assert!(!state.contains(&token));
+    assert!(state.contains("link_credentials"));
+    task.abort();
+    // The stored hash survives a restart.
+    let restarted = HubService::new(HubConfig {
+        token: B.into(),
+        public_url: Some("ws://localhost/v1/live".into()),
+        state_file: Some(path.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    restarted.initialize_state().await.unwrap();
+    let (base2, task2) = serve(restarted).await;
+    // Engine state is not persisted, so the user is no longer paired: 403 proves
+    // the credential itself still authenticates, where an unknown one gets 401.
+    assert_eq!(
+        post(&base2, &token, "/v1/hubs/game/tickets", service_ticket())
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        post(
+            &base2,
+            "not-a-real-credential-0123456789",
+            "/v1/hubs/game/tickets",
+            service_ticket()
+        )
+        .await
+        .status(),
+        401
+    );
+    task2.abort();
+    std::fs::remove_file(path).unwrap();
+}
+fn rand_suffix() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }

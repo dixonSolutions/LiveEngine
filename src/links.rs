@@ -2,7 +2,7 @@
 use crate::hub::{endpoint, error, validated_remote_url, Inner};
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -16,6 +16,7 @@ use std::{
     },
     time::Duration,
 };
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest,
@@ -65,6 +66,81 @@ impl Links {
             .into_iter()
             .map(|d| (d.id.clone(), Arc::new(Entry::new(d))))
             .collect();
+    }
+}
+const MAX_CREDENTIALS: usize = 16;
+/// Marks a request authenticated by a hub link credential rather than the admin token.
+#[derive(Clone)]
+pub(crate) struct CredentialAuth;
+fn digest(token: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, token.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+/// Accept a link credential only for `POST /v1/hubs/{id}/tickets` on its own hub.
+pub(crate) async fn credential_auth(
+    state: &Inner,
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+) -> Option<CredentialAuth> {
+    if method != Method::POST {
+        return None;
+    }
+    let mut parts = path.strip_prefix("/v1/hubs/")?.split('/');
+    let (id, last) = (parts.next()?, parts.next()?);
+    if last != "tickets" || parts.next().is_some() {
+        return None;
+    }
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")?;
+    let supplied = digest(token);
+    let hubs = state.hubs.read().await;
+    let record = hubs.get(id)?;
+    let mut matched = 0u8;
+    for stored in &record.link_credentials {
+        matched |= u8::from(bool::from(stored.as_bytes().ct_eq(supplied.as_bytes())));
+    }
+    (matched == 1).then_some(CredentialAuth)
+}
+pub(crate) async fn issue_credential(
+    State(state): State<Arc<Inner>>,
+    Path(id): Path<String>,
+) -> Response {
+    let mut hubs = state.hubs.write().await;
+    let Some(record) = hubs.get_mut(&id) else {
+        return error(StatusCode::NOT_FOUND, "hub not found");
+    };
+    if record.link_credentials.len() >= MAX_CREDENTIALS {
+        return error(StatusCode::CONFLICT, "link credential limit reached");
+    }
+    let token = format!(
+        "{:032x}{:032x}",
+        rand::random::<u128>(),
+        rand::random::<u128>()
+    );
+    record.link_credentials.push(digest(&token));
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({"token":token})),
+    )
+        .into_response()
+}
+pub(crate) async fn revoke_credentials(
+    State(state): State<Arc<Inner>>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.hubs.write().await.get_mut(&id) {
+        Some(record) => {
+            record.link_credentials.clear();
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => error(StatusCode::NOT_FOUND, "hub not found"),
     }
 }
 fn valid(state: &Inner, d: &LinkDefinition) -> bool {

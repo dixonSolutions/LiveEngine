@@ -244,10 +244,18 @@ fn peer_role() -> String {
 pub(crate) async fn ticket_hub(
     State(state): State<Arc<Inner>>,
     Path(id): Path<String>,
+    credential: Option<axum::Extension<crate::links::CredentialAuth>>,
     headers: HeaderMap,
     payload: Result<Json<TicketRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    issue_ticket(state, id, headers, payload.ok().map(|Json(v)| v), None).await
+    let request = payload.ok().map(|Json(v)| v);
+    if credential.is_some() && request.as_ref().is_some_and(|r| r.role != "service") {
+        return error(
+            StatusCode::FORBIDDEN,
+            "link credentials may only request service tickets",
+        );
+    }
+    issue_ticket(state, id, headers, request, None).await
 }
 pub(crate) async fn issue_ticket(
     state: Arc<Inner>,

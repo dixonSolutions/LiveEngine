@@ -157,7 +157,14 @@ rest of the tree remains live. Forwarding traces reject loops.
 
 An administrator can create a persistent outbound link with `POST /v1/links`:
 `{"id":"link-a","address":"https://remote.example","remoteToken":"...","hubId":"game","userId":"service-user","serverId":"room"}`.
-The service user must already be paired in the remote room. The remote host must
+`remoteToken` is a link credential, never the remote administrator token. The
+remote administrator creates one with `POST /v1/hubs/{id}/link-credentials`,
+which returns `{"token":"..."}` once; only its SHA-256 hash is kept, in the
+remote state file. The credential is accepted only as the bearer for
+`POST /v1/hubs/{id}/tickets` on that hub and only for role `service`
+(role `peer` is refused with 403). Every other route still needs the
+administrator token. `DELETE /v1/hubs/{id}/link-credentials` revokes every
+credential for the hub. The service user must already be paired in the remote room. The remote host must
 be on `LIVEENGINE_ALLOWED_REMOTE_HOSTS`. The initiating service requests a new
 service-role ticket over the authenticated HTTP API for each connection, then
 sends only that ticket in the WebSocket authentication frame. Use HTTPS for
