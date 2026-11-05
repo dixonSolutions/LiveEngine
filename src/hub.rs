@@ -1727,7 +1727,7 @@ fn enforce_schemas(schemas: &[Option<Value>; 3], call: &CallRequest) -> Result<(
     if call.method == "generateUsers" && schemas.iter().any(Option::is_some) {
         return Err("generateUsers requires an unbound hub".into());
     }
-    let schema = if call.method.contains("User") {
+    let schema = if call.method == "pairPeers" || call.method.contains("User") {
         &schemas[1]
     } else if call.method.contains("Server") {
         &schemas[2]
@@ -3224,6 +3224,7 @@ fn validate_call_scopes(schema: &Value, call: &CallRequest) -> Result<(), String
     let items: Vec<&Value> = match call.method.as_str() {
         "generateUsers" => return Err("generateUsers requires a hub without scopeSchema; generate locally and upsert validated users".into()),
         "upsertUser" | "upsertServer" => call.args.first().into_iter().collect(),
+        "pairPeers" => call.args.first().and_then(|v| v.get("users")).and_then(Value::as_array).map(|v| v.iter().collect()).unwrap_or_default(),
         "upsertUsers" | "upsertServers" => call
             .args
             .first()
@@ -3312,6 +3313,42 @@ fn preflight_internal_call(
             return Err("entity count exceeds configured maximum".into());
         }
     }
+    if call.method == "pairPeers" {
+        let spec = call.args.first().ok_or("missing pairing")?;
+        let peers = spec
+            .get("users")
+            .and_then(Value::as_array)
+            .ok_or("missing peers")?;
+        if peers.len() > config.max_entities {
+            return Err("entity count exceeds configured maximum".into());
+        }
+        let mut added = 0usize;
+        for peer in peers {
+            if let Some(id) = peer.get("id").and_then(Value::as_str) {
+                if engine
+                    .dispatch("getUser", vec![Value::String(id.to_owned())])?
+                    .is_null()
+                {
+                    added += 1;
+                }
+            } else {
+                added += 1;
+            }
+        }
+        if let Some(room) = spec.get("room").and_then(Value::as_str) {
+            if engine
+                .dispatch("getServer", vec![Value::String(room.to_owned())])?
+                .is_null()
+            {
+                added += 1;
+            }
+        } else {
+            added += 1;
+        }
+        if users.saturating_add(servers).saturating_add(added) > config.max_entities {
+            return Err("entity count exceeds configured maximum".into());
+        }
+    }
     let (kind, bulk) = match call.method.as_str() {
         "upsertUser" => (Some("user"), false),
         "upsertUsers" => (Some("user"), true),
@@ -3359,7 +3396,8 @@ fn preflight_internal_call(
         }
     }
     let projected = match call.method.as_str() {
-        "upsertUser" | "removeUser" | "setUserStatus" => 3,
+        "upsertUser" => 3,
+        "removeUser" | "setUserStatus" => 4,
         "upsertUsers" => call
             .args
             .first()
@@ -3392,8 +3430,14 @@ fn preflight_internal_call(
                 .unwrap_or(0);
             members.saturating_mul(2).saturating_add(1)
         }
+        "pairPeers" => call
+            .args
+            .first()
+            .and_then(|v| v.get("users"))
+            .and_then(Value::as_array)
+            .map_or(2, |v| v.len().saturating_mul(4).saturating_add(2)),
         "join" | "autoJoin" => 4,
-        "leave" => 2,
+        "leave" => 3,
         "matchAll" => users.saturating_mul(5),
         "advertise" => 1,
         "advertiseAll" => users,

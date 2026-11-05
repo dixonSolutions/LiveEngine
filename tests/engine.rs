@@ -315,3 +315,45 @@ fn first_strategy_respects_server_arrival_order_not_id_order() {
     assert_eq!(s["minMembers"], 0);
     assert_eq!(s["free"], 1);
 }
+
+#[test]
+fn pair_peers_is_atomic_and_system_rooms_are_not_server_matches() {
+    let mut e = Engine::new(42);
+    call(&mut e, "upsertUser", vec![json!({"id":"taken"})]);
+    call(&mut e, "upsertServer", vec![json!({"id":"real"})]);
+    call(&mut e, "join", vec![json!("taken"), json!("real")]);
+    let before = call(&mut e, "stats", vec![]);
+    let events = call(&mut e, "pendingEvents", vec![]);
+    assert!(e.dispatch("pairPeers", vec![json!({"room":"failed","capacity":2,"users":[{"id":"new","scopes":{}},{"id":"taken","scopes":{}}]})]).is_err());
+    assert_eq!(call(&mut e, "stats", vec![]), before);
+    assert_eq!(call(&mut e, "pendingEvents", vec![]), events);
+    assert_eq!(call(&mut e, "getUser", vec![json!("new")]), Value::Null);
+    assert_eq!(
+        call(&mut e, "getServer", vec![json!("failed")]),
+        Value::Null
+    );
+    call(
+        &mut e,
+        "pairPeers",
+        vec![
+            json!({"room":"room","capacity":3,"users":[{"id":"a","scopes":{}},{"id":"b","scopes":{}}]}),
+        ],
+    );
+    call(&mut e, "upsertUser", vec![json!({"id":"other"})]);
+    assert_eq!(
+        call(&mut e, "findServersForUser", vec![json!("other")]),
+        json!([])
+    );
+    assert_eq!(
+        call(&mut e, "findUsersForServer", vec![json!("room")]),
+        json!([])
+    );
+    assert_eq!(
+        call(&mut e, "join", vec![json!("other"), json!("room")])["ok"],
+        false
+    );
+    call(&mut e, "leave", vec![json!("a")]);
+    assert!(!call(&mut e, "getServer", vec![json!("room")]).is_null());
+    call(&mut e, "leave", vec![json!("b")]);
+    assert!(call(&mut e, "getServer", vec![json!("room")]).is_null());
+}

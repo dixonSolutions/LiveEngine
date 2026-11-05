@@ -25,6 +25,7 @@ struct Server {
     min: u32,
     members: Vec<String>,
     seq: u64,
+    system: bool,
 }
 #[derive(Clone)]
 struct Match {
@@ -43,6 +44,7 @@ fn generator_bound(value: Option<&Value>, default: f64, key: &str) -> Result<f64
     }
 }
 
+#[derive(Clone)]
 pub struct Engine {
     users: BTreeMap<String, User>,
     servers: BTreeMap<String, Server>,
@@ -152,6 +154,7 @@ impl Engine {
                 .min(u32::MAX as u64) as u32,
             members: vec![],
             seq: 0,
+            system: false,
         })
     }
     fn user_value(u: &User) -> Value {
@@ -220,7 +223,8 @@ impl Engine {
             return false;
         };
         self.evaluated += 1;
-        self.available(&s)
+        !s.system
+            && self.available(&s)
             && rules::evaluate(&s.req, &u.scopes)
             && rules::evaluate(&u.req, &s.scopes)
     }
@@ -321,7 +325,7 @@ impl Engine {
                             let Some(s) = self.servers.get(sid) else {
                                 continue;
                             };
-                            if !self.available(s) {
+                            if s.system || !self.available(s) {
                                 continue;
                             }
                             self.evaluated += 1;
@@ -382,7 +386,7 @@ impl Engine {
             let Some(s) = self.servers.get(id).cloned() else {
                 return out;
             };
-            if !self.available(&s) {
+            if s.system || !self.available(&s) {
                 return out;
             }
             let mut ids: Vec<_> = self
@@ -482,7 +486,7 @@ impl Engine {
                 sid,
             );
         }
-        if !self.fits(uid, sid) {
+        if !s.system && !self.fits(uid, sid) {
             return Self::result(false, "no_fit", uid, sid);
         }
         let s = self.servers.get_mut(sid).unwrap();
@@ -517,6 +521,15 @@ impl Engine {
         let u = self.users.get_mut(uid).unwrap();
         u.status = "waiting".into();
         u.server.clear();
+        if self
+            .servers
+            .get(&sid)
+            .is_some_and(|s| s.system && s.members.is_empty())
+        {
+            self.servers.remove(&sid);
+            self.availability.remove(&sid);
+            self.event("server_removed", "", &sid, None);
+        }
         Self::result(true, "", uid, &sid)
     }
 
@@ -524,6 +537,78 @@ impl Engine {
         let a = &args;
         let x = |i| a.get(i);
         Ok(match method {
+            "pairPeers" => {
+                let spec = x(0)
+                    .and_then(Value::as_object)
+                    .ok_or("pairPeers requires an object")?;
+                let room = spec
+                    .get("room")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or("room must be a nonempty string")?;
+                let capacity = spec
+                    .get("capacity")
+                    .and_then(Value::as_u64)
+                    .filter(|n| *n > 0 && *n <= u32::MAX as u64)
+                    .ok_or("invalid capacity")? as u32;
+                let users = spec
+                    .get("users")
+                    .and_then(Value::as_array)
+                    .filter(|u| !u.is_empty())
+                    .ok_or("users must be a nonempty array")?;
+                let mut ids = std::collections::HashSet::new();
+                for user in users {
+                    let id = user
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or("user id must be a nonempty string")?;
+                    if !user.get("scopes").is_some_and(Value::is_object) || !ids.insert(id) {
+                        return Err("invalid or duplicate peer".into());
+                    }
+                    if self
+                        .users
+                        .get(id)
+                        .is_some_and(|u| u.status == "paired" && u.server != room)
+                    {
+                        return Err("peer already paired".into());
+                    }
+                }
+                if self.servers.get(room).is_some_and(|s| !s.system) {
+                    return Err("room already exists".into());
+                }
+                let mut next = self.clone();
+                if !next.servers.contains_key(room) {
+                    let mut server = next.make_server(&json!({"id":room,"capacity":capacity}))?;
+                    server.system = true;
+                    next.seq += 1;
+                    server.seq = next.seq;
+                    next.servers.insert(room.into(), server);
+                    next.event("server_added", "", room, None);
+                    next.refresh(room);
+                }
+                for user in users {
+                    let id = user["id"].as_str().unwrap();
+                    if next
+                        .users
+                        .get(id)
+                        .is_some_and(|u| u.server == room && u.status == "paired")
+                    {
+                        continue;
+                    }
+                    if !next.users.contains_key(id) {
+                        next.dispatch("upsertUser", vec![user.clone()])?;
+                    } else {
+                        next.users.get_mut(id).unwrap().scopes = user["scopes"].clone();
+                        next.event("user_updated", id, "", None);
+                    }
+                    if next.join_inner(id, room)["ok"] != true {
+                        return Err("peer could not join room".into());
+                    }
+                }
+                *self = next;
+                json!({"ok":true,"serverId":room})
+            }
             "upsertUser" => {
                 let mut u = self.make_user(x(0).unwrap_or(&Value::Null))?;
                 if let Some(old) = self.users.get(&u.id) {
@@ -619,6 +704,9 @@ impl Engine {
             "upsertServer" => {
                 let mut s = self.make_server(x(0).unwrap_or(&Value::Null))?;
                 if let Some(old) = self.servers.get(&s.id).cloned() {
+                    if old.system {
+                        return Err("cannot overwrite a system room".into());
+                    }
                     self.index_server(&old, false);
                     s.seq = old.seq;
                     s.members = old.members.clone();
@@ -663,10 +751,11 @@ impl Engine {
                     for uid in &s.members {
                         self.leave_inner(uid, "server_removed");
                     }
-                    self.index_server(&s, false);
-                    self.servers.remove(&id);
-                    self.availability.remove(&id);
-                    self.event("server_removed", "", &id, None);
+                    if self.servers.remove(&id).is_some() {
+                        self.index_server(&s, false);
+                        self.availability.remove(&id);
+                        self.event("server_removed", "", &id, None);
+                    }
                     json!(true)
                 } else {
                     json!(false)
@@ -768,7 +857,11 @@ impl Engine {
             "join" => {
                 let u = Self::id_arg(a, 0, "userId")?;
                 let s = Self::id_arg(a, 1, "serverId")?;
-                self.join_inner(&u, &s)
+                if self.servers.get(&s).is_some_and(|s| s.system) {
+                    Self::result(false, "no_fit", &u, &s)
+                } else {
+                    self.join_inner(&u, &s)
+                }
             }
             "leave" => {
                 let u = Self::id_arg(a, 0, "userId")?;

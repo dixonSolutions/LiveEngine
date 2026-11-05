@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Pair peers atomically in system rooms, validate peer scopes against the user schema, and remove empty system rooms.
+
 - Add authenticated, bounded discovery and engine-backed pairing of hubs and peers through nested registries.
 
 - Speed up first-match searches that use an indexed equality requirement.

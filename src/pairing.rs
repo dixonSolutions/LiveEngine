@@ -535,37 +535,27 @@ pub(crate) async fn pair(
         None
     };
     let room = existing.clone().unwrap_or(room);
-    if existing.is_none() {
-        let server = json!({"id":room,"scopes":if peer { subject["scopes"].clone() } else { target_scopes.clone() },"capacity":64});
-        if let Err(e) = routed(
+    if peer {
+        let result = routed(
             state.clone(),
             headers.clone(),
             path.clone(),
             "call",
-            call("upsertServer", vec![server]),
+            call(
+                "pairPeers",
+                vec![json!({"room":room,"capacity":64,"users":[
+                    {"id":target_id,"scopes":target_scopes},
+                    {"id":id,"scopes":subject["scopes"]}
+                ]})],
+            ),
             inherited.clone(),
         )
-        .await
-        {
+        .await;
+        if let Err(e) = result {
             return e;
         }
-        if peer {
-            let joined = match routed(
-                state.clone(),
-                headers.clone(),
-                path.clone(),
-                "call",
-                call("join", vec![json!(target_id), json!(room)]),
-                inherited.clone(),
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            if joined["result"]["ok"] != true {
-                return error(StatusCode::CONFLICT, "candidate could not join");
-            }
+    } else {
+        if existing.is_none() {
             let server = json!({"id":room,"scopes":target_scopes,"capacity":64});
             if let Err(e) = routed(
                 state.clone(),
@@ -580,41 +570,26 @@ pub(crate) async fn pair(
                 return e;
             }
         }
-    }
-    let user =
-        json!({"id":id,"scopes":subject["scopes"],"requirements":target.get("requirements")});
-    if let Err(e) = routed(
-        state.clone(),
-        headers.clone(),
-        path.clone(),
-        "call",
-        call("upsertUser", vec![user]),
-        inherited.clone(),
-    )
-    .await
-    {
-        return e;
-    }
-    let current = match routed(
-        state.clone(),
-        headers.clone(),
-        path.clone(),
-        "call",
-        call("getUser", vec![json!(id)]),
-        inherited.clone(),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    if current["result"]["serverId"] != room {
-        let joined = match routed(
+        let user =
+            json!({"id":id,"scopes":subject["scopes"],"requirements":target.get("requirements")});
+        if let Err(e) = routed(
             state.clone(),
             headers.clone(),
             path.clone(),
             "call",
-            call("join", vec![json!(id), json!(room)]),
+            call("upsertUser", vec![user]),
+            inherited.clone(),
+        )
+        .await
+        {
+            return e;
+        }
+        let current = match routed(
+            state.clone(),
+            headers.clone(),
+            path.clone(),
+            "call",
+            call("getUser", vec![json!(id)]),
             inherited.clone(),
         )
         .await
@@ -622,8 +597,23 @@ pub(crate) async fn pair(
             Ok(v) => v,
             Err(e) => return e,
         };
-        if joined["result"]["ok"] != true {
-            return error(StatusCode::CONFLICT, "subject could not join");
+        if current["result"]["serverId"] != room {
+            let joined = match routed(
+                state.clone(),
+                headers.clone(),
+                path.clone(),
+                "call",
+                call("join", vec![json!(id), json!(room)]),
+                inherited.clone(),
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            if joined["result"]["ok"] != true {
+                return error(StatusCode::CONFLICT, "subject could not join");
+            }
         }
     }
     let ticket = match routed(state, headers, path, "ticket", json!({"id":hub_id,"userId":id,"serverId":room,"role":if kind == "hub" {"service"} else {"peer"}}), inherited).await { Ok(v) => v, Err(e) => return e };

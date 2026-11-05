@@ -209,3 +209,128 @@ async fn pairing_returns_each_link_kind_through_a_remote_nest() {
     root_task.abort();
     remote_task.abort();
 }
+
+#[tokio::test]
+async fn peer_pairing_uses_user_schema_and_rolls_back_failures() {
+    let (base, task) = server(TOKEN).await;
+    let c = reqwest::Client::new();
+    let (status, body) = post(&c, &base, TOKEN, "/v1/hubs", json!({"id":"game","mode":"internal", "userSchema":{"type":"object","required":["rank"],"properties":{"rank":{"type":"integer"}}}, "serverSchema":{"type":"object","required":["host"],"properties":{"host":{"type":"string"}}}})).await;
+    assert_eq!(status, 201, "{body}");
+    let call = |method: &str, args: Value| json!({"method":method,"args":args});
+    let (status, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs/game/call",
+        call("upsertUser", json!([{"id":"alice","scopes":{"rank":1}}])),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let pair = |id: &str, scopes: Value| json!({"subject":{"kind":"peer","id":id,"scopes":scopes},"target":{"kind":"peer","requirements":{"rank":1}}});
+    let (status, _) = post(&c, &base, TOKEN, "/v1/pair", pair("bad", json!({}))).await;
+    assert_ne!(status, 200);
+    let (_, users) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs/game/call",
+        call("listUsers", json!([])),
+    )
+    .await;
+    assert_eq!(users["result"].as_array().unwrap().len(), 1);
+    let (_, rooms) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs/game/call",
+        call("listServers", json!([])),
+    )
+    .await;
+    assert_eq!(rooms["result"], json!([]));
+    let (status, body) = post(&c, &base, TOKEN, "/v1/pair", pair("bob", json!({"rank":2}))).await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room"].clone();
+    let (status, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs/game/call",
+        call(
+            "upsertUser",
+            json!([{"id":"candidate","scopes":{"rank":9}}]),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _) = post(&c, &base, TOKEN, "/v1/pair", json!({"subject":{"kind":"peer","id":"bob","scopes":{"rank":2}},"target":{"kind":"peer","requirements":{"rank":9}}})).await;
+    assert_ne!(status, 200);
+    let (_, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs/game/call",
+        call("getServer", json!(["pair:candidate"])),
+    )
+    .await;
+    assert_eq!(body["result"], Value::Null);
+    let (_, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs/game/call",
+        call("getUser", json!(["candidate"])),
+    )
+    .await;
+    assert_eq!(body["result"]["serverId"], Value::Null);
+    let (_, result) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs/game/call",
+        call("upsertUser", json!([{"id":"other","scopes":{"rank":3}}])),
+    )
+    .await;
+    assert_eq!(result["result"], true);
+    let (_, result) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs/game/call",
+        call("findServersForUser", json!(["other"])),
+    )
+    .await;
+    assert_eq!(result["result"], json!([]));
+    let (status, _) = post(&c, &base, TOKEN, "/v1/hubs/game/call", call("pairPeers", json!([{"room":"failed","capacity":2,"users":[{"id":"new","scopes":{"rank":4}},{"id":"bob","scopes":{"rank":2}}]}]))).await;
+    assert_ne!(status, 200);
+    for (method, id) in [("getUser", "new"), ("getServer", "failed")] {
+        let (_, body) = post(
+            &c,
+            &base,
+            TOKEN,
+            "/v1/hubs/game/call",
+            call(method, json!([id])),
+        )
+        .await;
+        assert_eq!(body["result"], Value::Null);
+    }
+    for id in ["alice", "bob"] {
+        post(
+            &c,
+            &base,
+            TOKEN,
+            "/v1/hubs/game/call",
+            call("leave", json!([id])),
+        )
+        .await;
+    }
+    let (_, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs/game/call",
+        call("getServer", json!([room])),
+    )
+    .await;
+    assert_eq!(body["result"], Value::Null);
+    task.abort();
+}
