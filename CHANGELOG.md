@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add a typed Rust hub specification for registration through the HTTP service path.
+
+- Bound registry list and export responses, publish instance identities atomically, and prune expired bridge rate limits.
+
 - Expose nested registry operations in the Rust client and CLI, document schemas and nesting, and support `LIVEENGINE_HUB_PATH` in the Gogh Strike bridge.
 
 - Persist self-hosted registry definitions and refresh imported registries, marking missing entries stale.

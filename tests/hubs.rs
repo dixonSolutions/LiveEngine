@@ -3,12 +3,135 @@
 use std::{net::SocketAddr, time::Duration};
 
 use axum::Router;
-use liveengine::hub::{HubConfig, HubHandler, HubMode, HubRegistration, HubService};
+use liveengine::hub::{HubConfig, HubHandler, HubMode, HubRegistration, HubService, HubSpec};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
 const TOKEN: &str = "test-administrator-token-long-enough";
 const REMOTE_TOKEN: &str = "different-remote-administrator-token";
+
+#[test]
+fn concurrent_instance_id_child() {
+    if std::env::var_os("LIVEENGINE_TEST_INSTANCE_CHILD").is_some() {
+        let id = HubConfig::from_env().unwrap().instance_id.unwrap();
+        println!("CONCURRENT_INSTANCE_ID={id}");
+    }
+}
+
+#[test]
+fn concurrent_instance_id_file_creators_converge() {
+    use std::sync::{Arc, Barrier};
+
+    let dir = std::env::temp_dir().join(format!(
+        "liveengine-concurrent-id-{}-{:032x}",
+        std::process::id(),
+        rand::random::<u128>()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = Arc::new(dir.join("instance-id"));
+    let barrier = Arc::new(Barrier::new(16));
+    let threads: Vec<_> = (0..16)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "concurrent_instance_id_child", "--nocapture"])
+                    .env("LIVEENGINE_TEST_INSTANCE_CHILD", "1")
+                    .env("LIVEENGINE_TOKEN", TOKEN)
+                    .env("LIVEENGINE_INSTANCE_ID_FILE", path.as_ref())
+                    .env_remove("LIVEENGINE_INSTANCE_ID")
+                    .env_remove("LIVEENGINE_STATE_FILE")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                stdout
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once("CONCURRENT_INSTANCE_ID=")
+                            .map(|(_, id)| id.to_owned())
+                    })
+                    .unwrap()
+            })
+        })
+        .collect();
+    let ids: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert!(ids.iter().all(|id| id == &ids[0]));
+    assert_eq!(std::fs::read_to_string(path.as_ref()).unwrap(), ids[0]);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn typed_hub_spec_uses_http_registration_rules() {
+    let service = HubService::new(config()).unwrap();
+    let app = service.router();
+    assert_eq!(
+        request(
+            app.clone(),
+            "POST",
+            "/v1/schemas",
+            Some(json!({
+                "id":"typed", "version":"1", "schema":{"type":"object"}
+            })),
+            true
+        )
+        .await
+        .0,
+        201
+    );
+    let spec = HubSpec {
+        id: "typed-hub".into(),
+        schema_ref: Some("typed@1".into()),
+        user_schema: Some(json!({"type":"object"})),
+        server_schema: Some(json!({"type":"object"})),
+        if_absent: true,
+        ..HubSpec::default()
+    };
+    let info = service.register(spec.clone()).await.unwrap();
+    assert_eq!(info.schema_ref.as_deref(), Some("typed@1"));
+    assert_eq!(info.user_schema, spec.user_schema);
+    assert_eq!(info.server_schema, spec.server_schema);
+    assert_eq!(service.register(spec).await.unwrap().id, "typed-hub");
+    let (status, fetched) = request(app, "GET", "/v1/hubs/typed-hub", None, true).await;
+    assert_eq!(status, 200);
+    assert_eq!(fetched["schemaRef"], "typed@1");
+
+    assert_eq!(
+        request(
+            service.router(),
+            "POST",
+            "/v1/templates",
+            Some(json!({
+                "name":"central-template", "mode":"central"
+            })),
+            true
+        )
+        .await
+        .0,
+        201
+    );
+    let central = service
+        .register(HubSpec {
+            id: "typed-central".into(),
+            template: Some("central-template".into()),
+            max_hubs: Some(2),
+            ..HubSpec::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(central.mode, HubMode::Central);
+    assert_eq!(central.max_hubs, Some(2));
+}
 
 fn config() -> HubConfig {
     HubConfig {
@@ -588,6 +711,49 @@ async fn ping_endpoint_is_unauthenticated_and_native_ping_reports_stats() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn unwritable_state_directory_rejects_initial_snapshot() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!(
+        "liveengine-unwritable-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let service = HubService::new(HubConfig {
+        state_file: Some(dir.join("state.json")),
+        ..config()
+    })
+    .unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = service.initialize_state().await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn failed_state_rename_removes_temporary_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "liveengine-rename-failure-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("state.json");
+    let service = HubService::new(HubConfig {
+        state_file: Some(path.clone()),
+        ..config()
+    })
+    .unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(service.initialize_state().await.is_err());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn durable_registry_restart_and_invalid_files() {
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!(
@@ -927,4 +1093,57 @@ async fn rust_client_routes_and_exports_over_tcp() {
         .get("hubs")
         .is_some());
     task.abort();
+}
+
+#[tokio::test]
+async fn list_and_export_respect_response_size_limit() {
+    let service = HubService::new(HubConfig {
+        max_response_bytes: 30,
+        ..config()
+    })
+    .unwrap();
+    let app = service.router();
+    assert_eq!(
+        request(
+            app.clone(),
+            "POST",
+            "/v1/hubs",
+            Some(json!({"id":"main","mode":"internal"})),
+            true
+        )
+        .await
+        .0,
+        201
+    );
+    assert_eq!(
+        request(
+            app.clone(),
+            "POST",
+            "/v1/templates",
+            Some(json!({"name":"test","mode":"internal"})),
+            true
+        )
+        .await
+        .0,
+        201
+    );
+    for path in [
+        "/v1/schemas",
+        "/v1/templates",
+        "/v1/hubs",
+        "/v1/registry/export",
+    ] {
+        let (status, body) = request(app.clone(), "GET", path, None, true).await;
+        assert_eq!(status, 413, "{path}: {body}");
+        assert!(body["error"].as_str().unwrap().contains("response"));
+    }
+    let (status, _) = request(
+        app,
+        "POST",
+        "/v1/route",
+        Some(json!({"path":[],"op":"list"})),
+        true,
+    )
+    .await;
+    assert_eq!(status, 413);
 }

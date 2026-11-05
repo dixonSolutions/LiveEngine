@@ -215,7 +215,6 @@ fn instance_id_from_env() -> Result<String, String> {
         return Ok(id);
     }
     use std::hash::{Hash, Hasher};
-    use std::io::Write;
     let path = if let Ok(file) = std::env::var("LIVEENGINE_INSTANCE_ID_FILE") {
         std::path::PathBuf::from(file)
     } else if let Ok(file) = std::env::var("LIVEENGINE_STATE_FILE") {
@@ -237,7 +236,22 @@ fn instance_id_from_env() -> Result<String, String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|_| "cannot create instance id directory")?;
     }
+    instance_id_at(&path)
+}
+
+fn instance_id_at(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Write;
+    match std::fs::read_to_string(path) {
+        Ok(existing) if valid_trace_id(&existing) => return Ok(existing),
+        Ok(_) => return Err("invalid persisted instance id".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("cannot read instance id".into()),
+    }
     let id = format!("{:032x}", rand::random::<u128>());
+    let temp = path.with_file_name(format!(
+        ".liveengine-id-{:032x}.tmp",
+        rand::random::<u128>()
+    ));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -245,15 +259,17 @@ fn instance_id_from_env() -> Result<String, String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    match options.open(&path) {
-        Ok(mut file) => {
-            file.write_all(id.as_bytes())
-                .and_then(|_| file.sync_all())
-                .map_err(|_| "cannot persist instance id")?;
-            Ok(id)
-        }
+    let result = (|| -> std::io::Result<()> {
+        let mut file = options.open(&temp)?;
+        file.write_all(id.as_bytes())?;
+        file.sync_all()?;
+        std::fs::hard_link(&temp, path)
+    })();
+    let _ = std::fs::remove_file(&temp);
+    match result {
+        Ok(()) => Ok(id),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = std::fs::read_to_string(&path).map_err(|_| "cannot read instance id")?;
+            let existing = std::fs::read_to_string(path).map_err(|_| "cannot read instance id")?;
             if !valid_trace_id(&existing) {
                 return Err("invalid persisted instance id".into());
             }
@@ -282,6 +298,37 @@ pub struct HubRegistration {
     pub scope_schema: Option<Value>,
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
+}
+
+/// Complete registration payload for the hosted registry.
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HubSpec {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<HubMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_hub_id: Option<String>,
+    pub scopes: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_hubs: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    pub if_absent: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -438,8 +485,50 @@ impl HubService {
         persist(&self.inner).await
     }
 
+    /// Register a hub using the same validation and behavior as the HTTP API.
+    pub async fn register(&self, spec: HubSpec) -> Result<HubInfo, String> {
+        use tower::ServiceExt;
+        let mut value = serde_json::to_value(spec).map_err(|_| "invalid registration")?;
+        if value["scopes"].is_null() {
+            value.as_object_mut().unwrap().remove("scopes");
+        }
+        if value.get("template").is_none() && value.get("mode").is_none() {
+            value["mode"] = "internal".into();
+        }
+        let body = serde_json::to_vec(&value).map_err(|_| "invalid registration")?;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/hubs")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", self.inner.config.token),
+            )
+            .body(Body::from(body))
+            .map_err(|_| "invalid registration request")?;
+        let response = self
+            .router()
+            .oneshot(request)
+            .await
+            .map_err(|_| "registration failed")?;
+        let status = response.status();
+        let bytes =
+            axum::body::to_bytes(response.into_body(), self.inner.config.max_response_bytes)
+                .await
+                .map_err(|_| "invalid registration response")?;
+        if !status.is_success() {
+            let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            return Err(value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("registration failed")
+                .to_string());
+        }
+        serde_json::from_slice(&bytes).map_err(|_| "invalid registration response".to_string())
+    }
+
     /// Router for embedding in another Axum application. It owns routes rooted
-    /// at `/health`, `/v1/contract`, and `/v1/hubs`.
+    /// at `/health` and `/v1/{ping,contract,schemas,templates,route,tree,hubs,registries,registry}`.
     pub fn router(&self) -> Router {
         start_reaper(&self.inner);
         Router::new()
@@ -782,32 +871,37 @@ async fn persist(state: &Inner) -> Result<(), String> {
         hubs: snapshot_hubs(state).await,
     };
     let bytes = serde_json::to_vec(&snapshot).map_err(|_| "cannot encode state file")?;
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
-    let temp = parent.join(format!(".liveengine-{:032x}.tmp", rand::random::<u128>()));
-    let result = (|| -> std::io::Result<()> {
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+    let path = path.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let temp = parent.join(format!(".liveengine-{:032x}.tmp", rand::random::<u128>()));
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temp, &path)?;
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(temp);
+            return Err("cannot persist state file".into());
         }
-        let mut file = options.open(&temp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temp, path)?;
-        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temp);
-        return Err("cannot persist state file".into());
-    }
-    Ok(())
+    })
+    .await
+    .map_err(|_| "cannot persist state file".to_string())?
 }
 async fn persist_request(
     State(state): State<Arc<Inner>>,
@@ -1027,14 +1121,25 @@ async fn create_schema(
     )
         .into_response()
 }
-async fn list_schemas(State(state): State<Arc<Inner>>) -> Json<Value> {
+fn bounded_json(state: &Inner, value: Value) -> Response {
+    if serde_json::to_vec(&value)
+        .map_or(true, |bytes| bytes.len() > state.config.max_response_bytes)
+    {
+        return error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "response exceeds configured size limit",
+        );
+    }
+    Json(value).into_response()
+}
+async fn list_schemas(State(state): State<Arc<Inner>>) -> Response {
     let schemas = state.schemas.read().await;
     let mut list: Vec<_> = schemas
         .iter()
         .map(|(key, schema)| serde_json::json!({"ref":key,"schema":schema}))
         .collect();
     list.sort_by(|a, b| a["ref"].as_str().cmp(&b["ref"].as_str()));
-    Json(serde_json::json!({"schemas":list}))
+    bounded_json(&state, serde_json::json!({"schemas":list}))
 }
 async fn get_schema(State(state): State<Arc<Inner>>, Path(id): Path<String>) -> Response {
     match state.schemas.read().await.get(&id) {
@@ -1081,7 +1186,7 @@ fn schema_used<'a>(
     })
 }
 
-async fn export_registry(State(state): State<Arc<Inner>>) -> Json<Value> {
+async fn export_registry(State(state): State<Arc<Inner>>) -> Response {
     let schemas = state.schemas.read().await;
     let mut hubs = state.hubs.write().await;
     expire_hubs(&mut hubs);
@@ -1092,15 +1197,18 @@ async fn export_registry(State(state): State<Arc<Inner>>) -> Json<Value> {
         .map(|(key, schema)| serde_json::json!({"ref":key,"schema":schema}))
         .collect();
     definitions.sort_by(|a, b| a["ref"].as_str().cmp(&b["ref"].as_str()));
-    Json(serde_json::json!({"protocol":HUB_PROTOCOL,"hubs":list,"schemas":definitions}))
+    bounded_json(
+        &state,
+        serde_json::json!({"protocol":HUB_PROTOCOL,"hubs":list,"schemas":definitions}),
+    )
 }
 
-async fn list_hubs(State(state): State<Arc<Inner>>) -> Json<Value> {
+async fn list_hubs(State(state): State<Arc<Inner>>) -> Response {
     let mut hubs = state.hubs.write().await;
     expire_hubs(&mut hubs);
     let mut list: Vec<HubInfo> = hubs.values().map(public_info).collect();
     list.sort_by(|a, b| a.id.cmp(&b.id));
-    Json(serde_json::json!({"hubs":list}))
+    bounded_json(&state, serde_json::json!({"hubs":list}))
 }
 
 async fn get_hub(State(state): State<Arc<Inner>>, Path(id): Path<String>) -> Response {
@@ -1593,14 +1701,14 @@ async fn create_template(
     templates.insert(name, value);
     (StatusCode::CREATED, Json(public)).into_response()
 }
-async fn list_templates(State(state): State<Arc<Inner>>) -> Json<Value> {
+async fn list_templates(State(state): State<Arc<Inner>>) -> Response {
     let templates = state.templates.read().await;
     let mut list: Vec<_> = templates
         .iter()
         .map(|(name, value)| public_template(name, value))
         .collect();
     list.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    Json(serde_json::json!({"templates":list}))
+    bounded_json(&state, serde_json::json!({"templates":list}))
 }
 async fn get_template(State(state): State<Arc<Inner>>, Path(name): Path<String>) -> Response {
     match state.templates.read().await.get(&name) {
@@ -1700,6 +1808,7 @@ async fn register_hub_inherited(
             .or_else(|| state.inherited[0].clone())
             .or_else(|| inherited[0].clone()),
     };
+    drop(schemas);
     if let Some(schema) = &effective {
         if let Err(e) = validate_scope_schema(&reg.scopes, schema) {
             return error(StatusCode::BAD_REQUEST, &e);
@@ -3048,5 +3157,33 @@ impl HubClient {
     pub async fn export_registry(&self) -> Result<Value, String> {
         self.request(reqwest::Method::GET, "/v1/registry/export", None)
             .await
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    #[test]
+    fn concurrent_instance_id_creators_converge() {
+        let dir = std::env::temp_dir().join(format!(
+            "liveengine-id-test-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = std::sync::Arc::new(dir.join("id"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(24));
+        let threads: Vec<_> = (0..24)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    super::instance_id_at(&path).unwrap()
+                })
+            })
+            .collect();
+        let ids: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert!(ids.iter().all(|id| id == &ids[0]));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

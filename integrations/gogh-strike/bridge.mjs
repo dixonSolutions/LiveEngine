@@ -3,6 +3,7 @@ import http from 'node:http';
 import {createRequire} from 'node:module';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {pruneRates} from './rate-limit.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const {HubClient} = createRequire(import.meta.url)('../../lib/hubs.js');
@@ -146,6 +147,7 @@ let client;
 function getClient() { return client ||= new LiveEngineClient(); }
 
 const reaper = setInterval(async () => {
+  pruneRates(joinRates, Date.now(), RATE_WINDOW_MS);
   for (const [userId, lastSeen] of seats) {
     if (Date.now() - lastSeen < idleMs) continue;
     try {

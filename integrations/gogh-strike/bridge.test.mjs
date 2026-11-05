@@ -7,6 +7,7 @@ import net from 'node:net';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {after, before, test} from 'node:test';
+import {pruneRates} from './rate-limit.mjs';
 
 let root;
 const bridge = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'bridge.mjs');
@@ -171,6 +172,25 @@ test('bridge rejects hostile Origin on status requests', async () => {
   const base = `http://127.0.0.1:${bridgePort}`;
   const statusAttack = await fetch(`${base}/api/liveengine/status`, {headers: {Origin: 'https://attacker.example'}});
   assert.equal(statusAttack.status, 403);
+});
+
+test('expired rate entries are removed while active timestamps remain', () => {
+  const rates = new Map([['expired', [10, 20]], ['active', [20, 80]]]);
+  pruneRates(rates, 100, 50);
+  assert.deepEqual([...rates], [['active', [80]]]);
+});
+
+test('bridge rejects hostile Origin on leave and heartbeat', async () => {
+  const base = `http://127.0.0.1:${bridgePort}`;
+  const beforeCalls = calls.length;
+  for (const action of ['leave', 'heartbeat']) {
+    const response = await fetch(`${base}/api/liveengine/${action}`, {
+      method: 'POST', headers: {'Content-Type': 'application/json', Origin: 'https://attacker.example'},
+      body: JSON.stringify({userId: 'player-1'}),
+    });
+    assert.equal(response.status, 403);
+  }
+  assert.equal(calls.length, beforeCalls);
 });
 
 test('bridge enforces the request body byte limit', async () => {
