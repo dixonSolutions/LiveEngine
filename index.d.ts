@@ -154,6 +154,7 @@ export declare const nativeVersion: string;
 export default LiveEngine;
 
 export type HubMode = 'internal' | 'external' | 'central';
+export interface LiveChannel { schemaRef?: string; delivery: 'reliable' | 'lossy'; maxRate?: number; }
 export interface HubDefinition {
   id: string;
   mode?: HubMode;
@@ -167,6 +168,7 @@ export interface HubDefinition {
   schemaRef?: string;
   userSchema?: Record<string, unknown> | boolean;
   serverSchema?: Record<string, unknown> | boolean;
+  channels?: Record<string, LiveChannel>;
   ttlSeconds?: number;
   maxHubs?: number;
 }

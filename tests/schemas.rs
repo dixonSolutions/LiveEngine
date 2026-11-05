@@ -25,6 +25,91 @@ async fn server() -> (String, tokio::task::JoinHandle<()>) {
     });
     (format!("http://{addr}"), task)
 }
+
+#[tokio::test]
+async fn channel_declarations_are_validated_and_keep_schemas_in_use() {
+    let (base, task) = server().await;
+    let c = reqwest::Client::new();
+    assert_eq!(
+        req(
+            &c,
+            &base,
+            reqwest::Method::POST,
+            "/v1/schemas",
+            Some(json!({
+                "id":"message", "version":"1", "schema":{"type":"string"}
+            }))
+        )
+        .await
+        .0,
+        201
+    );
+    for channels in [
+        json!({"updates":{"delivery":"reliable","schemaRef":"missing@1"}}),
+        json!({"updates":{"delivery":"unknown"}}),
+        json!({"updates":{"delivery":"lossy","maxRate":0}}),
+        json!({"bad name":{"delivery":"lossy"}}),
+    ] {
+        assert_eq!(
+            req(
+                &c,
+                &base,
+                reqwest::Method::POST,
+                "/v1/hubs",
+                Some(json!({
+                    "id":"bad", "mode":"internal", "channels":channels
+                }))
+            )
+            .await
+            .0,
+            400
+        );
+    }
+    let channels = json!({"updates":{"delivery":"reliable","schemaRef":"message@1","maxRate":12}});
+    let (status, hub) = req(
+        &c,
+        &base,
+        reqwest::Method::POST,
+        "/v1/hubs",
+        Some(json!({
+            "id":"game", "mode":"internal", "channels":channels
+        })),
+    )
+    .await;
+    assert_eq!(status, 201);
+    assert_eq!(hub["channels"], channels);
+    assert_eq!(
+        req(
+            &c,
+            &base,
+            reqwest::Method::DELETE,
+            "/v1/schemas/message@1",
+            None
+        )
+        .await
+        .0,
+        409
+    );
+    assert_eq!(
+        req(&c, &base, reqwest::Method::DELETE, "/v1/hubs/game", None)
+            .await
+            .0,
+        204
+    );
+    assert_eq!(
+        req(
+            &c,
+            &base,
+            reqwest::Method::DELETE,
+            "/v1/schemas/message@1",
+            None
+        )
+        .await
+        .0,
+        204
+    );
+    task.abort();
+}
 async fn req(
     client: &reqwest::Client,
     base: &str,

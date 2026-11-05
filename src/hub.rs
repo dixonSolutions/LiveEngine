@@ -325,10 +325,30 @@ pub struct HubSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<HashMap<String, LiveChannel>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_hubs: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
     pub if_absent: bool,
+}
+
+/// User-defined relay channel settings.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LiveChannel {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_ref: Option<String>,
+    pub delivery: LiveDelivery,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rate: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LiveDelivery {
+    Reliable,
+    Lossy,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -358,6 +378,8 @@ pub struct HubInfo {
     pub user_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<HashMap<String, LiveChannel>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_hubs: Option<usize>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -620,6 +642,7 @@ impl HubService {
             schema_ref: None,
             user_schema: None,
             server_schema: None,
+            channels: None,
             max_hubs: None,
             stale: false,
         };
@@ -1316,7 +1339,13 @@ fn schema_used<'a>(
             hubs.values().cloned().collect()
         };
         for record in records {
-            if record.info.schema_ref.as_deref() == Some(id) {
+            if record.info.schema_ref.as_deref() == Some(id)
+                || record.info.channels.as_ref().is_some_and(|channels| {
+                    channels
+                        .values()
+                        .any(|channel| channel.schema_ref.as_deref() == Some(id))
+                })
+            {
                 return true;
             }
             if let Some(child) = record.child {
@@ -1775,6 +1804,36 @@ fn public_template(name: &str, template: &Value) -> Value {
     }
     value
 }
+
+async fn parse_channels(
+    value: Option<Value>,
+    state: &Inner,
+) -> Result<Option<HashMap<String, LiveChannel>>, String> {
+    let Some(value) = value else { return Ok(None) };
+    let channels: HashMap<String, LiveChannel> =
+        serde_json::from_value(value).map_err(|_| "invalid channels")?;
+    if channels.len() > state.config.max_hubs {
+        return Err("too many channels".into());
+    }
+    let schemas = state.schemas.read().await;
+    for (name, channel) in &channels {
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            || channel.max_rate == Some(0)
+        {
+            return Err("invalid channel".into());
+        }
+        if let Some(schema_ref) = &channel.schema_ref {
+            if !schemas.contains_key(schema_ref) {
+                return Err("channel schema not found".into());
+            }
+        }
+    }
+    Ok(Some(channels))
+}
 async fn create_template(
     State(state): State<Arc<Inner>>,
     payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
@@ -1809,6 +1868,11 @@ async fn create_template(
     }
     let user_schema = validation.remove("userSchema");
     let server_schema = validation.remove("serverSchema");
+    let channels = match parse_channels(validation.remove("channels"), &state).await {
+        Ok(channels) => channels,
+        Err(message) => return error(StatusCode::BAD_REQUEST, &message),
+    };
+    let _ = channels;
     let Ok(reg) = serde_json::from_value::<HubRegistration>(Value::Object(validation)) else {
         return error(StatusCode::BAD_REQUEST, "invalid template");
     };
@@ -1929,6 +1993,10 @@ async fn register_hub_inherited(
     };
     let user_schema = object.remove("userSchema");
     let server_schema = object.remove("serverSchema");
+    let channels = match parse_channels(object.remove("channels"), &state).await {
+        Ok(channels) => channels,
+        Err(message) => return error(StatusCode::BAD_REQUEST, &message),
+    };
     let reg: HubRegistration = match serde_json::from_value(raw) {
         Ok(v) => v,
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid registration"),
@@ -2025,6 +2093,7 @@ async fn register_hub_inherited(
         schema_ref,
         user_schema,
         server_schema,
+        channels,
         max_hubs,
         stale: false,
     };
@@ -2274,6 +2343,7 @@ async fn import_registry(
                 .map(str::to_owned),
             user_schema: remote.get("userSchema").cloned(),
             server_schema: remote.get("serverSchema").cloned(),
+            channels: None,
             max_hubs: None,
             stale: false,
         };
