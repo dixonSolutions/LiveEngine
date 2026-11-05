@@ -1185,3 +1185,206 @@ async fn recovery_restores_presence_and_frames() {
     a.task.abort();
     b.task.abort();
 }
+
+#[tokio::test]
+async fn identical_frames_from_one_peer_both_cross_the_link() {
+    let (a, b) = pair().await;
+    let (mut alice, w1) = peer(&a, "alice").await;
+    let (mut bob, w2) = peer(&b, "bob").await;
+    sees(&mut alice, &w1, "bob").await;
+    sees(&mut bob, &w2, "alice").await;
+    // seq is client-supplied, so a repeated byte-identical frame is still a new frame.
+    let text =
+        json!({"v":1,"type":"message","channel":"updates","seq":1,"payload":"same"}).to_string();
+    say(&mut alice, Message::Text(text.clone().into())).await;
+    say(&mut alice, Message::Text(text.into())).await;
+    assert_eq!(frames_within(&mut bob, 1000).await.len(), 2);
+    a.task.abort();
+    b.task.abort();
+}
+
+async fn busy_nodes(channels: Option<Value>) -> (Node, Node, Vec<Ws>, Ws) {
+    let a = node_with(
+        "a",
+        &["p1", "p2", "p3", "p4", "svc-b"],
+        channels.clone(),
+        None,
+    )
+    .await;
+    let b = node_with("b", &["bob", "svc-a"], channels, None).await;
+    link(&a, &b, "ab").await;
+    link_status(&a, "ab", "connected").await;
+    let (mut bob, bob_welcome) = peer(&b, "bob").await;
+    let mut senders = vec![];
+    for name in ["p1", "p2", "p3", "p4"] {
+        let (mut ws, welcome) = peer(&a, name).await;
+        sees(&mut ws, &welcome, "bob").await;
+        senders.push(ws);
+    }
+    sees(&mut bob, &bob_welcome, "p4").await;
+    (a, b, senders, bob)
+}
+/// Frames received by `ws` until it is quiet for `quiet_ms`, and whether the link was lost.
+async fn drain(ws: &mut Ws, quiet_ms: u64) -> (usize, bool) {
+    let (mut frames, mut lost) = (0, false);
+    while let Some(v) = wait_for(ws, quiet_ms, |v| {
+        is_frame(v) || (v["type"] == "presence" && v["event"] == "unreachable")
+    })
+    .await
+    {
+        if is_frame(&v) {
+            frames += 1;
+        } else {
+            lost = true;
+        }
+    }
+    (frames, lost)
+}
+
+#[tokio::test]
+async fn a_busy_room_over_one_hundred_frames_a_second_keeps_the_link_up() {
+    let (a, b, senders, mut bob) = busy_nodes(None).await;
+    let mut tasks = vec![];
+    for (n, mut ws) in senders.into_iter().enumerate() {
+        tasks.push(tokio::spawn(async move {
+            // 4 peers x 90 frames over about a second: 360 a second across the link.
+            for seq in 1..=90u64 {
+                say(&mut ws, frame(seq, json!(n))).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            ws
+        }));
+    }
+    let (frames, lost) = drain(&mut bob, 1500).await;
+    assert!(!lost, "the link was dropped");
+    assert_eq!(frames, 360);
+    link_status(&a, "ab", "connected").await;
+    let mut sockets = vec![];
+    for task in tasks {
+        sockets.push(task.await.unwrap());
+    }
+    say(&mut sockets[0], frame(1000, json!("after"))).await;
+    assert!(wait_for(&mut bob, 5000, is_frame).await.is_some());
+    a.task.abort();
+    b.task.abort();
+}
+
+#[tokio::test]
+async fn over_the_link_budget_lossy_frames_are_dropped_and_the_link_stays_up() {
+    std::env::set_var("LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND", "50");
+    let channels = json!({"updates":{"delivery":"lossy"}});
+    let (a, b, senders, mut bob) = busy_nodes(Some(channels)).await;
+    let mut tasks = vec![];
+    for (n, mut ws) in senders.into_iter().enumerate() {
+        tasks.push(tokio::spawn(async move {
+            for seq in 1..=60u64 {
+                say(&mut ws, frame(seq, json!(n))).await;
+            }
+            ws
+        }));
+    }
+    let (frames, lost) = drain(&mut bob, 1500).await;
+    std::env::remove_var("LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND");
+    assert!(!lost, "the link was dropped");
+    assert!(frames > 0 && frames < 240, "{frames}");
+    assert!(counters(&a).await.0 + counters(&b).await.0 > 0);
+    let mut sockets = vec![];
+    for task in tasks {
+        sockets.push(task.await.unwrap());
+    }
+    link_status(&a, "ab", "connected").await;
+    say(&mut sockets[0], frame(1000, json!("after"))).await;
+    assert!(wait_for(&mut bob, 5000, is_frame).await.is_some());
+    a.task.abort();
+    b.task.abort();
+}
+
+/// Wait until a fresh peer on `node` is told about `names`.
+async fn welcome_lists(node: &Node, user: &str, names: &[&str]) {
+    for _ in 0..50 {
+        let (mut ws, welcome) = peer(node, user).await;
+        let _ = ws.close(None).await;
+        if names.iter().all(|n| welcome.iter().any(|p| p == n)) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("{user} never saw {names:?}");
+}
+/// Each of the three peers sends once; the other two hear it exactly once.
+async fn everyone_hears_everyone_once(peers: &mut [(&str, &mut Ws)], round: u64) {
+    for i in 0..peers.len() {
+        let tag = format!("{round}-{}", peers[i].0);
+        say(&mut *peers[i].1, frame(round, json!(tag))).await;
+        for j in 0..peers.len() {
+            if i != j {
+                let got = wait_for(&mut *peers[j].1, 5000, |v| v["payload"] == tag.as_str()).await;
+                assert!(got.is_some(), "{} never heard {tag}", peers[j].0);
+            }
+        }
+        for j in 0..peers.len() {
+            assert!(
+                wait_for(&mut *peers[j].1, 300, is_frame).await.is_none(),
+                "{} got a stray or duplicate frame",
+                peers[j].0
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_ring_survives_losing_one_link_and_recovers_it() {
+    let a = node("a", &["alice", "dave", "svc-c"]).await;
+    let b = node("b", &["bob", "dave", "svc-a"]).await;
+    let c = node("c", &["carol", "dave", "svc-b"]).await;
+    link(&a, &b, "ab").await;
+    link(&b, &c, "bc").await;
+    link(&c, &a, "ca").await;
+    for (n, id) in [(&a, "ab"), (&b, "bc"), (&c, "ca")] {
+        link_status(n, id, "connected").await;
+    }
+    let (mut alice, w1) = peer(&a, "alice").await;
+    let (mut bob, w2) = peer(&b, "bob").await;
+    let (mut carol, w3) = peer(&c, "carol").await;
+    for (ws, w, names) in [
+        (&mut alice, &w1, ["bob", "carol"]),
+        (&mut bob, &w2, ["alice", "carol"]),
+        (&mut carol, &w3, ["alice", "bob"]),
+    ] {
+        for name in names {
+            sees(ws, w, name).await;
+        }
+    }
+    // Kill one link: the other two still connect all three services.
+    unlink(&a, "ab").await;
+    welcome_lists(&a, "dave", &["bob", "carol"]).await;
+    welcome_lists(&b, "dave", &["alice", "carol"]).await;
+    welcome_lists(&c, "dave", &["alice", "bob"]).await;
+    everyone_hears_everyone_once(
+        &mut [
+            ("alice", &mut alice),
+            ("bob", &mut bob),
+            ("carol", &mut carol),
+        ],
+        1,
+    )
+    .await;
+    // Recover it: presence and frames stay correct, with no duplicates.
+    link(&a, &b, "ab").await;
+    link_status(&a, "ab", "connected").await;
+    welcome_lists(&a, "dave", &["bob", "carol"]).await;
+    welcome_lists(&b, "dave", &["alice", "carol"]).await;
+    welcome_lists(&c, "dave", &["alice", "bob"]).await;
+    everyone_hears_everyone_once(
+        &mut [
+            ("alice", &mut alice),
+            ("bob", &mut bob),
+            ("carol", &mut carol),
+        ],
+        2,
+    )
+    .await;
+    for n in [a, b, c] {
+        n.task.abort();
+    }
+}

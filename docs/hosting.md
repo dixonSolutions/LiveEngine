@@ -186,5 +186,5 @@ receiving instance is dropped, and each side enforces its own channel and
 schema rules, so a ring of links delivers each frame once. When a link drops,
 peers known through it get a `presence` event `unreachable`, local peers keep
 working, and presence is resent on reconnect. A link without `localHubId`
-stays a plain connection. `GET /v1/links` reports dropped and rejected frame
+stays a plain connection. Each bridged frame carries a unique `id` stamped by the hub it entered; forwarding hubs keep it and drop repeats. A link socket has its own budget, `LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND` (default 2000) and `LIVEENGINE_LINK_MAX_BYTES_PER_SECOND` (default 16777216); over the message budget lossy frames are dropped and the link stays up. When a link drops, the remaining links are asked to announce presence again, so peers reachable another way reappear. `GET /v1/links` reports dropped and rejected frame
 counts under `frames`.

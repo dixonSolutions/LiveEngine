@@ -454,11 +454,13 @@ async fn connect(state: Arc<Inner>, entry: &Arc<Entry>) -> bool {
             msg = socket.next() => { last_frame = tokio::time::Instant::now(); match msg { Some(Ok(Message::Text(s))) => {
                 if window.elapsed() >= Duration::from_secs(1) { window = tokio::time::Instant::now(); bytes = 0; count = 0; }
                 bytes += s.len(); count += 1;
-                if bytes > 1_048_576 || count > 100 { break; }
+                let (max_count, max_bytes) = if bridge.is_some() { live::link_budget() } else { (100, 1_048_576) };
+                if bytes > max_bytes || (count > max_count && bridge.is_none()) { break; }
+                let over_budget = count > max_count;
                 if let (Some(key), Ok(value)) = (&bridge, serde_json::from_str::<serde_json::Value>(&s)) {
                     // Ordinary room frames are not carried; only the two link frame types are.
                     if !matches!(value["type"].as_str(), Some("link.frame" | "link.presence")) { continue; }
-                    if let Some(state) = weak.upgrade() { live::ingest(&state, key, &name, &value, None).await; }
+                    if let Some(state) = weak.upgrade() { live::ingest(&state, key, &name, &value, None, over_budget).await; }
                 }
             }, Some(Ok(Message::Ping(data))) => { if socket.send(Message::Pong(data)).await.is_err() { break; } }, Some(Ok(Message::Pong(_))) => {}, _ => break } }
         }

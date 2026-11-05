@@ -403,6 +403,7 @@ pub(crate) struct LiveRooms {
     bridges: AsyncMutex<HashMap<RoomKey, Bridge>>,
     recent: Mutex<Recent>,
     next_attach: std::sync::atomic::AtomicU64,
+    next_frame: std::sync::atomic::AtomicU64,
     /// Linked frames dropped as loops or duplicates.
     dropped: std::sync::atomic::AtomicU64,
     /// Linked frames or presence refused by wire, channel or schema rules.
@@ -446,11 +447,10 @@ const MAX_REMOTE_PEERS: usize = 1024;
 const RECENT_FRAMES: usize = 4096;
 const RECENT_WINDOW: Duration = Duration::from_secs(10);
 impl LiveRooms {
-    /// Whether a linked frame was already handled; a ring can deliver one frame along two paths.
-    fn seen(&self, origin: &str, frame: &str) -> bool {
+    /// Whether a linked frame id was already handled; a ring can deliver one frame along two paths.
+    fn seen(&self, id: &str) -> bool {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        origin.hash(&mut hasher);
-        frame.hash(&mut hasher);
+        id.hash(&mut hasher);
         let key = hasher.finish();
         let mut guard = self.recent.lock().unwrap_or_else(|e| e.into_inner());
         let recent = &mut *guard;
@@ -471,6 +471,13 @@ impl LiveRooms {
         }
         recent.order.push_back((now, key));
         false
+    }
+    /// A unique id for a frame entering the links here: instance id plus a per-process counter.
+    fn frame_id(&self, instance: &str) -> String {
+        let n = self
+            .next_frame
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{instance}-{n}")
     }
     fn count(counter: &std::sync::atomic::AtomicU64) {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -502,13 +509,15 @@ fn extended(trace: &[String], instance: &str) -> Vec<String> {
 fn forward(
     live: &LiveRooms,
     bridge: &Bridge,
+    id: &str,
     trace: &[String],
     except: Option<&str>,
     target: Option<&str>,
     frame: &Value,
     lossy: bool,
 ) {
-    let message = text(serde_json::json!({"type":"link.frame","trace":trace,"frame":frame}));
+    let message =
+        text(serde_json::json!({"type":"link.frame","id":id,"trace":trace,"frame":frame}));
     if matches!(&message, Message::Text(t) if t.len() > MAX_WIRE) {
         LiveRooms::count(&live.rejected);
         return;
@@ -611,9 +620,24 @@ async fn attach(
         },
     );
     let trace = [state.instance_id.clone()];
-    let mut messages = vec![wire_presence(&trace, "join", None)];
-    let local = rooms
-        .get(key)
+    // A link this hub dials announces itself first; an inbound link already has.
+    let mut messages = if user.is_none() {
+        vec![wire_presence(&trace, "join", None)]
+    } else {
+        vec![]
+    };
+    messages.extend(snapshot(state, rooms.get(key), bridge, &name));
+    Some((generation, messages))
+}
+/// The peers to announce to link `name`: local peers and those known through other links.
+fn snapshot(
+    state: &Inner,
+    room: Option<&HashMap<String, PeerQueue>>,
+    bridge: &Bridge,
+    name: &str,
+) -> Vec<Message> {
+    let trace = [state.instance_id.clone()];
+    let local = room
         .into_iter()
         .flatten()
         .filter(|(peer, queue)| !queue.service && !bridge.is_link_user(peer))
@@ -621,14 +645,22 @@ async fn attach(
     let remote = bridge
         .remote
         .iter()
-        .filter(|(_, via)| **via != name)
+        .filter(|(_, via)| *via != name)
         .map(|(peer, _)| peer);
-    messages.extend(
-        local
-            .chain(remote)
-            .map(|peer| wire_presence(&trace, "join", Some(peer))),
-    );
-    Some((generation, messages))
+    local
+        .chain(remote)
+        .map(|peer| wire_presence(&trace, "join", Some(peer)))
+        .collect()
+}
+/// Queue messages with backpressure, off the lock; a snapshot can exceed the queue.
+fn spawn_send(sender: mpsc::Sender<Message>, messages: Vec<Message>) {
+    tokio::spawn(async move {
+        for message in messages {
+            if sender.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
 }
 /// Remove a link; peers known only through it become unreachable.
 pub(crate) async fn detach_link(state: &Arc<Inner>, key: &RoomKey, name: &str, generation: u64) {
@@ -660,6 +692,10 @@ pub(crate) async fn detach_link(state: &Arc<Inner>, key: &RoomKey, name: &str, g
             false,
         );
     }
+    if !lost.is_empty() {
+        // Ask the remaining links to announce again: a peer may be reachable another way.
+        bridge.offer(None, &wire_presence(&trace, "join", None), false);
+    }
     if bridge.links.is_empty() && bridge.remote.is_empty() {
         bridges.remove(key);
     }
@@ -675,23 +711,25 @@ async fn link_policy(
 }
 /// Handle a `link.frame` or `link.presence` received from the link `via`.
 /// Returns false for any other type. `policy` carries the receiving socket's channel rules;
-/// without it the local hub's own rules apply.
+/// without it the local hub's own rules apply. Over the link budget, lossy frames are dropped.
 pub(crate) async fn ingest(
     state: &Arc<Inner>,
     key: &RoomKey,
     via: &str,
     wire: &Value,
     policy: Option<(&Option<HashMap<String, LiveChannel>>, &Validators)>,
+    over_budget: bool,
 ) -> bool {
     match wire.get("type").and_then(Value::as_str) {
         Some("link.frame") => {
             match policy {
                 Some((channels, validators)) => {
-                    ingest_frame(state, key, via, wire, channels, validators).await
+                    ingest_frame(state, key, via, wire, channels, validators, over_budget).await
                 }
                 None => {
                     if let Some((channels, validators)) = link_policy(state, key).await {
-                        ingest_frame(state, key, via, wire, &channels, &validators).await;
+                        ingest_frame(state, key, via, wire, &channels, &validators, over_budget)
+                            .await;
                     } else {
                         LiveRooms::count(&state.live_rooms.rejected);
                     }
@@ -713,6 +751,7 @@ async fn ingest_frame(
     wire: &Value,
     channels: &Option<HashMap<String, LiveChannel>>,
     validators: &Validators,
+    over_budget: bool,
 ) {
     let live = &state.live_rooms;
     let Some(trace) = parse_trace(wire) else {
@@ -758,8 +797,18 @@ async fn ingest_frame(
             return LiveRooms::count(&live.rejected);
         }
     }
+    let Some(id) = wire
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_graphic()))
+    else {
+        return LiveRooms::count(&live.rejected);
+    };
+    if lossy && over_budget {
+        return LiveRooms::count(&live.dropped);
+    }
     let serialized = wire["frame"].to_string();
-    if live.seen(trace.first().map_or("", String::as_str), &serialized) {
+    if live.seen(id) {
         return LiveRooms::count(&live.dropped);
     }
     let trace = extended(&trace, &state.instance_id);
@@ -781,6 +830,7 @@ async fn ingest_frame(
                 forward(
                     live,
                     bridge,
+                    id,
                     &trace,
                     Some(via),
                     Some(to),
@@ -795,7 +845,16 @@ async fn ingest_frame(
                     queue.send(message.clone(), lossy);
                 }
             }
-            forward(live, bridge, &trace, Some(via), None, &wire["frame"], lossy);
+            forward(
+                live,
+                bridge,
+                id,
+                &trace,
+                Some(via),
+                None,
+                &wire["frame"],
+                lossy,
+            );
         }
     }
 }
@@ -809,9 +868,9 @@ async fn ingest_presence(state: &Arc<Inner>, key: &RoomKey, via: &str, wire: &Va
     }
     let event = wire.get("event").and_then(Value::as_str);
     let peer = match wire.get("peer") {
-        // A join without a peer only announces the link itself.
-        None => return,
-        Some(Value::String(peer)) if !peer.is_empty() && peer.len() <= 256 => peer.as_str(),
+        // A join without a peer announces the link and asks for the current presence.
+        None => None,
+        Some(Value::String(peer)) if !peer.is_empty() && peer.len() <= 256 => Some(peer.as_str()),
         _ => return LiveRooms::count(&live.rejected),
     };
     let Some(event @ ("join" | "leave" | "unreachable")) = event else {
@@ -820,6 +879,13 @@ async fn ingest_presence(state: &Arc<Inner>, key: &RoomKey, via: &str, wire: &Va
     let rooms = live.rooms.lock().await;
     let mut bridges = live.bridges.lock().await;
     let Some(bridge) = bridges.get_mut(key).filter(|b| b.links.contains_key(via)) else {
+        return;
+    };
+    let Some(peer) = peer else {
+        if event == "join" {
+            let messages = snapshot(state, rooms.get(key), bridge, via);
+            spawn_send(bridge.links[via].queue.sender.clone(), messages);
+        }
         return;
     };
     if event == "join" {
@@ -838,6 +904,11 @@ async fn ingest_presence(state: &Arc<Inner>, key: &RoomKey, via: &str, wire: &Va
     notify_local(rooms.get(key), bridge, &local_presence(event, peer));
     let trace = extended(&trace, &state.instance_id);
     bridge.offer(Some(via), &wire_presence(&trace, event, Some(peer)), false);
+    if event == "unreachable" {
+        // The peer may still be reachable through another link: ask them to announce again.
+        let hello = wire_presence(&[state.instance_id.clone()], "join", None);
+        bridge.offer(Some(via), &hello, false);
+    }
 }
 
 pub(crate) async fn live_socket(
@@ -893,6 +964,14 @@ impl Drop for ConnectionPermit {
             .connections
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// Messages and bytes per second a link socket may carry.
+pub(crate) fn link_budget() -> (usize, usize) {
+    (
+        limit("LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND", 2000),
+        limit("LIVEENGINE_LINK_MAX_BYTES_PER_SECOND", 16_777_216),
+    )
 }
 
 fn limit(name: &str, default: usize) -> usize {
@@ -1160,9 +1239,18 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
         }
         messages += 1;
         bytes = bytes.saturating_add(text.len());
-        if messages > limit("LIVEENGINE_LIVE_MESSAGES_PER_SECOND", 100)
-            || bytes > limit("LIVEENGINE_LIVE_BYTES_PER_SECOND", 1_048_576)
-        {
+        // A link has its own, higher budget; over it, lossy frames are dropped, not the link.
+        let linked = attached.is_some();
+        let (max_messages, max_bytes) = if linked {
+            link_budget()
+        } else {
+            (
+                limit("LIVEENGINE_LIVE_MESSAGES_PER_SECOND", 100),
+                limit("LIVEENGINE_LIVE_BYTES_PER_SECOND", 1_048_576),
+            )
+        };
+        let over_budget = messages > max_messages;
+        if bytes > max_bytes || (over_budget && !linked) {
             break;
         }
         let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
@@ -1196,13 +1284,13 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
                     .and_then(|room| room.get(&user))
                     .map(|queue| queue.sender.clone());
                 if let Some(sender) = sender {
-                    tokio::spawn(async move {
-                        for message in snapshot {
-                            if sender.send(message).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
+                    spawn_send(sender, snapshot);
+                }
+                // The first hello is answered by the snapshot just queued.
+                if object.get("peer").is_none()
+                    && object.get("type") == Some(&Value::from("link.presence"))
+                {
+                    continue;
                 }
             }
             if !ingest(
@@ -1211,6 +1299,7 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
                 &link_name,
                 &value,
                 Some((&channels, &validators)),
+                over_budget,
             )
             .await
             {
@@ -1254,6 +1343,7 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
                 forward(
                     &state.live_rooms,
                     bridge,
+                    &state.live_rooms.frame_id(&state.instance_id),
                     &trace,
                     None,
                     Some(target),
@@ -1307,6 +1397,7 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
                 forward(
                     &state.live_rooms,
                     bridge,
+                    &state.live_rooms.frame_id(&state.instance_id),
                     &trace,
                     None,
                     target.as_deref(),
