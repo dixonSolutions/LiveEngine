@@ -78,6 +78,8 @@ pub struct HubConfig {
     pub max_hubs: usize,
     pub max_depth: usize,
     pub instance_id: Option<String>,
+    /// Optional durable registry snapshot path.
+    pub state_file: Option<std::path::PathBuf>,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     pub max_args: usize,
@@ -102,6 +104,7 @@ impl Default for HubConfig {
             max_hubs: 256,
             max_depth: 8,
             instance_id: None,
+            state_file: None,
             max_request_bytes: 1024 * 1024,
             max_response_bytes: 4 * 1024 * 1024,
             max_args: 256,
@@ -138,7 +141,12 @@ impl HubConfig {
             ..Self::default()
         };
         config.max_depth = env_limit("LIVEENGINE_MAX_DEPTH", config.max_depth)?;
-        config.instance_id = Some(instance_id_from_env()?);
+        config.state_file = std::env::var_os("LIVEENGINE_STATE_FILE").map(Into::into);
+        config.instance_id = if config.state_file.is_some() {
+            std::env::var("LIVEENGINE_INSTANCE_ID").ok()
+        } else {
+            Some(instance_id_from_env()?)
+        };
         config.max_hubs = env_limit("LIVEENGINE_MAX_HUBS", config.max_hubs)?;
         config.max_request_bytes =
             env_limit("LIVEENGINE_MAX_BODY_BYTES", config.max_request_bytes)?;
@@ -284,7 +292,7 @@ pub enum HubMode {
     Central,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HubInfo {
     pub id: String,
@@ -305,6 +313,8 @@ pub struct HubInfo {
     pub server_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_hubs: Option<usize>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -315,13 +325,15 @@ struct CallRequest {
     args: Vec<Value>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ImportRegistryRequest {
     address: String,
     token: String,
     #[serde(default)]
     prefix: Option<String>,
+    #[serde(default)]
+    refresh_seconds: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -331,6 +343,7 @@ struct HubRecord {
     handler: Option<Arc<Mutex<Box<dyn HubHandler>>>>,
     remote_token: Option<String>,
     child: Option<Arc<Inner>>,
+    custom: bool,
     _slot: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
@@ -360,6 +373,9 @@ struct Inner {
     global_max_hubs: usize,
     instance_id: String,
     inherited: [Option<Value>; 3],
+    imports: Arc<RwLock<Vec<ImportRegistryRequest>>>,
+    persistence_lock: Arc<tokio::sync::Mutex<()>>,
+    root: bool,
 }
 
 /// Cloneable state for a hosted hub registry.
@@ -383,7 +399,12 @@ impl HubService {
             .instance_id
             .clone()
             .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
-        Ok(Self {
+        let snapshot = load_snapshot(config.state_file.as_deref())?;
+        let instance_id = snapshot
+            .as_ref()
+            .map(|s| s.instance_id.clone())
+            .unwrap_or(instance_id);
+        let service = Self {
             inner: Arc::new(Inner {
                 config,
                 hubs: RwLock::new(HashMap::new()),
@@ -401,8 +422,20 @@ impl HubService {
                 hub_slots,
                 instance_id,
                 inherited: [None, None, None],
+                imports: Arc::new(RwLock::new(Vec::new())),
+                persistence_lock: Arc::new(tokio::sync::Mutex::new(())),
+                root: true,
             }),
-        })
+        };
+        if let Some(snapshot) = snapshot {
+            restore_snapshot(&service.inner, snapshot)?;
+        }
+        Ok(service)
+    }
+
+    /// Create or verify the initial durable snapshot before accepting requests.
+    pub async fn initialize_state(&self) -> Result<(), String> {
+        persist(&self.inner).await
     }
 
     /// Router for embedding in another Axum application. It owns routes rooted
@@ -430,6 +463,10 @@ impl HubService {
             .route("/v1/registry/export", get(export_registry))
             .layer(axum::extract::DefaultBodyLimit::max(
                 self.inner.config.max_request_bytes,
+            ))
+            .route_layer(middleware::from_fn_with_state(
+                self.inner.clone(),
+                persist_request,
             ))
             .route_layer(middleware::from_fn_with_state(
                 self.inner.clone(),
@@ -475,6 +512,7 @@ impl HubService {
             user_schema: None,
             server_schema: None,
             max_hubs: None,
+            stale: false,
         };
         let mut record = HubRecord {
             info: info.clone(),
@@ -482,11 +520,19 @@ impl HubService {
             handler: Some(Arc::new(Mutex::new(Box::new(handler)))),
             remote_token: None,
             child: None,
+            custom: true,
             _slot: None,
         };
         let mut hubs = self.inner.hubs.write().await;
         expire_hubs(&mut hubs);
-        if hubs.contains_key(&registration.id) {
+        if let Some(existing) = hubs.get_mut(&registration.id) {
+            if existing.custom && existing.handler.is_none() {
+                existing.handler = record.handler;
+                let restored = existing.info.clone();
+                drop(hubs);
+                persist(&self.inner).await?;
+                return Ok(restored);
+            }
             return Err("hub id already registered".into());
         }
         if hubs.len() >= self.inner.config.max_hubs {
@@ -500,8 +546,284 @@ impl HubService {
                 .map_err(|_| "hub registry is full")?,
         ));
         hubs.insert(registration.id, record);
+        drop(hubs);
+        persist(&self.inner).await?;
         Ok(info)
     }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Snapshot {
+    version: u8,
+    instance_id: String,
+    schemas: HashMap<String, Value>,
+    templates: HashMap<String, Value>,
+    imports: Vec<ImportRegistryRequest>,
+    hubs: Vec<SavedHub>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedHub {
+    info: HubInfo,
+    remote_token: Option<String>,
+    expires_at: Option<u64>,
+    children: Vec<SavedHub>,
+    #[serde(default)]
+    custom: bool,
+}
+
+fn load_snapshot(path: Option<&std::path::Path>) -> Result<Option<Snapshot>, String> {
+    let Some(path) = path else { return Ok(None) };
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("cannot open state file".into()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file
+            .metadata()
+            .map_err(|_| "cannot inspect state file")?
+            .permissions()
+            .mode()
+            & 0o077
+            != 0
+        {
+            return Err("state file must not be group- or world-accessible".into());
+        }
+    }
+    let snapshot: Snapshot = serde_json::from_reader(file).map_err(|_| "invalid state file")?;
+    if snapshot.version != 1 || !valid_trace_id(&snapshot.instance_id) {
+        return Err("invalid state file".into());
+    }
+    Ok(Some(snapshot))
+}
+
+fn restore_snapshot(state: &Arc<Inner>, snapshot: Snapshot) -> Result<(), String> {
+    if snapshot.schemas.len() > state.config.max_hubs
+        || snapshot.templates.len() > state.config.max_hubs
+        || snapshot.imports.len() > state.config.max_hubs
+    {
+        return Err("state file exceeds registry limits".into());
+    }
+    for schema in snapshot.schemas.values() {
+        compile_schema(schema).map_err(|_| "invalid state file schema")?;
+    }
+    if snapshot.schemas.get("liveengine.default@1") != Some(&serde_json::json!({"type":"object"})) {
+        return Err("invalid state file schemas".into());
+    }
+    for import in &snapshot.imports {
+        validated_remote_url(state, &import.address).map_err(|_| "invalid state file import")?;
+        if import.token.len() < 24 || import.refresh_seconds.is_none_or(|s| s == 0 || s > 86400) {
+            return Err("invalid state file import".into());
+        }
+    }
+    *state
+        .schemas
+        .try_write()
+        .map_err(|_| "state initialization failed")? = snapshot.schemas;
+    *state
+        .templates
+        .try_write()
+        .map_err(|_| "state initialization failed")? = snapshot.templates;
+    *state
+        .imports
+        .try_write()
+        .map_err(|_| "state initialization failed")? = snapshot.imports;
+    restore_hubs(state, snapshot.hubs, 0)
+}
+fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Result<(), String> {
+    if depth > state.config.max_depth || saved.len() > state.config.max_hubs {
+        return Err("state file exceeds hub limits".into());
+    }
+    let mut hubs = state
+        .hubs
+        .try_write()
+        .map_err(|_| "state initialization failed")?;
+    for saved in saved {
+        let info = saved.info;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "invalid clock")?
+            .as_secs();
+        if saved.expires_at.is_some_and(|t| t <= now) {
+            continue;
+        }
+        let reg = HubRegistration {
+            id: info.id.clone(),
+            mode: info.mode,
+            address: info.address.clone(),
+            remote_token: saved.remote_token.clone(),
+            remote_hub_id: if info.mode != HubMode::External {
+                None
+            } else {
+                Some(info.remote_hub_id.clone())
+            },
+            scopes: info.scopes.clone(),
+            scope_schema: info.scope_schema.clone(),
+            ttl_seconds: None,
+        };
+        validate_registration(state, &reg).map_err(|_| "invalid state file hub")?;
+        let child = if info.mode == HubMode::Central && info.address.is_none() {
+            let mut config = state.config.clone();
+            config.state_file = None;
+            config.max_hubs = info.max_hubs.unwrap_or(state.global_max_hubs);
+            let service = HubService::new(config)?;
+            let mut inner =
+                Arc::try_unwrap(service.inner).map_err(|_| "state initialization failed")?;
+            inner.root = false;
+            inner.global_max_hubs = state.global_max_hubs;
+            inner.hub_slots = state.hub_slots.clone();
+            inner.schemas = state.schemas.clone();
+            inner.templates = state.templates.clone();
+            inner.imports = state.imports.clone();
+            inner.persistence_lock = state.persistence_lock.clone();
+            inner.inflight_calls = state.inflight_calls.clone();
+            inner.instance_id = state.instance_id.clone();
+            let schemas = state
+                .schemas
+                .try_read()
+                .map_err(|_| "state initialization failed")?;
+            inner.inherited = [
+                info.schema_ref
+                    .as_ref()
+                    .and_then(|key| schemas.get(key).cloned())
+                    .or(info.scope_schema.clone())
+                    .or(state.inherited[0].clone()),
+                info.user_schema.clone().or(state.inherited[1].clone()),
+                info.server_schema.clone().or(state.inherited[2].clone()),
+            ];
+            drop(schemas);
+            let child = Arc::new(inner);
+            restore_hubs(&child, saved.children, depth + 1)?;
+            Some(child)
+        } else {
+            if !saved.children.is_empty() {
+                return Err("invalid state file tree".into());
+            }
+            None
+        };
+        let slot = state
+            .hub_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "state file exceeds global hub limit")?;
+        let record = HubRecord {
+            handler: if info.mode == HubMode::Internal && !saved.custom {
+                Some(Arc::new(Mutex::new(Box::new(Engine::new(
+                    state.config.seed,
+                )))))
+            } else {
+                None
+            },
+            expires_at: saved
+                .expires_at
+                .map(|t| Instant::now() + Duration::from_secs(t - now)),
+            remote_token: saved.remote_token,
+            custom: saved.custom,
+            child,
+            _slot: Some(Arc::new(slot)),
+            info,
+        };
+        if hubs.insert(record.info.id.clone(), record).is_some() {
+            return Err("duplicate hub in state file".into());
+        }
+    }
+    Ok(())
+}
+fn snapshot_hubs(
+    state: &Inner,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<SavedHub>> + Send + '_>> {
+    Box::pin(async move {
+        let records: Vec<_> = state.hubs.read().await.values().cloned().collect();
+        let mut saved = Vec::new();
+        for record in records {
+            let remaining = record
+                .expires_at
+                .map(|t| t.saturating_duration_since(Instant::now()));
+            if remaining.is_some_and(|d| d.is_zero()) {
+                continue;
+            }
+            let expires_at = remaining.map(|d| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_add(d.as_secs().max(1))
+            });
+            let children = match record.child {
+                Some(child) => snapshot_hubs(&child).await,
+                None => Vec::new(),
+            };
+            saved.push(SavedHub {
+                info: record.info,
+                remote_token: record.remote_token,
+                expires_at,
+                children,
+                custom: record.custom,
+            });
+        }
+        saved
+    })
+}
+async fn persist(state: &Inner) -> Result<(), String> {
+    let Some(path) = &state.config.state_file else {
+        return Ok(());
+    };
+    let _guard = state.persistence_lock.lock().await;
+    let snapshot = Snapshot {
+        version: 1,
+        instance_id: state.instance_id.clone(),
+        schemas: state.schemas.read().await.clone(),
+        templates: state.templates.read().await.clone(),
+        imports: state.imports.read().await.clone(),
+        hubs: snapshot_hubs(state).await,
+    };
+    let bytes = serde_json::to_vec(&snapshot).map_err(|_| "cannot encode state file")?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let temp = parent.join(format!(".liveengine-{:032x}.tmp", rand::random::<u128>()));
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+        return Err("cannot persist state file".into());
+    }
+    Ok(())
+}
+async fn persist_request(
+    State(state): State<Arc<Inner>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let mutation = request.method() == axum::http::Method::POST
+        || request.method() == axum::http::Method::DELETE;
+    let response = next.run(request).await;
+    if mutation && response.status().is_success() && persist(&state).await.is_err() {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot persist state file",
+        );
+    }
+    response
 }
 
 fn start_reaper(state: &Arc<Inner>) {
@@ -509,10 +831,43 @@ fn start_reaper(state: &Arc<Inner>) {
         if !state.reaper_started.swap(true, Ordering::AcqRel) {
             let weak = Arc::downgrade(state);
             runtime.spawn(async move {
+                let mut last_refresh: HashMap<(String, Option<String>), Instant> = HashMap::new();
                 loop {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     let Some(state) = weak.upgrade() else { break };
-                    expire_hubs(&mut *state.hubs.write().await);
+                    let expired = {
+                        let mut hubs = state.hubs.write().await;
+                        let before = hubs.len();
+                        expire_hubs(&mut hubs);
+                        before != hubs.len()
+                    };
+                    if expired {
+                        let _ = persist(&state).await;
+                    }
+                    let imports = if state.root {
+                        state.imports.read().await.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    for request in imports {
+                        let key = (request.address.clone(), request.prefix.clone());
+                        let interval =
+                            Duration::from_secs(request.refresh_seconds.unwrap_or(86400));
+                        if last_refresh
+                            .get(&key)
+                            .is_none_or(|last| last.elapsed() >= interval)
+                        {
+                            last_refresh.insert(key, Instant::now());
+                            let result = tokio::time::timeout(
+                                state.config.request_timeout,
+                                import_registry(State(state.clone()), Ok(Json(request))),
+                            )
+                            .await;
+                            if result.is_ok_and(|response| response.status().is_success()) {
+                                let _ = persist(&state).await;
+                            }
+                        }
+                    }
                 }
             });
         }
@@ -1419,10 +1774,12 @@ async fn register_hub_inherited(
         user_schema,
         server_schema,
         max_hubs,
+        stale: false,
     };
     let child = if reg.mode == HubMode::Central && info.address.is_none() {
         let mut config = state.config.clone();
         config.max_hubs = max_hubs.unwrap_or(state.global_max_hubs);
+        config.state_file = None;
         let service = match HubService::new(config) {
             Ok(service) => service,
             Err(_) => {
@@ -1438,6 +1795,9 @@ async fn register_hub_inherited(
         inner.templates = state.templates.clone();
         inner.schemas = state.schemas.clone();
         inner.inflight_calls = state.inflight_calls.clone();
+        inner.root = false;
+        inner.imports = state.imports.clone();
+        inner.persistence_lock = state.persistence_lock.clone();
         inner.instance_id = state.instance_id.clone();
         inner.inherited = merge_schemas(&state, &info, &[None, None, None]).await;
         let child = Arc::new(inner);
@@ -1457,6 +1817,7 @@ async fn register_hub_inherited(
             None
         },
         remote_token: reg.remote_token,
+        custom: false,
         child,
         _slot: None,
     };
@@ -1502,7 +1863,20 @@ async fn import_registry(
     if request.token.len() < 24 {
         return error(StatusCode::BAD_REQUEST, "token must be at least 24 bytes");
     }
-    let prefix = request.prefix.unwrap_or_default();
+    if request.refresh_seconds.is_some_and(|s| s == 0 || s > 86400) {
+        return error(StatusCode::BAD_REQUEST, "invalid refreshSeconds");
+    }
+    if request.refresh_seconds.is_some() {
+        let imports = state.imports.read().await;
+        if imports.len() >= state.config.max_hubs
+            && !imports
+                .iter()
+                .any(|i| i.address == request.address && i.prefix == request.prefix)
+        {
+            return error(StatusCode::INSUFFICIENT_STORAGE, "import registry is full");
+        }
+    }
+    let prefix = request.prefix.clone().unwrap_or_default();
     if prefix.len() > 64
         || !prefix
             .bytes()
@@ -1647,6 +2021,7 @@ async fn import_registry(
             user_schema: remote.get("userSchema").cloned(),
             server_schema: remote.get("serverSchema").cloned(),
             max_hubs: None,
+            stale: false,
         };
         if info
             .schema_ref
@@ -1674,13 +2049,13 @@ async fn import_registry(
             handler: None,
             remote_token: Some(request.token.clone()),
             child: None,
+            custom: false,
             _slot: None,
         });
     }
-    let (existing_infos, new_ids) = {
+    let new_ids = {
         let mut hubs = state.hubs.write().await;
         expire_hubs(&mut hubs);
-        let mut existing_infos = Vec::new();
         let mut new_ids = Vec::new();
         for candidate in &candidates {
             if let Some(existing) = hubs.get(&candidate.info.id) {
@@ -1693,7 +2068,6 @@ async fn import_registry(
                         "import id is already mapped to another target",
                     );
                 }
-                existing_infos.push(existing.info.clone());
             } else {
                 new_ids.push(candidate.info.id.clone());
             }
@@ -1701,7 +2075,7 @@ async fn import_registry(
         if hubs.len().saturating_add(new_ids.len()) > state.config.max_hubs {
             return error(StatusCode::INSUFFICIENT_STORAGE, "hub registry is full");
         }
-        (existing_infos, new_ids)
+        new_ids
     };
     for candidate in candidates.iter().filter(|c| new_ids.contains(&c.info.id)) {
         if let Err(e) = remote_handshake(
@@ -1762,11 +2136,16 @@ async fn import_registry(
         }
     }
     schemas.extend(imported_schemas);
-    let mut imported = existing_infos;
-    for mut entry in candidates
-        .into_iter()
-        .filter(|c| new_ids.contains(&c.info.id))
-    {
+    let mut imported = Vec::new();
+    for mut entry in candidates {
+        if !new_ids.contains(&entry.info.id) {
+            if let Some(existing) = hubs.get_mut(&entry.info.id) {
+                existing.info = entry.info.clone();
+                imported.push(entry.info);
+                continue;
+            }
+            return error(StatusCode::CONFLICT, "import target changed concurrently");
+        }
         if hubs.contains_key(&entry.info.id) {
             return error(
                 StatusCode::CONFLICT,
@@ -1776,6 +2155,32 @@ async fn import_registry(
         entry._slot = slots.pop();
         imported.push(entry.info.clone());
         hubs.insert(entry.info.id.clone(), entry);
+    }
+    for candidate in &mut imported {
+        candidate.stale = false;
+    }
+    for candidate in &imported {
+        if let Some(entry) = hubs.get_mut(&candidate.id) {
+            entry.info.stale = false;
+        }
+    }
+    for entry in hubs.values_mut() {
+        if entry.info.address.as_deref() == Some(&request.address)
+            && entry.remote_token.as_deref() == Some(&request.token)
+            && entry.info.id == format!("{}{}", prefix, entry.info.remote_hub_id)
+        {
+            entry.info.stale = !discovered_ids.contains(&entry.info.id);
+        }
+    }
+    drop(hubs);
+    drop(schemas);
+    if request.refresh_seconds.is_some() {
+        let mut imports = state.imports.write().await;
+        imports.retain(|i| !(i.address == request.address && i.prefix == request.prefix));
+        if imports.len() >= state.config.max_hubs {
+            return error(StatusCode::INSUFFICIENT_STORAGE, "import registry is full");
+        }
+        imports.push(request);
     }
     imported.sort_by(|a, b| a.id.cmp(&b.id));
     Json(serde_json::json!({"hubs": imported})).into_response()
@@ -1853,6 +2258,12 @@ async fn call_hub_inherited(
     let Some(record) = record else {
         return error(StatusCode::NOT_FOUND, "hub not found");
     };
+    if record.custom && record.handler.is_none() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "custom hub handler is unavailable",
+        );
+    }
     let schemas = merge_schemas(&state, &record.info, &inherited).await;
     if let Err(message) = enforce_schemas(&schemas, &call) {
         return error(StatusCode::BAD_REQUEST, &message);

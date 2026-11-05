@@ -242,6 +242,10 @@
           "type": "integer",
           "minimum": 1,
           "description": "Maximum immediate children of a local central hub."
+        },
+        "stale": {
+          "type": "boolean",
+          "description": "True when a refreshed registry no longer lists this imported hub."
         }
       }
     },
@@ -293,6 +297,11 @@
         "prefix": {
           "type": "string",
           "pattern": "^[A-Za-z0-9_.-]*$"
+        },
+        "refreshSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
         }
       }
     },

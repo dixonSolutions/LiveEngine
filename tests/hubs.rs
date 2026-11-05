@@ -585,3 +585,296 @@ async fn ping_endpoint_is_unauthenticated_and_native_ping_reports_stats() {
     assert!(stats.max_ms >= stats.avg_ms);
     assert!(stats.server_time_ms.is_some());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn durable_registry_restart_and_invalid_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!(
+        "liveengine-durable-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("state.json");
+    let cfg = HubConfig {
+        state_file: Some(path.clone()),
+        ..config()
+    };
+    let service = HubService::new(cfg.clone()).unwrap();
+    service.initialize_state().await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, service.router()).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let post = |uri: &str, body: Value| {
+        client
+            .post(format!("{base}{uri}"))
+            .bearer_auth(TOKEN)
+            .json(&body)
+            .send()
+    };
+    assert_eq!(
+        post(
+            "/v1/schemas",
+            json!({"id":"saved","version":"1","schema":{"type":"object"}})
+        )
+        .await
+        .unwrap()
+        .status(),
+        201
+    );
+    assert_eq!(
+        post("/v1/templates", json!({"name":"saved","mode":"internal"}))
+            .await
+            .unwrap()
+            .status(),
+        201
+    );
+    assert_eq!(
+        post("/v1/hubs", json!({"id":"parent","mode":"central"}))
+            .await
+            .unwrap()
+            .status(),
+        201
+    );
+    assert_eq!(post("/v1/route", json!({"path":["parent"],"op":"register","body":{"id":"child","template":"saved","schemaRef":"saved@1"}})).await.unwrap().status(), 201);
+    assert_eq!(post("/v1/route", json!({"path":["parent"],"op":"call","body":{"id":"child","method":"upsertUser","args":[{"id":"transient"}]}})).await.unwrap().status(), 200);
+    task.abort();
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let first_id: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let restored = HubService::new(cfg.clone()).unwrap();
+    restored.initialize_state().await.unwrap();
+    let second_id: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(first_id["instance_id"], second_id["instance_id"]);
+    let app = restored.router();
+    assert_eq!(
+        request(app.clone(), "GET", "/v1/schemas/saved@1", None, true)
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        request(app.clone(), "GET", "/v1/templates/saved", None, true)
+            .await
+            .0,
+        200
+    );
+    let (status, info) = request(
+        app.clone(),
+        "POST",
+        "/v1/route",
+        Some(json!({"path":["parent"],"op":"get","body":{"id":"child"}})),
+        true,
+    )
+    .await;
+    assert_eq!(status, 200, "{info}");
+    let (_, result) = request(app, "POST", "/v1/route", Some(json!({"path":["parent"],"op":"call","body":{"id":"child","method":"getUser","args":["transient"]}})), true).await;
+    assert!(result["result"].is_null(), "{result}");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(HubService::new(cfg.clone()).is_err());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(&path, b"{corrupt").unwrap();
+    assert!(HubService::new(cfg).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"{corrupt");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn refreshed_import_marks_missing_entries_stale_and_persists_credentials_privately() {
+    let remote = HubService::new(HubConfig {
+        token: REMOTE_TOKEN.into(),
+        ..config()
+    })
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let remote_app = remote.router();
+    let task = tokio::spawn(async move { axum::serve(listener, remote_app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    assert_eq!(
+        client
+            .post(format!("{base}/v1/hubs"))
+            .bearer_auth(REMOTE_TOKEN)
+            .json(&json!({"id":"source","mode":"internal"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        201
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "liveengine-refresh-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("state.json");
+    let cfg = HubConfig {
+        state_file: Some(path.clone()),
+        allowed_remote_hosts: vec!["127.0.0.1".into()],
+        ..config()
+    };
+    let importer = HubService::new(cfg.clone()).unwrap();
+    let app = importer.router();
+    let (status, result) = request(
+        app.clone(),
+        "POST",
+        "/v1/registries/import",
+        Some(json!({"address":base,"token":REMOTE_TOKEN,"prefix":"copy-","refreshSeconds":1})),
+        true,
+    )
+    .await;
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(
+        client
+            .delete(format!("{base}/v1/hubs/source"))
+            .bearer_auth(REMOTE_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    let mut stale = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (_, value) = request(app.clone(), "GET", "/v1/hubs/copy-source", None, true).await;
+        if value["stale"] == true {
+            stale = true;
+            break;
+        }
+    }
+    assert!(stale);
+    for uri in [
+        "/v1/hubs",
+        "/v1/hubs/copy-source",
+        "/v1/tree",
+        "/v1/registry/export",
+        "/v1/templates",
+    ] {
+        let (_, value) = request(app.clone(), "GET", uri, None, true).await;
+        assert!(!value.to_string().contains(REMOTE_TOKEN));
+    }
+    drop(app);
+    drop(importer);
+    let restored = HubService::new(cfg).unwrap();
+    let restored_app = restored.router();
+    let (_, value) = request(
+        restored_app.clone(),
+        "GET",
+        "/v1/hubs/copy-source",
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(value["stale"], true);
+    assert_eq!(
+        client
+            .post(format!("{base}/v1/hubs"))
+            .bearer_auth(REMOTE_TOKEN)
+            .json(&json!({"id":"after-restart","mode":"internal"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        201
+    );
+    let mut rediscovered = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (status, _) = request(
+            restored_app.clone(),
+            "GET",
+            "/v1/hubs/copy-after-restart",
+            None,
+            true,
+        )
+        .await;
+        if status == 200 {
+            rediscovered = true;
+            break;
+        }
+    }
+    assert!(
+        rediscovered,
+        "persisted import did not refresh after restart"
+    );
+    drop(restored_app);
+    drop(restored);
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains(REMOTE_TOKEN));
+    task.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn standalone_state_file_environment_and_startup_errors() {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        process::{Command, Stdio},
+        time::Duration,
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "liveengine-env-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("state.json");
+    let start = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_liveengine-hub"));
+        command
+            .env("LIVEENGINE_TOKEN", TOKEN)
+            .env("LIVEENGINE_STATE_FILE", &path)
+            .env("LIVEENGINE_BIND", "127.0.0.1:0")
+            .env_remove("LIVEENGINE_INSTANCE_ID")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        command
+    };
+    let mut child = start().spawn().unwrap();
+    for _ in 0..100 {
+        if path.exists() || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let created = path.exists();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        created,
+        "standalone service did not create LIVEENGINE_STATE_FILE"
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let first: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut child = start().spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(child.try_wait().unwrap().is_none(), "restart failed");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let second: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(first["instance_id"], second["instance_id"]);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let output = start().output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("state file"));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(&path, b"{invalid").unwrap();
+    let output = start().output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid state file"));
+    assert_eq!(std::fs::read(&path).unwrap(), b"{invalid");
+    std::fs::remove_dir_all(dir).unwrap();
+}

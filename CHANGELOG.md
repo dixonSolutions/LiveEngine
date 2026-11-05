@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Persist self-hosted registry definitions and refresh imported registries, marking missing entries stale.
+
 - Add remote and local nested central routing, bounded tree discovery, loop detection, and inherited schemas.
 
 - Add hub templates, idempotent creation, background expiry, and per-central child quotas for hosted hubs.

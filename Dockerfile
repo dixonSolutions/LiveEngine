@@ -10,6 +10,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,targe
 FROM docker.io/library/debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 COPY --from=build /liveengine-hub /usr/local/bin/liveengine-hub
+RUN mkdir /state && chown 65532:65532 /state
 USER 65532:65532
 ENV LIVEENGINE_BIND=0.0.0.0:8787
 EXPOSE 8787

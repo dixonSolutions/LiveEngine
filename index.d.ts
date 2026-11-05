@@ -214,5 +214,5 @@ export declare class HubClient {
   get(id: string): Promise<unknown>;
   remove(id: string): Promise<unknown>;
   call<T = unknown>(id: string, method: string, args?: unknown[], options?: { signal?: AbortSignal }): Promise<T>;
-  importRegistry(registry: { address: string; token: string; prefix?: string }): Promise<unknown>;
+  importRegistry(registry: { address: string; token: string; prefix?: string; refreshSeconds?: number }): Promise<unknown>;
 }

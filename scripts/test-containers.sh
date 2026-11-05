@@ -17,11 +17,26 @@ openssl rand -hex 32 > "$secrets_dir/central-token"
 openssl rand -hex 32 > "$secrets_dir/remote-token"
 { printf 'LIVEENGINE_TOKEN='; cat "$secrets_dir/central-token"; printf 'LIVEENGINE_ALLOWED_REMOTE_HOSTS=remote,custom\n'; } > "$secrets_dir/central.env"
 { printf 'LIVEENGINE_TOKEN='; cat "$secrets_dir/remote-token"; } > "$secrets_dir/remote.env"
+# Use the Compose service limits for the standalone test containers too.
+compose_file="$(dirname "$0")/../compose.yaml"
+compose_limit() {
+  awk -v service="$1" -v key="$2" '
+    /^  [a-zA-Z0-9_-]+:$/ { active = ($1 == service ":") }
+    active && $1 == key ":" { print $2; exit }
+  ' "$compose_file"
+}
+central_memory="$(compose_limit central mem_limit)"
+central_swap="$(compose_limit central memswap_limit)"
+remote_memory="$(compose_limit remote mem_limit)"
+remote_swap="$(compose_limit remote memswap_limit)"
+for limit in "$central_memory" "$central_swap" "$remote_memory" "$remote_swap"; do
+  [[ "$limit" =~ ^[1-9][0-9]*g$ ]] || { printf 'Invalid or missing Compose memory limit: %s\n' "$limit" >&2; exit 1; }
+done
 "$runtime" network create "$run_id" >/dev/null
-"$runtime" run -d --name "$run_id-remote" --network "$run_id" --network-alias remote --env-file "$secrets_dir/remote.env" -p 127.0.0.1::8787 "$image" >/dev/null
-"$runtime" run -d --name "$run_id-central" --network "$run_id" --env-file "$secrets_dir/central.env" -p 127.0.0.1::8787 "$image" >/dev/null
+"$runtime" run -d --memory="$remote_memory" --memory-swap="$remote_swap" --name "$run_id-remote" --network "$run_id" --network-alias remote --env-file "$secrets_dir/remote.env" -p 127.0.0.1::8787 "$image" >/dev/null
+"$runtime" run -d --memory="$central_memory" --memory-swap="$central_swap" --name "$run_id-central" --network "$run_id" --env-file "$secrets_dir/central.env" -p 127.0.0.1::8787 "$image" >/dev/null
 if [ -n "$custom_image" ]; then
-  "$runtime" run -d --name "$run_id-custom" --network "$run_id" --network-alias custom --env-file "$secrets_dir/remote.env" "$custom_image" >/dev/null
+  "$runtime" run -d --memory="$remote_memory" --memory-swap="$remote_swap" --name "$run_id-custom" --network "$run_id" --network-alias custom --env-file "$secrets_dir/remote.env" "$custom_image" >/dev/null
 fi
 central_port="$("$runtime" port "$run_id-central" 8787/tcp | head -1 | awk -F: '{print $NF}')"
 remote_port="$("$runtime" port "$run_id-remote" 8787/tcp | head -1 | awk -F: '{print $NF}')"

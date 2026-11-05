@@ -1,6 +1,6 @@
 # Hub hosting
 
-The `liveengine-hub` process owns its registry and all registered internal engines. An external registration routes to a remote process; removing that registration does not remove its remote hub. Runtime state is in memory and is intentionally not persisted by this version.
+The `liveengine-hub` process owns its registry and all registered internal engines. An external registration routes to a remote process; removing that registration does not remove its remote hub. Live room and player state is in memory; registry definitions can optionally be persisted.
 
 Set `LIVEENGINE_TOKEN` to an unpredictable secret of at least 24 bytes. Internal endpoints and remote endpoints share the `liveengine.hub/v1` protocol. Remote registrations require their own token; registry listing never returns credentials.
 
@@ -66,7 +66,7 @@ For hubs with a `scopeSchema`, user/server upserts are validated before dispatch
 
 Authenticated `POST /v1/schemas` accepts `{ "id": "game", "version": "1", "schema": { "type": "object" } }`. `GET /v1/schemas` lists definitions, and `GET` or `DELETE /v1/schemas/game@1` retrieves or deletes one. Versions are immutable, and deletion fails while a hub references the version. `liveengine.default@1` is built in.
 
-Hub registration accepts `schemaRef` instead of `scopeSchema`; `userSchema` and `serverSchema` optionally override the shared schema for the corresponding upserts. Registry imports transfer schema definitions and reject conflicting versions; `GET /v1/registry/export` includes definitions without credentials. Schema definitions remain in memory.
+Hub registration accepts `schemaRef` instead of `scopeSchema`; `userSchema` and `serverSchema` optionally override the shared schema for the corresponding upserts. Registry imports transfer schema definitions and reject conflicting versions; `GET /v1/registry/export` includes definitions without credentials. Schema definitions are durable when a state file is configured.
 
 ## On-demand hubs
 
@@ -79,4 +79,12 @@ Local central hubs accept `maxHubs` to limit their immediate children, including
 
 Register `mode: "central"` to create a local namespace. Supplying `address` and `remoteToken` makes the central a remote service. `POST /v1/route` accepts `path`, `op` (`get`, `list`, `register`, `delete`, `call`, or `tree`), and `body`; each path element selects a central. Calls use `body.id`, `body.method`, and `body.args`. Empty paths target the current service. `GET /v1/tree?depth=3` recursively lists branches, including an `error` status for unreachable services. Discovery is bounded to 1024 nodes and the configured global hub limit. Flat routes continue to show immediate children.
 
-Schemas are inherited from the nearest central and can be overridden by a child. Remote routing carries inherited schemas to the destination. Each service has a stable identity used in the `x-liveengine-trace` forwarding header; loops return HTTP 508. Set `LIVEENGINE_INSTANCE_ID` to a unique identifier per service. Otherwise the standalone service stores a generated identity under the XDG state directory, keyed by bind address; `LIVEENGINE_INSTANCE_ID_FILE` selects the file explicitly, and `LIVEENGINE_STATE_FILE` selects an adjacent identity file. Embedded `HubService` instances should set `HubConfig.instance_id` when identity must survive restarts.
+Schemas are inherited from the nearest central and can be overridden by a child. Remote routing carries inherited schemas to the destination. Each service has a stable identity used in the `x-liveengine-trace` forwarding header; loops return HTTP 508. Set `LIVEENGINE_INSTANCE_ID` to a unique identifier per service. Otherwise the standalone service stores a generated identity under the XDG state directory, keyed by bind address; `LIVEENGINE_INSTANCE_ID_FILE` selects the file explicitly, and `LIVEENGINE_STATE_FILE` stores the identity in the registry snapshot. Embedded `HubService` instances should set `HubConfig.instance_id` when identity must survive restarts.
+
+## Durable registry
+
+Set `LIVEENGINE_STATE_FILE` to a writable file path to persist hub definitions, nested local centrals, schemas, templates, imports and the instance ID. Snapshots are written atomically and synced to disk. The file contains remote credentials in plaintext: protect its directory and backups. LiveEngine creates the file with mode `0600` and refuses to start if an existing file is group- or world-accessible or corrupt. Live rooms and player state remain in memory and are lost on restart. Embedded custom Rust handlers must be registered again by the host after restart; their restored definitions return unavailable until the handler is reattached. Without a state file, registry definitions remain in memory.
+
+`GET /v1/registry/export` returns hub and schema definitions without credentials. `POST /v1/registries/import` accepts an optional `refreshSeconds` (1–86400); the service periodically re-syncs the source, retains entries no longer present with `stale: true`, and persists the refresh configuration and credential. A failed refresh leaves the previous registry intact.
+
+The Compose example provides three separate services and persistent volumes. After starting it, register `remote` as a remote central on `central`, then register `leaf` as a remote central on `remote` using their respective credentials and service addresses `http://remote:8787` and `http://leaf:8787`. Create child hubs on `leaf` to form a three-tier nest. Each volume contains sensitive credentials and should be secured and backed up accordingly.

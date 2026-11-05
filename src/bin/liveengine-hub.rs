@@ -42,6 +42,7 @@ async fn run_serve() -> Result<(), String> {
         .parse()
         .map_err(|e| format!("invalid LIVEENGINE_BIND: {e}"))?;
     let service = HubService::new(config)?;
+    service.initialize_state().await?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|e| format!("could not bind {bind}: {e}"))?;

@@ -6,6 +6,11 @@ services:
     environment:
       LIVEENGINE_TOKEN: ${LIVEENGINE_TOKEN:?Set a strong token of at least 24 characters}
       LIVEENGINE_ALLOWED_REMOTE_HOSTS: remote
+      LIVEENGINE_STATE_FILE: /state/registry.json
+    volumes:
+      - central-state:/state
+    mem_limit: 1g
+    memswap_limit: 1g
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -16,7 +21,31 @@ services:
       - "127.0.0.1:8788:8787"
     environment:
       LIVEENGINE_TOKEN: ${LIVEENGINE_REMOTE_TOKEN:?Set a separate strong remote token}
+      LIVEENGINE_ALLOWED_REMOTE_HOSTS: leaf
+      LIVEENGINE_STATE_FILE: /state/registry.json
+    volumes:
+      - remote-state:/state
+    mem_limit: 1g
+    memswap_limit: 1g
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
+  leaf:
+    build: .
+    environment:
+      LIVEENGINE_TOKEN: ${LIVEENGINE_LEAF_TOKEN:?Set a separate strong leaf token}
+      LIVEENGINE_STATE_FILE: /state/registry.json
+    volumes:
+      - leaf-state:/state
+    mem_limit: 1g
+    memswap_limit: 1g
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+volumes:
+  central-state:
+  remote-state:
+  leaf-state:
