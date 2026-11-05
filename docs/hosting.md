@@ -106,3 +106,13 @@ origins. Requests without an Origin header are accepted; requests with one must
 match the list. A welcome message lists current peers, and presence messages
 announce joins and leaves. Relay messages contain `v`, `type`, `channel`,
 `seq`, and `payload`, with optional `to`; the server supplies `from`.
+
+The live relay bounds per-connection traffic with `LIVEENGINE_LIVE_MAX_FRAME_BYTES`
+(default 65536), `LIVEENGINE_LIVE_MESSAGES_PER_SECOND` (100),
+`LIVEENGINE_LIVE_BYTES_PER_SECOND` (1048576), and `LIVEENGINE_LIVE_SEND_QUEUE`
+(64 messages). `LIVEENGINE_LIVE_MAX_CONNECTIONS` (4096) and
+`LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM` (256) cap sockets globally and authenticated sockets per room.
+`LIVEENGINE_LIVE_PING_SECONDS` (20), `LIVEENGINE_LIVE_IDLE_SECONDS` (60), and
+`LIVEENGINE_LIVE_RESUME_MILLIS` (500) control liveness and presence. Values must
+be positive integers. A full queue drops lossy messages; reliable delivery
+closes the slow consumer. Reconnection requires a new ticket.

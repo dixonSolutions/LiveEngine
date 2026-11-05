@@ -1,5 +1,8 @@
 //! Short-lived, single-use credentials for live room connections.
-use crate::hub::{error, expire_hubs, forward_route, header_depth, Inner, RouteRequest};
+use crate::hub::{
+    compile_schema, error, expire_hubs, forward_route, header_depth, HubRecord, Inner, LiveChannel,
+    LiveDelivery, RouteRequest,
+};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -293,8 +296,8 @@ struct PeerQueue {
     disconnect: tokio::sync::watch::Sender<bool>,
 }
 impl PeerQueue {
-    fn send(&self, message: Message) {
-        if self.sender.try_send(message).is_err() {
+    fn send(&self, message: Message, lossy: bool) {
+        if self.sender.try_send(message).is_err() && !lossy {
             let _ = self.disconnect.send(true);
         }
     }
@@ -303,6 +306,9 @@ impl PeerQueue {
 #[derive(Default)]
 pub(crate) struct LiveRooms {
     rooms: AsyncMutex<HashMap<RoomKey, HashMap<String, PeerQueue>>>,
+    pending: AsyncMutex<HashMap<(RoomKey, String), u64>>,
+    connections: std::sync::atomic::AtomicUsize,
+    validators: AsyncMutex<HashMap<String, (Value, Arc<jsonschema::Validator>)>>,
 }
 
 pub(crate) async fn live_socket(
@@ -326,9 +332,92 @@ pub(crate) async fn live_socket(
             return error(StatusCode::FORBIDDEN, "origin not allowed");
         }
     }
-    ws.max_message_size(64 * 1024)
-        .max_frame_size(64 * 1024)
-        .on_upgrade(move |socket| serve_socket(state, socket))
+    let live = state.live_rooms.clone();
+    if live
+        .connections
+        .fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |n| (n < limit("LIVEENGINE_LIVE_MAX_CONNECTIONS", 4096)).then_some(n + 1),
+        )
+        .is_err()
+    {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "live connection capacity reached",
+        );
+    }
+    let permit = ConnectionPermit(live);
+    let frame_limit = limit("LIVEENGINE_LIVE_MAX_FRAME_BYTES", 65536);
+    ws.max_message_size(frame_limit)
+        .max_frame_size(frame_limit)
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            serve_socket(state, socket).await
+        })
+}
+
+struct ConnectionPermit(Arc<LiveRooms>);
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0
+            .connections
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn limit(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+        .min(16_777_216)
+}
+
+async fn resolve(
+    state: &Arc<Inner>,
+    path: &[String],
+) -> Option<(HubRecord, Option<HashMap<String, LiveChannel>>)> {
+    let mut current = state.clone();
+    let mut channels = None;
+    for (index, id) in path.iter().enumerate() {
+        let record = current.hubs.read().await.get(id).cloned()?;
+        if record.info.channels.is_some() {
+            channels = record.info.channels.clone();
+        }
+        if index + 1 == path.len() {
+            return Some((record, channels));
+        }
+        current = record.child?;
+    }
+    None
+}
+
+async fn paired(record: &HubRecord, user: &str, room: &str) -> bool {
+    let Some(handler) = record.handler.clone() else {
+        return false;
+    };
+    let user = user.to_owned();
+    let room = room.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let Ok(mut handler) = handler.lock() else {
+            return false;
+        };
+        let Ok(u) = handler.call("getUser", vec![Value::String(user.clone())]) else {
+            return false;
+        };
+        let Ok(r) = handler.call("getServer", vec![Value::String(room.clone())]) else {
+            return false;
+        };
+        u["status"] == "paired"
+            && u["serverId"] == room
+            && r["members"]
+                .as_array()
+                .is_some_and(|m| m.iter().any(|v| v.as_str() == Some(&user)))
+    })
+    .await
+    .unwrap_or(false)
 }
 
 async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
@@ -353,26 +442,69 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
     };
     let key = (claims.hub_path, claims.room);
     let user = claims.user;
-    let (tx, mut rx) = mpsc::channel::<Message>(64);
+    let Some((record, channels)) = resolve(&state, &key.0).await else {
+        return;
+    };
+    if !paired(&record, &user, &key.1).await {
+        return;
+    }
+    let mut validators = HashMap::new();
+    if let Some(channels) = &channels {
+        let schemas = state.schemas.read().await;
+        let mut cache = state.live_rooms.validators.lock().await;
+        cache.retain(|id, _| schemas.contains_key(id));
+        for (name, channel) in channels {
+            if let Some(id) = &channel.schema_ref {
+                let Some(schema) = schemas.get(id) else {
+                    return;
+                };
+                if !cache.get(id).is_some_and(|(saved, _)| saved == schema) {
+                    let Ok(validator) = compile_schema(schema) else {
+                        return;
+                    };
+                    cache.insert(id.clone(), (schema.clone(), Arc::new(validator)));
+                }
+                validators.insert(name.clone(), cache[id].1.clone());
+            }
+        }
+    }
+    let (tx, mut rx) = mpsc::channel::<Message>(limit("LIVEENGINE_LIVE_SEND_QUEUE", 64));
     let (disconnect, mut disconnected) = tokio::sync::watch::channel(false);
     {
         let mut rooms = state.live_rooms.rooms.lock().await;
-        let room = rooms.entry(key.clone()).or_default();
-        if room.contains_key(&user) {
+        if rooms.values().map(HashMap::len).sum::<usize>()
+            >= limit("LIVEENGINE_LIVE_MAX_CONNECTIONS", 4096)
+        {
             return;
         }
-        let peers: Vec<_> = room.keys().cloned().collect();
+        let room = rooms.entry(key.clone()).or_default();
+        if room.contains_key(&user)
+            || room.len() >= limit("LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM", 256)
+        {
+            return;
+        }
+        let mut pending = state.live_rooms.pending.lock().await;
+        let resumed = pending.remove(&(key.clone(), user.clone())).is_some();
+        let mut peers: Vec<_> = room.keys().cloned().collect();
+        peers.extend(
+            pending
+                .keys()
+                .filter(|(k, u)| k == &key && u != &user)
+                .map(|(_, u)| u.clone()),
+        );
         let welcome = serde_json::json!({"type":"welcome","peers":peers}).to_string();
         if tx.try_send(Message::Text(welcome.into())).is_err() {
             return;
         }
-        let joined = Message::Text(
-            serde_json::json!({"type":"presence","event":"join","peer":user})
-                .to_string()
-                .into(),
-        );
-        for queue in room.values() {
-            queue.send(joined.clone());
+        if !resumed {
+            let joined = Message::Text(
+                serde_json::json!({"type":"presence","event":"join","peer":user})
+                    .to_string()
+                    .into(),
+            );
+            for queue in room.values() {
+                queue.send(joined.clone(), false);
+            }
         }
         room.insert(
             user.clone(),
@@ -390,13 +522,47 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
             }
         }
     });
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut last_activity = tokio::time::Instant::now();
+    let mut last_ping = last_activity;
+    let mut window = last_activity;
+    let mut messages = 0usize;
+    let mut bytes = 0usize;
+    let mut channel_rates: HashMap<String, usize> = HashMap::new();
     loop {
         let message = tokio::select! {
             result = stream.next() => match result { Some(Ok(message)) => message, _ => break },
             _ = disconnected.changed() => break,
             _ = &mut writer => break,
+            _ = tick.tick() => {
+                if last_activity.elapsed() >= Duration::from_secs(limit("LIVEENGINE_LIVE_IDLE_SECONDS", 60) as u64) { break }
+                if !resolve(&state, &key.0).await.is_some_and(|(current, _)| match (&current.handler, &record.handler) { (Some(a), Some(b)) => Arc::ptr_eq(a, b), _ => false }) || !paired(&record, &user, &key.1).await { break }
+                if last_ping.elapsed() >= Duration::from_secs(limit("LIVEENGINE_LIVE_PING_SECONDS", 20) as u64) {
+                    let rooms = state.live_rooms.rooms.lock().await;
+                    if let Some(queue) = rooms.get(&key).and_then(|r| r.get(&user)) { queue.send(Message::Ping(Default::default()), false); }
+                    last_ping = tokio::time::Instant::now();
+                }
+                continue
+            }
         };
+        last_activity = tokio::time::Instant::now();
+        if matches!(message, Message::Pong(_) | Message::Ping(_)) {
+            continue;
+        }
         let Message::Text(text) = message else { break };
+        if window.elapsed() >= Duration::from_secs(1) {
+            window = tokio::time::Instant::now();
+            messages = 0;
+            bytes = 0;
+            channel_rates.clear();
+        }
+        messages += 1;
+        bytes = bytes.saturating_add(text.len());
+        if messages > limit("LIVEENGINE_LIVE_MESSAGES_PER_SECOND", 100)
+            || bytes > limit("LIVEENGINE_LIVE_BYTES_PER_SECOND", 1_048_576)
+        {
+            break;
+        }
         let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
             break;
         };
@@ -415,6 +581,26 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
         {
             break;
         }
+        let channel = object["channel"].as_str().unwrap();
+        let mut lossy = false;
+        if let Some(channels) = &channels {
+            let Some(definition) = channels.get(channel) else {
+                break;
+            };
+            lossy = matches!(definition.delivery, LiveDelivery::Lossy);
+            let count = channel_rates.entry(channel.to_owned()).or_default();
+            *count += 1;
+            // maxRate is a per-peer, per-channel messages-per-second budget.
+            if definition.max_rate.is_some_and(|max| *count > max) {
+                break;
+            }
+        }
+        if validators
+            .get(channel)
+            .is_some_and(|v| !v.is_valid(&object["payload"]))
+        {
+            break;
+        }
         let target = object.get("to").and_then(Value::as_str).map(str::to_owned);
         object.insert("from".into(), Value::String(user.clone()));
         let frame = Message::Text(value.to_string().into());
@@ -422,27 +608,68 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
         if let Some(room) = rooms.get(&key) {
             for (peer, queue) in room {
                 if target.as_ref().map_or(peer != &user, |to| to == peer) {
-                    queue.send(frame.clone());
+                    queue.send(frame.clone(), lossy);
                 }
             }
         }
     }
+    writer.abort();
+    let generation = rand::random::<u64>();
     {
         let mut rooms = state.live_rooms.rooms.lock().await;
         if let Some(room) = rooms.get_mut(&key) {
             room.remove(&user);
+        }
+        state
+            .live_rooms
+            .pending
+            .lock()
+            .await
+            .insert((key.clone(), user.clone()), generation);
+    }
+    let live = state.live_rooms.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(
+            limit("LIVEENGINE_LIVE_RESUME_MILLIS", 500) as u64,
+        ))
+        .await;
+        let mut rooms = live.rooms.lock().await;
+        let mut pending = live.pending.lock().await;
+        if pending.get(&(key.clone(), user.clone())) != Some(&generation) {
+            return;
+        }
+        pending.remove(&(key.clone(), user.clone()));
+        if let Some(room) = rooms.get_mut(&key) {
             let left = Message::Text(
                 serde_json::json!({"type":"presence","event":"leave","peer":user})
                     .to_string()
                     .into(),
             );
             for queue in room.values() {
-                queue.send(left.clone());
+                queue.send(left.clone(), false);
             }
             if room.is_empty() {
                 rooms.remove(&key);
             }
         }
+    });
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    #[test]
+    fn full_queue_drops_lossy_and_disconnects_reliable() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (disconnect, disconnected) = tokio::sync::watch::channel(false);
+        let queue = PeerQueue { sender, disconnect };
+        queue.send(Message::Text("first".into()), false);
+        queue.send(Message::Text("lossy".into()), true);
+        assert!(!*disconnected.borrow());
+        assert_eq!(receiver.try_recv().unwrap(), Message::Text("first".into()));
+        queue.send(Message::Text("first".into()), false);
+        queue.send(Message::Text("reliable".into()), false);
+        assert!(*disconnected.borrow());
     }
-    writer.abort();
 }

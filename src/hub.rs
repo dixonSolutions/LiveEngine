@@ -426,7 +426,7 @@ pub(crate) struct HubRecord {
     expires_at: Option<Instant>,
     pub(crate) handler: Option<Arc<Mutex<Box<dyn HubHandler>>>>,
     pub(crate) remote_token: Option<String>,
-    child: Option<Arc<Inner>>,
+    pub(crate) child: Option<Arc<Inner>>,
     custom: bool,
     _slot: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
@@ -446,7 +446,7 @@ enum HandlerCallError {
 pub(crate) struct Inner {
     pub(crate) config: HubConfig,
     pub(crate) hubs: RwLock<HashMap<String, HubRecord>>,
-    schemas: Arc<RwLock<HashMap<String, Value>>>,
+    pub(crate) schemas: Arc<RwLock<HashMap<String, Value>>>,
     templates: Arc<RwLock<HashMap<String, Value>>>,
     reaper_started: AtomicBool,
     client: Client,
@@ -3038,7 +3038,7 @@ fn validate_registration(state: &Inner, r: &HubRegistration) -> Result<(), Strin
 }
 
 // Reject non-fragment references before compilation, including in nested resources.
-fn compile_schema(schema: &Value) -> Result<jsonschema::Validator, String> {
+pub(crate) fn compile_schema(schema: &Value) -> Result<jsonschema::Validator, String> {
     if serde_json::to_vec(schema).map_or(true, |v| v.len() > 65536) || json_depth(schema, 0) > 32 {
         return Err("schema exceeds size or depth limit".into());
     }

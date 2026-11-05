@@ -251,6 +251,9 @@ mod sockets {
         }
     }
     async fn setup(ttl: u64) -> Fixture {
+        setup_channels(ttl, None).await
+    }
+    async fn setup_channels(ttl: u64, channels: Option<Value>) -> Fixture {
         let service = HubService::new(HubConfig {
             token: TOKEN.into(),
             public_url: Some("ws://localhost/v1/live".into()),
@@ -277,15 +280,27 @@ mod sockets {
             client: reqwest::Client::new(),
             task,
         };
+        if channels.is_some() {
+            assert_eq!(
+                post(
+                    &fixture.client,
+                    &fixture.base,
+                    "/v1/schemas",
+                    json!({"id":"message","version":"1","schema":{"type":"integer"}})
+                )
+                .await
+                .0,
+                201
+            );
+        }
+        let mut registration = json!({"id":"game","mode":"internal"});
+        if let Some(channels) = channels {
+            registration["channels"] = channels;
+        }
         assert_eq!(
-            post(
-                &fixture.client,
-                &fixture.base,
-                "/v1/hubs",
-                json!({"id":"game","mode":"internal"})
-            )
-            .await
-            .0,
+            post(&fixture.client, &fixture.base, "/v1/hubs", registration)
+                .await
+                .0,
             201
         );
         for (method, args) in [
@@ -451,5 +466,207 @@ mod sockets {
             result,
             None | Some(Ok(Message::Close(_))) | Some(Err(_))
         ));
+    }
+    #[tokio::test]
+    async fn channel_schema_undeclared_and_rate_enforced() {
+        let f = setup_channels(
+            60,
+            Some(json!({"valid":{"delivery":"reliable","schemaRef":"message@1","maxRate":1}})),
+        )
+        .await;
+        for (channel, payload, twice) in [
+            ("valid", json!("bad"), false),
+            ("missing", json!(1), false),
+            ("valid", json!(1), true),
+        ] {
+            let mut a = auth(&f, &ticket(&f, "alice").await).await;
+            read(&mut a).await;
+            let frame = json!({"v":1,"type":"data","channel":channel,"seq":1,"payload":payload})
+                .to_string();
+            a.send(Message::Text(frame.clone().into())).await.unwrap();
+            if twice {
+                a.send(Message::Text(frame.into())).await.unwrap();
+            }
+            closed(&mut a).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_hub_inherits_channel_schema() {
+        let f = setup_channels(60, Some(json!({"x":{"delivery":"reliable"}}))).await;
+        assert_eq!(post(&f.client, &f.base, "/v1/hubs", json!({"id":"central","mode":"central","channels":{"inherited":{"delivery":"reliable","schemaRef":"message@1"}}})).await.0, 201);
+        let route = |op: &str, body: Value| json!({"path":["central"],"op":op,"body":body});
+        assert_eq!(
+            post(
+                &f.client,
+                &f.base,
+                "/v1/route",
+                route("register", json!({"id":"child","mode":"internal"}))
+            )
+            .await
+            .0,
+            201
+        );
+        for (method, args) in [
+            ("upsertUser", json!([{"id":"alice"}])),
+            ("upsertServer", json!([{"id":"room"}])),
+            ("join", json!(["alice", "room"])),
+        ] {
+            assert_eq!(
+                post(
+                    &f.client,
+                    &f.base,
+                    "/v1/route",
+                    route("call", json!({"id":"child","method":method,"args":args}))
+                )
+                .await
+                .0,
+                200
+            );
+        }
+        let (status, issued) = post(
+            &f.client,
+            &f.base,
+            "/v1/route",
+            route(
+                "ticket",
+                json!({"id":"child","userId":"alice","serverId":"room"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let mut socket = auth(&f, issued["ticket"].as_str().unwrap()).await;
+        read(&mut socket).await;
+        socket
+            .send(Message::Text(
+                json!({"v":1,"type":"data","channel":"inherited","seq":1,"payload":"invalid"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        closed(&mut socket).await;
+    }
+
+    #[tokio::test]
+    async fn unpair_disconnects_and_resume_keeps_presence() {
+        let f = setup(60).await;
+        let mut a = auth(&f, &ticket(&f, "alice").await).await;
+        read(&mut a).await;
+        let mut b = auth(&f, &ticket(&f, "bob").await).await;
+        read(&mut b).await;
+        read(&mut a).await;
+        a.close(None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut a = auth(&f, &ticket(&f, "alice").await).await;
+        assert_eq!(read(&mut a).await["peers"], json!(["bob"]));
+        assert!(tokio::time::timeout(Duration::from_millis(650), b.next())
+            .await
+            .is_err());
+        assert_eq!(
+            post(
+                &f.client,
+                &f.base,
+                "/v1/hubs/game/call",
+                json!({"method":"leave","args":["alice","room"]})
+            )
+            .await
+            .0,
+            200
+        );
+        closed(&mut a).await;
+        assert_eq!(read(&mut b).await["event"], "leave");
+    }
+    #[tokio::test]
+    async fn oversized_frame_is_rejected() {
+        let f = setup(60).await;
+        let mut a = auth(&f, &ticket(&f, "alice").await).await;
+        read(&mut a).await;
+        let frame = json!({"v":1,"type":"data","channel":"x","seq":1,"payload":"x".repeat(70_000)})
+            .to_string();
+        a.send(Message::Text(frame.into())).await.unwrap();
+        closed(&mut a).await;
+    }
+    #[tokio::test]
+    async fn slow_consumer_reliable_and_lossy() {
+        let Some(delivery) = std::env::var("LIVEENGINE_TEST_SLOW_CASE").ok() else {
+            for delivery in ["reliable", "lossy"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "sockets::slow_consumer_reliable_and_lossy"])
+                    .env("LIVEENGINE_TEST_SLOW_CASE", delivery)
+                    .env("LIVEENGINE_LIVE_SEND_QUEUE", "1")
+                    .env("LIVEENGINE_LIVE_MESSAGES_PER_SECOND", "100000")
+                    .env("LIVEENGINE_LIVE_BYTES_PER_SECOND", "16777216")
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "{delivery} slow consumer test failed");
+            }
+            return;
+        };
+        let f = setup_channels(60, Some(json!({"x":{"delivery":delivery}}))).await;
+        let mut a = auth(&f, &ticket(&f, "alice").await).await;
+        read(&mut a).await;
+        let mut b = auth(&f, &ticket(&f, "bob").await).await;
+        read(&mut b).await;
+        read(&mut a).await;
+        let frame = json!({"v":1,"type":"data","channel":"x","seq":1,"payload":"x".repeat(16_000)})
+            .to_string();
+        for _ in 0..600 {
+            a.send(Message::Text(frame.clone().into())).await.unwrap();
+        }
+        if delivery == "reliable" {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while matches!(b.next().await, Some(Ok(Message::Text(_)))) {}
+            })
+            .await
+            .expect("slow reliable consumer remained connected");
+        } else {
+            let mut received = 0;
+            while let Ok(Some(Ok(Message::Text(_)))) =
+                tokio::time::timeout(Duration::from_millis(300), b.next()).await
+            {
+                received += 1;
+            }
+            assert!(received < 600, "lossy queue did not drop any frames");
+            b.send(Message::Text(
+                json!({"v":1,"type":"data","channel":"x","seq":2,"payload":1})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(read(&mut a).await["from"], "bob");
+        }
+    }
+    #[tokio::test]
+    async fn connection_caps() {
+        match std::env::var("LIVEENGINE_TEST_CAP_CASE").ok().as_deref() {
+            None => {
+                for case in ["global", "room"] {
+                    let status = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", "sockets::connection_caps"])
+                        .env("LIVEENGINE_TEST_CAP_CASE", case)
+                        .env(
+                            "LIVEENGINE_LIVE_MAX_CONNECTIONS",
+                            if case == "global" { "1" } else { "2" },
+                        )
+                        .env("LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM", "1")
+                        .status()
+                        .unwrap();
+                    assert!(status.success(), "{case} cap test failed");
+                }
+            }
+            Some(case) => {
+                let f = setup(60).await;
+                let mut a = auth(&f, &ticket(&f, "alice").await).await;
+                read(&mut a).await;
+                if case == "global" {
+                    assert!(connect_async(&f.ws).await.is_err());
+                } else {
+                    let mut b = auth(&f, &ticket(&f, "bob").await).await;
+                    closed(&mut b).await;
+                }
+            }
+        }
     }
 }
