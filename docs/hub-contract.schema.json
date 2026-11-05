@@ -590,7 +590,24 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 256
+        },
+        "localHubId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+        },
+        "localRoom": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
         }
+      },
+      "dependentRequired": {
+        "localHubId": [
+          "localRoom"
+        ],
+        "localRoom": [
+          "localHubId"
+        ]
       }
     },
     "LinkInfo": {

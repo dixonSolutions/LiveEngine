@@ -175,3 +175,16 @@ address and credential. Definitions and credentials are stored in the private
 state file, while connection status is rebuilt on startup. Links retry with
 bounded exponential backoff and enforce per-link frame and inbound rate limits.
 This link lifecycle does not yet forward room messages between services.
+
+Adding `localHubId` and `localRoom` bridges that local room to the remote room
+over the same socket. Frames from peers on either side reach the other side
+(targeted and `signal.*` frames go to the named peer), and presence is merged:
+a linked peer appears as a `presence` join and in the welcome list. Bridged
+frames are `link.frame` and `link.presence` messages with a `trace` of instance
+ids; only role `service` sockets may send them, a frame whose trace holds the
+receiving instance is dropped, and each side enforces its own channel and
+schema rules, so a ring of links delivers each frame once. When a link drops,
+peers known through it get a `presence` event `unreachable`, local peers keep
+working, and presence is resent on reconnect. A link without `localHubId`
+stays a plain connection. `GET /v1/links` reports dropped and rejected frame
+counts under `frames`.

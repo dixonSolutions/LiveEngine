@@ -1,5 +1,6 @@
 //! Persistent service-to-service live connections.
 use crate::hub::{endpoint, error, validated_remote_url, Inner};
+use crate::live;
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, Method, StatusCode},
@@ -32,6 +33,11 @@ pub struct LinkDefinition {
     pub hub_id: String,
     pub user_id: String,
     pub server_id: String,
+    /// With `local_room`, bridges that room of a local hub to the remote room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_hub_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_room: Option<String>,
 }
 struct Entry {
     definition: LinkDefinition,
@@ -158,6 +164,11 @@ fn valid(state: &Inner, d: &LinkDefinition) -> bool {
         && d.user_id.len() <= 256
         && !d.server_id.is_empty()
         && d.server_id.len() <= 256
+        && match (&d.local_hub_id, &d.local_room) {
+            (None, None) => true,
+            (Some(hub), Some(room)) => id_ok(hub) && !room.is_empty() && room.len() <= 256,
+            _ => false,
+        }
         && d.remote_token.len() >= 24
         && d.remote_token.len() <= 4096
         && validated_remote_url(state, &d.address).is_ok()
@@ -183,7 +194,12 @@ pub(crate) fn restore(state: &Inner, definitions: &[LinkDefinition]) -> Result<(
     Ok(())
 }
 fn info(e: &Entry) -> serde_json::Value {
-    serde_json::json!({"id":e.definition.id,"hubId":e.definition.hub_id,"userId":e.definition.user_id,"serverId":e.definition.server_id,"status":match e.status.load(Ordering::Relaxed) { 1 => "connected", 2 => "unreachable", _ => "connecting" }})
+    let mut value = serde_json::json!({"id":e.definition.id,"hubId":e.definition.hub_id,"userId":e.definition.user_id,"serverId":e.definition.server_id,"status":match e.status.load(Ordering::Relaxed) { 1 => "connected", 2 => "unreachable", _ => "connecting" }});
+    if let (Some(hub), Some(room)) = (&e.definition.local_hub_id, &e.definition.local_room) {
+        value["localHubId"] = hub.clone().into();
+        value["localRoom"] = room.clone().into();
+    }
+    value
 }
 pub(crate) async fn list(State(state): State<Arc<Inner>>) -> Json<serde_json::Value> {
     let mut links: Vec<_> = state
@@ -195,7 +211,8 @@ pub(crate) async fn list(State(state): State<Arc<Inner>>) -> Json<serde_json::Va
         .map(|e| info(e))
         .collect();
     links.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-    Json(serde_json::json!({"links":links}))
+    let (dropped, rejected) = state.live_rooms.counters();
+    Json(serde_json::json!({"links":links,"frames":{"dropped":dropped,"rejected":rejected}}))
 }
 pub(crate) async fn get_one(State(state): State<Arc<Inner>>, Path(id): Path<String>) -> Response {
     match state.links.entries.read().await.get(&id) {
@@ -279,6 +296,13 @@ pub(crate) fn start(state: &Arc<Inner>) {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     });
+}
+/// Convert a queued room message for the outbound socket.
+fn wire(message: axum::extract::ws::Message) -> Option<Message> {
+    match message {
+        axum::extract::ws::Message::Text(text) => Some(Message::Text(text.as_str().into())),
+        _ => None,
+    }
 }
 async fn present(state: &Inner, entry: &Arc<Entry>) -> bool {
     state
@@ -386,19 +410,61 @@ async fn connect(state: Arc<Inner>, entry: &Arc<Entry>) -> bool {
     {
         return false;
     }
+    // A link with a local hub and room also carries that room's frames and presence.
+    let bridge = match (&d.local_hub_id, &d.local_room) {
+        (Some(hub), Some(room)) => Some(live::room_key(&state, hub, room)),
+        _ => None,
+    };
+    let mut attach = match &bridge {
+        Some(key) => match live::attach_link(&state, key, &d.id).await {
+            Some(attach) => Some(attach),
+            None => return false,
+        },
+        None => None,
+    };
     entry.status.store(1, Ordering::Relaxed);
     let weak = Arc::downgrade(&state);
     drop(state);
+    let name = format!("out:{}", d.id);
+    let generation = attach.as_ref().map_or(0, |a| a.generation);
+    let snapshot = attach.as_mut().map(|a| std::mem::take(&mut a.snapshot));
+    let (mut rx, mut disconnected) = match attach {
+        Some(a) => (Some(a.rx), Some(a.disconnected)),
+        None => (None, None),
+    };
+    let mut healthy = true;
+    for message in snapshot.into_iter().flatten() {
+        if let Some(message) = wire(message) {
+            if socket.send(message).await.is_err() {
+                healthy = false;
+                break;
+            }
+        }
+    }
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut window = tokio::time::Instant::now();
     let mut bytes = 0usize;
     let mut count = 0usize;
     let mut last_frame = tokio::time::Instant::now();
-    loop {
+    while healthy {
         tokio::select! {
             _ = tick.tick() => { if last_frame.elapsed() > Duration::from_secs(60) { break; } let Some(state) = weak.upgrade() else { break }; if !present(&state, entry).await { let _ = socket.close(None).await; break; } },
-            msg = socket.next() => { last_frame = tokio::time::Instant::now(); match msg { Some(Ok(Message::Text(s))) => { if window.elapsed() >= Duration::from_secs(1) { window = tokio::time::Instant::now(); bytes = 0; count = 0; } bytes += s.len(); count += 1; if bytes > 1_048_576 || count > 100 { break; } }, Some(Ok(Message::Ping(data))) => { if socket.send(Message::Pong(data)).await.is_err() { break; } }, Some(Ok(Message::Pong(_))) => {}, _ => break } }
+            queued = async { match rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => { match queued { Some(message) => { if let Some(message) = wire(message) { if socket.send(message).await.is_err() { break; } } }, None => break } },
+            _ = async { match disconnected.as_mut() { Some(d) => { let _ = d.changed().await; }, None => std::future::pending().await } } => break,
+            msg = socket.next() => { last_frame = tokio::time::Instant::now(); match msg { Some(Ok(Message::Text(s))) => {
+                if window.elapsed() >= Duration::from_secs(1) { window = tokio::time::Instant::now(); bytes = 0; count = 0; }
+                bytes += s.len(); count += 1;
+                if bytes > 1_048_576 || count > 100 { break; }
+                if let (Some(key), Ok(value)) = (&bridge, serde_json::from_str::<serde_json::Value>(&s)) {
+                    // Ordinary room frames are not carried; only the two link frame types are.
+                    if !matches!(value["type"].as_str(), Some("link.frame" | "link.presence")) { continue; }
+                    if let Some(state) = weak.upgrade() { live::ingest(&state, key, &name, &value, None).await; }
+                }
+            }, Some(Ok(Message::Ping(data))) => { if socket.send(Message::Pong(data)).await.is_err() { break; } }, Some(Ok(Message::Pong(_))) => {}, _ => break } }
         }
+    }
+    if let (Some(key), Some(state)) = (&bridge, weak.upgrade()) {
+        live::detach_link(&state, key, &name, generation).await;
     }
     true
 }

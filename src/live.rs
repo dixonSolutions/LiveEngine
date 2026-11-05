@@ -1,7 +1,7 @@
 //! Short-lived, single-use credentials for live room connections.
 use crate::hub::{
-    compile_schema, error, expire_hubs, forward_route, header_depth, HubRecord, Inner, LiveChannel,
-    LiveDelivery, RouteRequest,
+    compile_schema, error, expire_hubs, forward_route, header_depth, valid_trace_id, HubRecord,
+    Inner, LiveChannel, LiveDelivery, RouteRequest,
 };
 use axum::{
     extract::{Path, State},
@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
+    hash::{Hash, Hasher},
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -382,6 +383,8 @@ type RoomKey = (Vec<String>, String);
 struct PeerQueue {
     sender: mpsc::Sender<Message>,
     disconnect: tokio::sync::watch::Sender<bool>,
+    /// Service sockets are never announced as bridged peers.
+    service: bool,
 }
 impl PeerQueue {
     fn send(&self, message: Message, lossy: bool) {
@@ -397,6 +400,444 @@ pub(crate) struct LiveRooms {
     pending: AsyncMutex<HashMap<(RoomKey, String), u64>>,
     connections: std::sync::atomic::AtomicUsize,
     validators: AsyncMutex<HashMap<String, (Value, Arc<jsonschema::Validator>)>>,
+    bridges: AsyncMutex<HashMap<RoomKey, Bridge>>,
+    recent: Mutex<Recent>,
+    next_attach: std::sync::atomic::AtomicU64,
+    /// Linked frames dropped as loops or duplicates.
+    dropped: std::sync::atomic::AtomicU64,
+    /// Linked frames or presence refused by wire, channel or schema rules.
+    rejected: std::sync::atomic::AtomicU64,
+}
+type Validators = HashMap<String, Arc<jsonschema::Validator>>;
+
+/// A link attached to a room. Frames offered to its queue are carried to the linked hub.
+struct Attached {
+    id: u64,
+    queue: PeerQueue,
+    /// The local user of an inbound link socket; `None` for a link this hub dials.
+    user: Option<String>,
+}
+/// The links of one room and the peers known only through them (peer to link name).
+#[derive(Default)]
+struct Bridge {
+    links: HashMap<String, Attached>,
+    remote: HashMap<String, String>,
+}
+impl Bridge {
+    fn is_link_user(&self, peer: &str) -> bool {
+        self.links.values().any(|a| a.user.as_deref() == Some(peer))
+    }
+    fn offer(&self, except: Option<&str>, message: &Message, lossy: bool) {
+        for (name, attached) in &self.links {
+            if Some(name.as_str()) != except {
+                attached.queue.send(message.clone(), lossy);
+            }
+        }
+    }
+}
+#[derive(Default)]
+struct Recent {
+    order: VecDeque<(std::time::Instant, u64)>,
+    set: HashSet<u64>,
+}
+const MAX_WIRE: usize = 65536;
+const MAX_TRACE: usize = 32;
+const MAX_REMOTE_PEERS: usize = 1024;
+const RECENT_FRAMES: usize = 4096;
+const RECENT_WINDOW: Duration = Duration::from_secs(10);
+impl LiveRooms {
+    /// Whether a linked frame was already handled; a ring can deliver one frame along two paths.
+    fn seen(&self, origin: &str, frame: &str) -> bool {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        origin.hash(&mut hasher);
+        frame.hash(&mut hasher);
+        let key = hasher.finish();
+        let mut guard = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        let recent = &mut *guard;
+        let now = std::time::Instant::now();
+        while recent
+            .order
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > RECENT_WINDOW)
+            || recent.order.len() >= RECENT_FRAMES
+        {
+            let Some((_, old)) = recent.order.pop_front() else {
+                break;
+            };
+            recent.set.remove(&old);
+        }
+        if !recent.set.insert(key) {
+            return true;
+        }
+        recent.order.push_back((now, key));
+        false
+    }
+    fn count(counter: &std::sync::atomic::AtomicU64) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn counters(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.dropped.load(Relaxed), self.rejected.load(Relaxed))
+    }
+}
+fn text(value: Value) -> Message {
+    Message::Text(value.to_string().into())
+}
+fn local_presence(event: &str, peer: &str) -> Message {
+    text(serde_json::json!({"type":"presence","event":event,"peer":peer}))
+}
+fn wire_presence(trace: &[String], event: &str, peer: Option<&str>) -> Message {
+    let mut value = serde_json::json!({"type":"link.presence","trace":trace,"event":event});
+    if let Some(peer) = peer {
+        value["peer"] = Value::String(peer.to_owned());
+    }
+    text(value)
+}
+fn extended(trace: &[String], instance: &str) -> Vec<String> {
+    let mut trace = trace.to_vec();
+    trace.push(instance.to_owned());
+    trace
+}
+/// Carry a frame over the links of a room: to the link that knows `target`, or to every link.
+fn forward(
+    live: &LiveRooms,
+    bridge: &Bridge,
+    trace: &[String],
+    except: Option<&str>,
+    target: Option<&str>,
+    frame: &Value,
+    lossy: bool,
+) {
+    let message = text(serde_json::json!({"type":"link.frame","trace":trace,"frame":frame}));
+    if matches!(&message, Message::Text(t) if t.len() > MAX_WIRE) {
+        LiveRooms::count(&live.rejected);
+        return;
+    }
+    match target {
+        Some(target) => {
+            if let Some(via) = bridge.remote.get(target) {
+                if Some(via.as_str()) != except {
+                    if let Some(attached) = bridge.links.get(via) {
+                        attached.queue.send(message, lossy);
+                    }
+                }
+            }
+        }
+        None => bridge.offer(except, &message, lossy),
+    }
+}
+fn notify_local(room: Option<&HashMap<String, PeerQueue>>, bridge: &Bridge, message: &Message) {
+    for (peer, queue) in room.into_iter().flatten() {
+        if !bridge.is_link_user(peer) {
+            queue.send(message.clone(), false);
+        }
+    }
+}
+fn parse_trace(wire: &Value) -> Option<Vec<String>> {
+    let items = wire.get("trace")?.as_array()?;
+    if items.len() > MAX_TRACE {
+        return None;
+    }
+    items
+        .iter()
+        .map(|id| {
+            id.as_str()
+                .filter(|id| valid_trace_id(id))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// A link this hub dials, attached to a local room.
+pub(crate) struct LinkAttach {
+    pub(crate) generation: u64,
+    /// Current presence, to send first; the first frame also announces the link.
+    pub(crate) snapshot: Vec<Message>,
+    pub(crate) rx: mpsc::Receiver<Message>,
+    pub(crate) disconnected: tokio::sync::watch::Receiver<bool>,
+}
+pub(crate) fn room_key(state: &Inner, hub_id: &str, room: &str) -> RoomKey {
+    let mut path = state.hub_path.clone();
+    path.push(hub_id.to_owned());
+    (path, room.to_owned())
+}
+pub(crate) async fn attach_link(
+    state: &Arc<Inner>,
+    key: &RoomKey,
+    link_id: &str,
+) -> Option<LinkAttach> {
+    resolve(state, &key.0).await?;
+    let (sender, rx) = mpsc::channel::<Message>(limit("LIVEENGINE_LIVE_SEND_QUEUE", 64));
+    let (disconnect, disconnected) = tokio::sync::watch::channel(false);
+    let queue = PeerQueue {
+        sender,
+        disconnect,
+        service: true,
+    };
+    let (generation, snapshot) =
+        attach(state, key, format!("out:{link_id}"), None, Some(queue)).await?;
+    Some(LinkAttach {
+        generation,
+        snapshot,
+        rx,
+        disconnected,
+    })
+}
+/// Register a link in a room and return its id with the presence to announce over it.
+async fn attach(
+    state: &Arc<Inner>,
+    key: &RoomKey,
+    name: String,
+    user: Option<&str>,
+    fresh: Option<PeerQueue>,
+) -> Option<(u64, Vec<Message>)> {
+    let live = &state.live_rooms;
+    let rooms = live.rooms.lock().await;
+    let queue = match fresh {
+        Some(queue) => queue,
+        None => rooms.get(key)?.get(user?)?.clone(),
+    };
+    let mut bridges = live.bridges.lock().await;
+    let bridge = bridges.entry(key.clone()).or_default();
+    let generation = live
+        .next_attach
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    bridge.links.insert(
+        name.clone(),
+        Attached {
+            id: generation,
+            queue,
+            user: user.map(str::to_owned),
+        },
+    );
+    let trace = [state.instance_id.clone()];
+    let mut messages = vec![wire_presence(&trace, "join", None)];
+    let local = rooms
+        .get(key)
+        .into_iter()
+        .flatten()
+        .filter(|(peer, queue)| !queue.service && !bridge.is_link_user(peer))
+        .map(|(peer, _)| peer);
+    let remote = bridge
+        .remote
+        .iter()
+        .filter(|(_, via)| **via != name)
+        .map(|(peer, _)| peer);
+    messages.extend(
+        local
+            .chain(remote)
+            .map(|peer| wire_presence(&trace, "join", Some(peer))),
+    );
+    Some((generation, messages))
+}
+/// Remove a link; peers known only through it become unreachable.
+pub(crate) async fn detach_link(state: &Arc<Inner>, key: &RoomKey, name: &str, generation: u64) {
+    let live = &state.live_rooms;
+    let rooms = live.rooms.lock().await;
+    let mut bridges = live.bridges.lock().await;
+    let Some(bridge) = bridges.get_mut(key) else {
+        return;
+    };
+    if bridge.links.get(name).is_none_or(|a| a.id != generation) {
+        return;
+    }
+    bridge.links.remove(name);
+    let lost: Vec<String> = bridge
+        .remote
+        .iter()
+        .filter(|(_, via)| *via == name)
+        .map(|(peer, _)| peer.clone())
+        .collect();
+    for peer in &lost {
+        bridge.remote.remove(peer);
+    }
+    let trace = [state.instance_id.clone()];
+    for peer in &lost {
+        notify_local(rooms.get(key), bridge, &local_presence("unreachable", peer));
+        bridge.offer(
+            None,
+            &wire_presence(&trace, "unreachable", Some(peer)),
+            false,
+        );
+    }
+    if bridge.links.is_empty() && bridge.remote.is_empty() {
+        bridges.remove(key);
+    }
+}
+/// The channel rules of the local hub, for frames arriving over a link this hub dials.
+async fn link_policy(
+    state: &Arc<Inner>,
+    key: &RoomKey,
+) -> Option<(Option<HashMap<String, LiveChannel>>, Validators)> {
+    let (_, channels) = resolve(state, &key.0).await?;
+    let validators = build_validators(state, &channels, true, None).await?;
+    Some((channels, validators))
+}
+/// Handle a `link.frame` or `link.presence` received from the link `via`.
+/// Returns false for any other type. `policy` carries the receiving socket's channel rules;
+/// without it the local hub's own rules apply.
+pub(crate) async fn ingest(
+    state: &Arc<Inner>,
+    key: &RoomKey,
+    via: &str,
+    wire: &Value,
+    policy: Option<(&Option<HashMap<String, LiveChannel>>, &Validators)>,
+) -> bool {
+    match wire.get("type").and_then(Value::as_str) {
+        Some("link.frame") => {
+            match policy {
+                Some((channels, validators)) => {
+                    ingest_frame(state, key, via, wire, channels, validators).await
+                }
+                None => {
+                    if let Some((channels, validators)) = link_policy(state, key).await {
+                        ingest_frame(state, key, via, wire, &channels, &validators).await;
+                    } else {
+                        LiveRooms::count(&state.live_rooms.rejected);
+                    }
+                }
+            }
+            true
+        }
+        Some("link.presence") => {
+            ingest_presence(state, key, via, wire).await;
+            true
+        }
+        _ => false,
+    }
+}
+async fn ingest_frame(
+    state: &Arc<Inner>,
+    key: &RoomKey,
+    via: &str,
+    wire: &Value,
+    channels: &Option<HashMap<String, LiveChannel>>,
+    validators: &Validators,
+) {
+    let live = &state.live_rooms;
+    let Some(trace) = parse_trace(wire) else {
+        return LiveRooms::count(&live.rejected);
+    };
+    if trace.contains(&state.instance_id) {
+        return LiveRooms::count(&live.dropped);
+    }
+    let Some(frame) = wire.get("frame").and_then(Value::as_object) else {
+        return LiveRooms::count(&live.rejected);
+    };
+    let (Some(from), Some(frame_type), Some(channel)) = (
+        frame.get("from").and_then(Value::as_str),
+        frame.get("type").and_then(Value::as_str),
+        frame.get("channel").and_then(Value::as_str),
+    ) else {
+        return LiveRooms::count(&live.rejected);
+    };
+    let target = frame.get("to").and_then(Value::as_str);
+    let signal = matches!(frame_type, "signal.offer" | "signal.answer" | "signal.ice");
+    if !frame.get("v").is_some_and(Value::is_number)
+        || !frame.get("seq").is_some_and(Value::is_u64)
+        || !frame.contains_key("payload")
+        || frame.get("to").is_some_and(|to| !to.is_string())
+        || frame_type.starts_with("link.")
+        || (frame_type.starts_with("signal.") && !signal)
+        || (signal && target.is_none_or(|to| to == from))
+    {
+        return LiveRooms::count(&live.rejected);
+    }
+    let mut lossy = false;
+    if !signal {
+        if let Some(channels) = channels {
+            let Some(definition) = channels.get(channel) else {
+                return LiveRooms::count(&live.rejected);
+            };
+            lossy = matches!(definition.delivery, LiveDelivery::Lossy);
+        }
+        if validators
+            .get(channel)
+            .is_some_and(|v| !v.is_valid(&wire["frame"]["payload"]))
+        {
+            return LiveRooms::count(&live.rejected);
+        }
+    }
+    let serialized = wire["frame"].to_string();
+    if live.seen(trace.first().map_or("", String::as_str), &serialized) {
+        return LiveRooms::count(&live.dropped);
+    }
+    let trace = extended(&trace, &state.instance_id);
+    let message = Message::Text(serialized.into());
+    let rooms = live.rooms.lock().await;
+    let bridges = live.bridges.lock().await;
+    let Some(bridge) = bridges.get(key).filter(|b| b.links.contains_key(via)) else {
+        return;
+    };
+    let room = rooms.get(key);
+    match target {
+        Some(to) => {
+            if let Some(queue) = room
+                .and_then(|r| r.get(to))
+                .filter(|_| !bridge.is_link_user(to))
+            {
+                queue.send(message, lossy);
+            } else {
+                forward(
+                    live,
+                    bridge,
+                    &trace,
+                    Some(via),
+                    Some(to),
+                    &wire["frame"],
+                    lossy,
+                );
+            }
+        }
+        None => {
+            for (peer, queue) in room.into_iter().flatten() {
+                if peer != from && !bridge.is_link_user(peer) {
+                    queue.send(message.clone(), lossy);
+                }
+            }
+            forward(live, bridge, &trace, Some(via), None, &wire["frame"], lossy);
+        }
+    }
+}
+async fn ingest_presence(state: &Arc<Inner>, key: &RoomKey, via: &str, wire: &Value) {
+    let live = &state.live_rooms;
+    let Some(trace) = parse_trace(wire) else {
+        return LiveRooms::count(&live.rejected);
+    };
+    if trace.contains(&state.instance_id) {
+        return LiveRooms::count(&live.dropped);
+    }
+    let event = wire.get("event").and_then(Value::as_str);
+    let peer = match wire.get("peer") {
+        // A join without a peer only announces the link itself.
+        None => return,
+        Some(Value::String(peer)) if !peer.is_empty() && peer.len() <= 256 => peer.as_str(),
+        _ => return LiveRooms::count(&live.rejected),
+    };
+    let Some(event @ ("join" | "leave" | "unreachable")) = event else {
+        return LiveRooms::count(&live.rejected);
+    };
+    let rooms = live.rooms.lock().await;
+    let mut bridges = live.bridges.lock().await;
+    let Some(bridge) = bridges.get_mut(key).filter(|b| b.links.contains_key(via)) else {
+        return;
+    };
+    if event == "join" {
+        if rooms.get(key).is_some_and(|r| r.contains_key(peer))
+            || bridge.remote.contains_key(peer)
+            || bridge.remote.len() >= MAX_REMOTE_PEERS
+        {
+            return;
+        }
+        bridge.remote.insert(peer.to_owned(), via.to_owned());
+    } else if bridge.remote.get(peer).map(String::as_str) == Some(via) {
+        bridge.remote.remove(peer);
+    } else {
+        return;
+    }
+    notify_local(rooms.get(key), bridge, &local_presence(event, peer));
+    let trace = extended(&trace, &state.instance_id);
+    bridge.offer(Some(via), &wire_presence(&trace, event, Some(peer)), false);
 }
 
 pub(crate) async fn live_socket(
@@ -534,6 +975,35 @@ async fn paired(record: &HubRecord, user: &str, room: &str) -> bool {
     .unwrap_or(false)
 }
 
+async fn build_validators(
+    state: &Arc<Inner>,
+    channels: &Option<HashMap<String, LiveChannel>>,
+    local_channels: bool,
+    inherited_channels: Option<&ChannelPolicy>,
+) -> Option<Validators> {
+    let mut validators = HashMap::new();
+    if let Some(channels) = channels {
+        let schemas = state.schemas.read().await;
+        let mut cache = state.live_rooms.validators.lock().await;
+        cache.retain(|id, _| schemas.contains_key(id));
+        for (name, channel) in channels {
+            if let Some(id) = &channel.schema_ref {
+                let schema = if local_channels {
+                    schemas.get(id)
+                } else {
+                    inherited_channels.and_then(|p| p.schemas.get(id))
+                }?;
+                if !cache.get(id).is_some_and(|(saved, _)| saved == schema) {
+                    let validator = compile_schema(schema).ok()?;
+                    cache.insert(id.clone(), (schema.clone(), Arc::new(validator)));
+                }
+                validators.insert(name.clone(), cache[id].1.clone());
+            }
+        }
+    }
+    Some(validators)
+}
+
 async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
     let first = tokio::time::timeout(Duration::from_secs(5), socket.recv()).await;
     let Some(Ok(Message::Text(text))) = first.ok().flatten() else {
@@ -558,6 +1028,7 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
         return;
     }
     let inherited_channels = claims.inherited_channels;
+    let service = claims.role == "service";
     let key = (claims.hub_path, claims.room);
     let user = claims.user;
     let Some((record, channels)) = resolve(&state, &key.0).await else {
@@ -568,30 +1039,16 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
     }
     let local_channels = channels.is_some();
     let channels = channels.or_else(|| inherited_channels.as_ref().map(|p| p.channels.clone()));
-    let mut validators = HashMap::new();
-    if let Some(channels) = &channels {
-        let schemas = state.schemas.read().await;
-        let mut cache = state.live_rooms.validators.lock().await;
-        cache.retain(|id, _| schemas.contains_key(id));
-        for (name, channel) in channels {
-            if let Some(id) = &channel.schema_ref {
-                let Some(schema) = (if local_channels {
-                    schemas.get(id)
-                } else {
-                    inherited_channels.as_ref().and_then(|p| p.schemas.get(id))
-                }) else {
-                    return;
-                };
-                if !cache.get(id).is_some_and(|(saved, _)| saved == schema) {
-                    let Ok(validator) = compile_schema(schema) else {
-                        return;
-                    };
-                    cache.insert(id.clone(), (schema.clone(), Arc::new(validator)));
-                }
-                validators.insert(name.clone(), cache[id].1.clone());
-            }
-        }
-    }
+    let Some(validators) = build_validators(
+        &state,
+        &channels,
+        local_channels,
+        inherited_channels.as_ref(),
+    )
+    .await
+    else {
+        return;
+    };
     let (tx, mut rx) = mpsc::channel::<Message>(limit("LIVEENGINE_LIVE_SEND_QUEUE", 64));
     let (disconnect, mut disconnected) = tokio::sync::watch::channel(false);
     {
@@ -608,8 +1065,15 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
             return;
         }
         let mut pending = state.live_rooms.pending.lock().await;
+        let bridges = state.live_rooms.bridges.lock().await;
         let resumed = pending.remove(&(key.clone(), user.clone())).is_some();
         let mut peers: Vec<_> = room.keys().cloned().collect();
+        peers.extend(
+            bridges
+                .get(&key)
+                .into_iter()
+                .flat_map(|b| b.remote.keys().cloned()),
+        );
         peers.extend(
             pending
                 .keys()
@@ -633,12 +1097,19 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
             for queue in room.values() {
                 queue.send(joined.clone(), false);
             }
+            if !service {
+                if let Some(bridge) = bridges.get(&key) {
+                    let trace = [state.instance_id.clone()];
+                    bridge.offer(None, &wire_presence(&trace, "join", Some(&user)), false);
+                }
+            }
         }
         room.insert(
             user.clone(),
             PeerQueue {
                 sender: tx,
                 disconnect,
+                service,
             },
         );
     }
@@ -657,6 +1128,9 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
     let mut messages = 0usize;
     let mut bytes = 0usize;
     let mut channel_rates: HashMap<String, usize> = HashMap::new();
+    let mut attached: Option<u64> = None;
+    let link_name = format!("in:{user}");
+    let trace = vec![state.instance_id.clone()];
     loop {
         let message = tokio::select! {
             result = stream.next() => match result { Some(Ok(message)) => message, _ => break },
@@ -698,6 +1172,53 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
             break;
         };
         if object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.starts_with("link."))
+        {
+            // Only a service socket may carry linked frames; a peer sending one is refused.
+            if !service {
+                break;
+            }
+            if attached.is_none() {
+                let Some((generation, snapshot)) =
+                    attach(&state, &key, link_name.clone(), Some(&user), None).await
+                else {
+                    break;
+                };
+                attached = Some(generation);
+                let sender = state
+                    .live_rooms
+                    .rooms
+                    .lock()
+                    .await
+                    .get(&key)
+                    .and_then(|room| room.get(&user))
+                    .map(|queue| queue.sender.clone());
+                if let Some(sender) = sender {
+                    tokio::spawn(async move {
+                        for message in snapshot {
+                            if sender.send(message).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+            if !ingest(
+                &state,
+                &key,
+                &link_name,
+                &value,
+                Some((&channels, &validators)),
+            )
+            .await
+            {
+                break;
+            }
+            continue;
+        }
+        if object
             .get("from")
             .is_some_and(|from| from.as_str() != Some(&user))
             || !object.get("v").is_some_and(|v| v.is_number())
@@ -716,18 +1237,32 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
             break;
         }
         if signal {
-            let Some(target) = object.get("to").and_then(Value::as_str) else {
+            let Some(target) = object.get("to").and_then(Value::as_str).map(str::to_owned) else {
                 break;
             };
+            let target = target.as_str();
             if target == user || text.len() > limit("LIVEENGINE_SIGNAL_MAX_BYTES", 16384) {
                 break;
             }
             let rooms = state.live_rooms.rooms.lock().await;
-            let Some(queue) = rooms.get(&key).and_then(|room| room.get(target)) else {
-                break;
-            };
+            let bridges = state.live_rooms.bridges.lock().await;
             object.insert("from".into(), Value::String(user.clone()));
-            queue.send(Message::Text(value.to_string().into()), false);
+            if let Some(queue) = rooms.get(&key).and_then(|room| room.get(target)) {
+                queue.send(Message::Text(value.to_string().into()), false);
+            } else if let Some(bridge) = bridges.get(&key).filter(|b| b.remote.contains_key(target))
+            {
+                forward(
+                    &state.live_rooms,
+                    bridge,
+                    &trace,
+                    None,
+                    Some(target),
+                    &value,
+                    false,
+                );
+            } else {
+                break;
+            }
             continue;
         }
         let mut lossy = false;
@@ -753,15 +1288,38 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
         object.insert("from".into(), Value::String(user.clone()));
         let frame = Message::Text(value.to_string().into());
         let rooms = state.live_rooms.rooms.lock().await;
+        let bridges = state.live_rooms.bridges.lock().await;
+        let bridge = bridges.get(&key);
         if let Some(room) = rooms.get(&key) {
             for (peer, queue) in room {
-                if target.as_ref().map_or(peer != &user, |to| to == peer) {
+                if target.as_ref().map_or(peer != &user, |to| to == peer)
+                    && !bridge.is_some_and(|b| b.is_link_user(peer))
+                {
                     queue.send(frame.clone(), lossy);
                 }
             }
         }
+        if let Some(bridge) = bridge {
+            let local = target
+                .as_ref()
+                .is_some_and(|to| rooms.get(&key).is_some_and(|room| room.contains_key(to)));
+            if !local {
+                forward(
+                    &state.live_rooms,
+                    bridge,
+                    &trace,
+                    None,
+                    target.as_deref(),
+                    &value,
+                    lossy,
+                );
+            }
+        }
     }
     writer.abort();
+    if let Some(generation) = attached {
+        detach_link(&state, &key, &link_name, generation).await;
+    }
     let generation = rand::random::<u64>();
     {
         let mut rooms = state.live_rooms.rooms.lock().await;
@@ -776,6 +1334,7 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
             .insert((key.clone(), user.clone()), generation);
     }
     let live = state.live_rooms.clone();
+    let instance = state.instance_id.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(
             limit("LIVEENGINE_LIVE_RESUME_MILLIS", 500) as u64,
@@ -783,10 +1342,20 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
         .await;
         let mut rooms = live.rooms.lock().await;
         let mut pending = live.pending.lock().await;
+        let bridges = live.bridges.lock().await;
         if pending.get(&(key.clone(), user.clone())) != Some(&generation) {
             return;
         }
         pending.remove(&(key.clone(), user.clone()));
+        if !service {
+            if let Some(bridge) = bridges.get(&key) {
+                bridge.offer(
+                    None,
+                    &wire_presence(&[instance], "leave", Some(&user)),
+                    false,
+                );
+            }
+        }
         if let Some(room) = rooms.get_mut(&key) {
             let left = Message::Text(
                 serde_json::json!({"type":"presence","event":"leave","peer":user})
@@ -811,7 +1380,11 @@ mod queue_tests {
     fn full_queue_drops_lossy_and_disconnects_reliable() {
         let (sender, mut receiver) = mpsc::channel(1);
         let (disconnect, disconnected) = tokio::sync::watch::channel(false);
-        let queue = PeerQueue { sender, disconnect };
+        let queue = PeerQueue {
+            sender,
+            disconnect,
+            service: false,
+        };
         queue.send(Message::Text("first".into()), false);
         queue.send(Message::Text("lossy".into()), true);
         assert!(!*disconnected.borrow());

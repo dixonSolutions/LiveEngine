@@ -505,7 +505,7 @@ pub(crate) struct Inner {
     pub(crate) inflight_calls: Arc<Semaphore>,
     hub_slots: Arc<Semaphore>,
     global_max_hubs: usize,
-    instance_id: String,
+    pub(crate) instance_id: String,
     inherited: [Option<Value>; 3],
     imports: Arc<RwLock<Vec<ImportRegistryRequest>>>,
     persistence_lock: Arc<tokio::sync::Mutex<()>>,
@@ -1709,7 +1709,7 @@ pub(crate) async fn route_hub(
     }
 }
 
-fn valid_trace_id(id: &str) -> bool {
+pub(crate) fn valid_trace_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id

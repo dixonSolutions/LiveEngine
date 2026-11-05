@@ -623,3 +623,565 @@ fn rand_suffix() -> String {
             .as_nanos()
     )
 }
+
+// Rooms that span linked hubs.
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+struct Node {
+    name: String,
+    base: String,
+    token: String,
+    task: tokio::task::JoinHandle<()>,
+}
+async fn node(name: &str, users: &[&str]) -> Node {
+    node_with(name, users, None, None).await
+}
+async fn node_with(
+    name: &str,
+    users: &[&str],
+    channels: Option<Value>,
+    schema: Option<Value>,
+) -> Node {
+    let token = format!("node-{name}-administrator-token-123456789");
+    let service = HubService::new(HubConfig {
+        token: token.clone(),
+        public_url: Some("ws://localhost/v1/live".into()),
+        allowed_remote_hosts: vec!["127.0.0.1".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let (base, task) = serve(service).await;
+    let mut hub = json!({"id":"game","mode":"internal"});
+    if let Some(schema) = schema {
+        assert_eq!(
+            post(
+                &base,
+                &token,
+                "/v1/schemas",
+                json!({"id":"message","version":"1","schema":schema})
+            )
+            .await
+            .status(),
+            201
+        );
+    }
+    if let Some(channels) = channels {
+        hub["channels"] = channels;
+    }
+    assert_eq!(post(&base, &token, "/v1/hubs", hub).await.status(), 201);
+    let mut calls = vec![("upsertServer", json!([{"id":"room","capacity":16}]))];
+    for user in users {
+        calls.push(("upsertUser", json!([{"id":user}])));
+        calls.push(("join", json!([user, "room"])));
+    }
+    for (method, args) in calls {
+        assert_eq!(
+            post(
+                &base,
+                &token,
+                "/v1/hubs/game/call",
+                json!({"method":method,"args":args})
+            )
+            .await
+            .status(),
+            200
+        );
+    }
+    Node {
+        name: name.into(),
+        base,
+        token,
+        task,
+    }
+}
+/// Dial `to` from `from` as service `svc-<from>`, bridging room `room` of hub `game` on both sides.
+async fn link(from: &Node, to: &Node, id: &str) {
+    let credential: Value = post(
+        &to.base,
+        &to.token,
+        "/v1/hubs/game/link-credentials",
+        json!({}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let body = json!({"id":id,"address":to.base,"remoteToken":credential["token"],"hubId":"game","userId":format!("svc-{}",from.name),"serverId":"room","localHubId":"game","localRoom":"room"});
+    assert_eq!(
+        post(&from.base, &from.token, "/v1/links", body)
+            .await
+            .status(),
+        201
+    );
+}
+async fn unlink(from: &Node, id: &str) {
+    let response = reqwest::Client::new()
+        .delete(format!("{}/v1/links/{id}", from.base))
+        .bearer_auth(&from.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+}
+async fn link_status(from: &Node, id: &str, expected: &str) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let r: Value = reqwest::Client::new()
+                .get(format!("{}/v1/links/{id}", from.base))
+                .bearer_auth(&from.token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if r["status"] == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+async fn counters(from: &Node) -> (u64, u64) {
+    let r: Value = reqwest::Client::new()
+        .get(format!("{}/v1/links", from.base))
+        .bearer_auth(&from.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (
+        r["frames"]["dropped"].as_u64().unwrap(),
+        r["frames"]["rejected"].as_u64().unwrap(),
+    )
+}
+async fn peer(node: &Node, user: &str) -> (Ws, Vec<String>) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    let issued: Value = post(
+        &node.base,
+        &node.token,
+        "/v1/hubs/game/tickets",
+        json!({"userId":user,"serverId":"room"}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let (mut socket, _) = connect_async(format!(
+        "{}/v1/live",
+        node.base.replacen("http://", "ws://", 1)
+    ))
+    .await
+    .unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"auth","ticket":issued["ticket"]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let welcome: Value =
+        serde_json::from_str(&socket.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+    assert_eq!(welcome["type"], "welcome");
+    let peers = welcome["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap().to_string())
+        .collect();
+    (socket, peers)
+}
+/// The next text frame matching `pred` within `ms`, discarding the others.
+async fn wait_for(ws: &mut Ws, ms: u64, pred: impl Fn(&Value) -> bool) -> Option<Value> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if pred(&value) {
+                    return Some(value);
+                }
+            }
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+            _ => return None,
+        }
+    }
+}
+/// Wait until `name` is known in the room, from the welcome list or a presence join.
+async fn sees(ws: &mut Ws, welcome: &[String], name: &str) {
+    if welcome.iter().any(|p| p == name) {
+        return;
+    }
+    assert!(
+        wait_for(ws, 10_000, |v| v["type"] == "presence"
+            && v["event"] == "join"
+            && v["peer"] == name)
+        .await
+        .is_some(),
+        "{name} never appeared"
+    );
+}
+fn frame(seq: u64, payload: Value) -> Message {
+    Message::Text(
+        json!({"v":1,"type":"message","channel":"updates","seq":seq,"payload":payload})
+            .to_string()
+            .into(),
+    )
+}
+use tokio_tungstenite::tungstenite::Message;
+async fn say(ws: &mut Ws, message: Message) {
+    use futures_util::SinkExt;
+    ws.send(message).await.unwrap();
+}
+fn is_frame(v: &Value) -> bool {
+    v["type"] == "message"
+}
+/// Every non-presence frame that arrives within `ms`.
+async fn frames_within(ws: &mut Ws, ms: u64) -> Vec<Value> {
+    let mut out = vec![];
+    while let Some(v) = wait_for(ws, ms, is_frame).await {
+        out.push(v);
+    }
+    out
+}
+async fn pair() -> (Node, Node) {
+    let a = node("a", &["alice", "carol", "svc-b"]).await;
+    let b = node("b", &["bob", "dave", "svc-a"]).await;
+    link(&a, &b, "ab").await;
+    link_status(&a, "ab", "connected").await;
+    (a, b)
+}
+
+#[tokio::test]
+async fn frames_cross_a_linked_room_in_both_directions() {
+    let (a, b) = pair().await;
+    let (mut alice, w1) = peer(&a, "alice").await;
+    let (mut bob, w2) = peer(&b, "bob").await;
+    sees(&mut alice, &w1, "bob").await;
+    sees(&mut bob, &w2, "alice").await;
+    say(&mut alice, frame(1, json!("from a"))).await;
+    let got = wait_for(&mut bob, 5000, is_frame).await.unwrap();
+    assert_eq!(
+        (got["from"].as_str(), &got["payload"]),
+        (Some("alice"), &json!("from a"))
+    );
+    say(&mut bob, frame(1, json!("from b"))).await;
+    let got = wait_for(&mut alice, 5000, is_frame).await.unwrap();
+    assert_eq!(
+        (got["from"].as_str(), &got["payload"]),
+        (Some("bob"), &json!("from b"))
+    );
+    // Nobody hears an echo of their own frame, and there are no duplicates.
+    assert!(frames_within(&mut alice, 500).await.is_empty());
+    assert!(frames_within(&mut bob, 500).await.is_empty());
+    a.task.abort();
+    b.task.abort();
+}
+
+#[tokio::test]
+async fn targeted_and_signal_frames_cross_the_link_to_the_named_peer() {
+    let (a, b) = pair().await;
+    let (mut alice, w1) = peer(&a, "alice").await;
+    let (mut carol, w3) = peer(&a, "carol").await;
+    let (mut bob, w2) = peer(&b, "bob").await;
+    sees(&mut alice, &w1, "bob").await;
+    sees(&mut carol, &w3, "bob").await;
+    sees(&mut bob, &w2, "alice").await;
+    sees(&mut bob, &w2, "carol").await;
+    say(
+        &mut alice,
+        Message::Text(
+            json!({"v":1,"type":"message","channel":"updates","seq":1,"to":"bob","payload":"hi"})
+                .to_string()
+                .into(),
+        ),
+    )
+    .await;
+    let got = wait_for(&mut bob, 5000, is_frame).await.unwrap();
+    assert_eq!(
+        (got["from"].as_str(), &got["payload"]),
+        (Some("alice"), &json!("hi"))
+    );
+    assert!(frames_within(&mut carol, 500).await.is_empty());
+    say(&mut bob, Message::Text(json!({"v":1,"type":"signal.offer","channel":"rtc","seq":1,"to":"carol","payload":{"sdp":"x"}}).to_string().into())).await;
+    let got = wait_for(&mut carol, 5000, |v| v["type"] == "signal.offer")
+        .await
+        .unwrap();
+    assert_eq!(
+        (got["from"].as_str(), &got["payload"]["sdp"]),
+        (Some("bob"), &json!("x"))
+    );
+    assert!(wait_for(&mut alice, 500, |v| v["type"] == "signal.offer")
+        .await
+        .is_none());
+    a.task.abort();
+    b.task.abort();
+}
+
+#[tokio::test]
+async fn presence_is_merged_across_the_link_in_both_directions() {
+    let (a, b) = pair().await;
+    let (mut alice, w1) = peer(&a, "alice").await;
+    let (mut bob, w2) = peer(&b, "bob").await;
+    sees(&mut alice, &w1, "bob").await;
+    sees(&mut bob, &w2, "alice").await;
+    // A peer joining later is announced on the other side, and its leave follows.
+    let (mut carol, _) = peer(&a, "carol").await;
+    assert!(wait_for(&mut bob, 5000, |v| v["type"] == "presence"
+        && v["event"] == "join"
+        && v["peer"] == "carol")
+    .await
+    .is_some());
+    carol.close(None).await.unwrap();
+    assert!(wait_for(&mut bob, 5000, |v| v["type"] == "presence"
+        && v["event"] == "leave"
+        && v["peer"] == "carol")
+    .await
+    .is_some());
+    // A peer that connects after the link is up sees the other side in its welcome list.
+    let (_dave, welcome) = peer(&b, "dave").await;
+    assert!(welcome.iter().any(|p| p == "alice"), "{welcome:?}");
+    a.task.abort();
+    b.task.abort();
+}
+
+#[tokio::test]
+async fn three_services_in_a_ring_deliver_once_and_do_not_loop() {
+    let a = node("a", &["alice", "svc-c"]).await;
+    let b = node("b", &["bob", "svc-a"]).await;
+    let c = node("c", &["carol", "svc-b"]).await;
+    link(&a, &b, "ab").await;
+    link(&b, &c, "bc").await;
+    link(&c, &a, "ca").await;
+    for (n, id) in [(&a, "ab"), (&b, "bc"), (&c, "ca")] {
+        link_status(n, id, "connected").await;
+    }
+    let (mut alice, w1) = peer(&a, "alice").await;
+    let (mut bob, w2) = peer(&b, "bob").await;
+    let (mut carol, w3) = peer(&c, "carol").await;
+    for (ws, w, names) in [
+        (&mut alice, &w1, ["bob", "carol"]),
+        (&mut bob, &w2, ["alice", "carol"]),
+        (&mut carol, &w3, ["alice", "bob"]),
+    ] {
+        for name in names {
+            sees(ws, w, name).await;
+        }
+    }
+    say(&mut alice, frame(1, json!("around"))).await;
+    for ws in [&mut bob, &mut carol] {
+        let got = wait_for(ws, 5000, is_frame).await.unwrap();
+        assert_eq!(
+            (got["from"].as_str(), &got["payload"]),
+            (Some("alice"), &json!("around"))
+        );
+    }
+    // The frame circles the ring but is delivered exactly once per peer and never returns.
+    assert!(frames_within(&mut alice, 1500).await.is_empty());
+    assert!(frames_within(&mut bob, 100).await.is_empty());
+    assert!(frames_within(&mut carol, 100).await.is_empty());
+    let mut dropped = 0;
+    for n in [&a, &b, &c] {
+        dropped += counters(n).await.0;
+    }
+    assert!(dropped > 0, "the ring must have dropped looping copies");
+    // A second frame from the far side behaves the same.
+    say(&mut carol, frame(1, json!("back"))).await;
+    for ws in [&mut alice, &mut bob] {
+        assert!(wait_for(ws, 5000, is_frame).await.is_some());
+    }
+    assert!(frames_within(&mut alice, 500).await.is_empty());
+    assert!(frames_within(&mut bob, 500).await.is_empty());
+    for n in [a, b, c] {
+        n.task.abort();
+    }
+}
+
+/// Whether the socket is closed by the hub within a few seconds.
+async fn closed(ws: &mut Ws) -> bool {
+    use futures_util::StreamExt;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[tokio::test]
+async fn a_peer_sending_a_link_frame_is_refused() {
+    let (a, b) = pair().await;
+    let (mut alice, w1) = peer(&a, "alice").await;
+    let (mut carol, w3) = peer(&a, "carol").await;
+    let (mut bob, w2) = peer(&b, "bob").await;
+    sees(&mut alice, &w1, "bob").await;
+    sees(&mut carol, &w3, "bob").await;
+    sees(&mut bob, &w2, "alice").await;
+    let forged_frame = json!({"type":"link.frame","trace":["x"],"frame":{"from":"alice","v":1,"type":"message","channel":"updates","seq":1,"payload":"forged"}});
+    let forged_presence =
+        json!({"type":"link.presence","trace":["x"],"event":"join","peer":"ghost"});
+    say(&mut alice, Message::Text(forged_frame.to_string().into())).await;
+    assert!(
+        closed(&mut alice).await,
+        "a peer sending link.frame must be refused"
+    );
+    say(
+        &mut carol,
+        Message::Text(forged_presence.to_string().into()),
+    )
+    .await;
+    assert!(
+        closed(&mut carol).await,
+        "a peer sending link.presence must be refused"
+    );
+    // Nothing leaked to the far side and no ghost peer appeared there.
+    assert!(
+        wait_for(&mut bob, 800, |v| is_frame(v) || v["peer"] == "ghost")
+            .await
+            .is_none()
+    );
+    a.task.abort();
+    b.task.abort();
+}
+
+#[tokio::test]
+async fn invalid_payloads_are_refused_at_ingress_and_again_on_a_stricter_far_side() {
+    let channels = json!({"updates":{"delivery":"reliable","schemaRef":"message@1"}});
+    let a = node_with(
+        "a",
+        &["alice", "svc-b"],
+        Some(channels.clone()),
+        Some(json!({"type":"integer"})),
+    )
+    .await;
+    let b = node_with(
+        "b",
+        &["bob", "svc-a"],
+        Some(channels),
+        Some(json!({"type":"integer","maximum":10})),
+    )
+    .await;
+    link(&a, &b, "ab").await;
+    link_status(&a, "ab", "connected").await;
+    let (mut alice, w1) = peer(&a, "alice").await;
+    let (mut bob, w2) = peer(&b, "bob").await;
+    sees(&mut alice, &w1, "bob").await;
+    sees(&mut bob, &w2, "alice").await;
+    // Valid on both sides.
+    say(&mut alice, frame(1, json!(5))).await;
+    assert_eq!(
+        wait_for(&mut bob, 5000, is_frame).await.unwrap()["payload"],
+        5
+    );
+    // Valid here but over the far side's maximum: refused there, and the link stays up.
+    say(&mut alice, frame(2, json!(42))).await;
+    say(&mut alice, frame(3, json!(7))).await;
+    let got = frames_within(&mut bob, 1500).await;
+    assert_eq!(
+        got.iter().map(|f| f["payload"].clone()).collect::<Vec<_>>(),
+        vec![json!(7)]
+    );
+    assert!(counters(&b).await.1 >= 1);
+    // Invalid at ingress: the sender is refused and nothing crosses.
+    say(&mut alice, frame(4, json!("bad"))).await;
+    assert!(closed(&mut alice).await);
+    assert!(frames_within(&mut bob, 500).await.is_empty());
+    a.task.abort();
+    b.task.abort();
+}
+
+/// Wait for a presence `event` about each of `names`, in any order.
+async fn presence_set(ws: &mut Ws, event: &str, names: &[&str]) {
+    let mut missing: Vec<&str> = names.to_vec();
+    while !missing.is_empty() {
+        let got = wait_for(ws, 10_000, |v| {
+            v["type"] == "presence" && v["event"] == event
+        })
+        .await
+        .unwrap_or_else(|| panic!("no {event} for {missing:?}"));
+        missing.retain(|n| got["peer"] != *n);
+    }
+}
+
+async fn killed_link() -> (Node, Node, Ws, Ws, Ws) {
+    let (a, b) = pair().await;
+    let (mut alice, w1) = peer(&a, "alice").await;
+    let (mut carol, w3) = peer(&a, "carol").await;
+    let (mut bob, w2) = peer(&b, "bob").await;
+    sees(&mut alice, &w1, "bob").await;
+    sees(&mut carol, &w3, "bob").await;
+    sees(&mut bob, &w2, "alice").await;
+    sees(&mut bob, &w2, "carol").await;
+    unlink(&a, "ab").await;
+    for ws in [&mut alice, &mut carol] {
+        assert!(wait_for(ws, 10_000, |v| v["type"] == "presence"
+            && v["event"] == "unreachable"
+            && v["peer"] == "bob")
+        .await
+        .is_some());
+    }
+    presence_set(&mut bob, "unreachable", &["alice", "carol"]).await;
+    (a, b, alice, carol, bob)
+}
+
+#[tokio::test]
+async fn a_link_killed_mid_room_reports_unreachable_and_local_peers_keep_working() {
+    let (a, b, mut alice, mut carol, mut bob) = killed_link().await;
+    say(&mut alice, frame(1, json!("still here"))).await;
+    let got = wait_for(&mut carol, 5000, is_frame).await.unwrap();
+    assert_eq!(got["payload"], "still here");
+    say(&mut carol, frame(1, json!("yes"))).await;
+    assert_eq!(
+        wait_for(&mut alice, 5000, is_frame).await.unwrap()["payload"],
+        "yes"
+    );
+    // The far side hears nothing from this side any more.
+    assert!(frames_within(&mut bob, 500).await.is_empty());
+    let (_dave, welcome) = peer(&b, "dave").await;
+    assert!(
+        !welcome.iter().any(|p| p == "alice" || p == "carol"),
+        "{welcome:?}"
+    );
+    a.task.abort();
+    b.task.abort();
+}
+
+#[tokio::test]
+async fn recovery_restores_presence_and_frames() {
+    let (a, b, mut alice, mut carol, mut bob) = killed_link().await;
+    link(&a, &b, "ab").await;
+    link_status(&a, "ab", "connected").await;
+    for ws in [&mut alice, &mut carol] {
+        assert!(wait_for(ws, 10_000, |v| v["type"] == "presence"
+            && v["event"] == "join"
+            && v["peer"] == "bob")
+        .await
+        .is_some());
+    }
+    presence_set(&mut bob, "join", &["alice", "carol"]).await;
+    say(&mut alice, frame(1, json!("again"))).await;
+    assert_eq!(
+        wait_for(&mut bob, 5000, is_frame).await.unwrap()["payload"],
+        "again"
+    );
+    say(&mut bob, frame(1, json!("welcome back"))).await;
+    for ws in [&mut alice, &mut carol] {
+        assert!(wait_for(ws, 5000, |v| v["payload"] == "welcome back")
+            .await
+            .is_some());
+    }
+    a.task.abort();
+    b.task.abort();
+}
