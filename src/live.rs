@@ -20,6 +20,16 @@ use std::{
 
 const MAX_USED: usize = 100_000;
 
+pub(crate) fn live_allowed_origins_from_env() -> Vec<String> {
+    std::env::var("LIVEENGINE_LIVE_ALLOWED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 pub(crate) fn ticket_ttl_from_env() -> Result<Duration, String> {
     match std::env::var("LIVEENGINE_TICKET_TTL_SECONDS") {
         Ok(value) => value
@@ -102,6 +112,13 @@ impl TicketSigner {
         hub_path: &[String],
         room: &str,
     ) -> Result<TicketClaims, &'static str> {
+        self.verify_inner(ticket, Some((hub_path, room)))
+    }
+    fn verify_inner(
+        &self,
+        ticket: &str,
+        binding: Option<(&[String], &str)>,
+    ) -> Result<TicketClaims, &'static str> {
         if ticket.len() > 16384 {
             return Err("invalid ticket");
         }
@@ -121,8 +138,7 @@ impl TicketSigner {
         let claims: TicketClaims = serde_json::from_slice(&bytes).map_err(|_| "invalid ticket")?;
         let now = now()?;
         if claims.expiry <= now
-            || claims.hub_path != hub_path
-            || claims.room != room
+            || binding.is_some_and(|(path, room)| claims.hub_path != path || claims.room != room)
             || !matches!(claims.role.as_str(), "peer" | "service")
             || claims.jti.is_empty()
         {
@@ -264,4 +280,169 @@ pub(crate) async fn issue_ticket(
             "hub handler is unavailable",
         )
     }
+}
+
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
+
+type RoomKey = (Vec<String>, String);
+#[derive(Clone)]
+struct PeerQueue {
+    sender: mpsc::Sender<Message>,
+    disconnect: tokio::sync::watch::Sender<bool>,
+}
+impl PeerQueue {
+    fn send(&self, message: Message) {
+        if self.sender.try_send(message).is_err() {
+            let _ = self.disconnect.send(true);
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct LiveRooms {
+    rooms: AsyncMutex<HashMap<RoomKey, HashMap<String, PeerQueue>>>,
+}
+
+pub(crate) async fn live_socket(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let origins = headers.get_all(axum::http::header::ORIGIN);
+    let mut origins = origins.iter();
+    if let Some(origin) = origins.next() {
+        if origins.next().is_some() {
+            return error(StatusCode::FORBIDDEN, "origin not allowed");
+        }
+        if !origin.to_str().ok().is_some_and(|o| {
+            state
+                .config
+                .live_allowed_origins
+                .iter()
+                .any(|allowed| allowed == o)
+        }) {
+            return error(StatusCode::FORBIDDEN, "origin not allowed");
+        }
+    }
+    ws.max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
+        .on_upgrade(move |socket| serve_socket(state, socket))
+}
+
+async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
+    let first = tokio::time::timeout(Duration::from_secs(5), socket.recv()).await;
+    let Some(Ok(Message::Text(text))) = first.ok().flatten() else {
+        return;
+    };
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Auth {
+        r#type: String,
+        ticket: String,
+    }
+    let Ok(auth) = serde_json::from_str::<Auth>(&text) else {
+        return;
+    };
+    if auth.r#type != "auth" {
+        return;
+    }
+    let Ok(claims) = state.ticket_signer.verify_inner(&auth.ticket, None) else {
+        return;
+    };
+    let key = (claims.hub_path, claims.room);
+    let user = claims.user;
+    let (tx, mut rx) = mpsc::channel::<Message>(64);
+    let (disconnect, mut disconnected) = tokio::sync::watch::channel(false);
+    {
+        let mut rooms = state.live_rooms.rooms.lock().await;
+        let room = rooms.entry(key.clone()).or_default();
+        if room.contains_key(&user) {
+            return;
+        }
+        let peers: Vec<_> = room.keys().cloned().collect();
+        let welcome = serde_json::json!({"type":"welcome","peers":peers}).to_string();
+        if tx.try_send(Message::Text(welcome.into())).is_err() {
+            return;
+        }
+        let joined = Message::Text(
+            serde_json::json!({"type":"presence","event":"join","peer":user})
+                .to_string()
+                .into(),
+        );
+        for queue in room.values() {
+            queue.send(joined.clone());
+        }
+        room.insert(
+            user.clone(),
+            PeerQueue {
+                sender: tx,
+                disconnect,
+            },
+        );
+    }
+    let (mut sink, mut stream) = socket.split();
+    let mut writer = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            if sink.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        let message = tokio::select! {
+            result = stream.next() => match result { Some(Ok(message)) => message, _ => break },
+            _ = disconnected.changed() => break,
+            _ = &mut writer => break,
+        };
+        let Message::Text(text) = message else { break };
+        let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+            break;
+        };
+        let Some(object) = value.as_object_mut() else {
+            break;
+        };
+        if object
+            .get("from")
+            .is_some_and(|from| from.as_str() != Some(&user))
+            || !object.get("v").is_some_and(|v| v.is_number())
+            || !object.get("type").is_some_and(|v| v.is_string())
+            || !object.get("channel").is_some_and(|v| v.is_string())
+            || !object.get("seq").is_some_and(|v| v.is_u64())
+            || !object.contains_key("payload")
+            || object.get("to").is_some_and(|v| !v.is_string())
+        {
+            break;
+        }
+        let target = object.get("to").and_then(Value::as_str).map(str::to_owned);
+        object.insert("from".into(), Value::String(user.clone()));
+        let frame = Message::Text(value.to_string().into());
+        let rooms = state.live_rooms.rooms.lock().await;
+        if let Some(room) = rooms.get(&key) {
+            for (peer, queue) in room {
+                if target.as_ref().map_or(peer != &user, |to| to == peer) {
+                    queue.send(frame.clone());
+                }
+            }
+        }
+    }
+    {
+        let mut rooms = state.live_rooms.rooms.lock().await;
+        if let Some(room) = rooms.get_mut(&key) {
+            room.remove(&user);
+            let left = Message::Text(
+                serde_json::json!({"type":"presence","event":"leave","peer":user})
+                    .to_string()
+                    .into(),
+            );
+            for queue in room.values() {
+                queue.send(left.clone());
+            }
+            if room.is_empty() {
+                rooms.remove(&key);
+            }
+        }
+    }
+    writer.abort();
 }

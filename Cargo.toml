@@ -32,7 +32,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.8"
 rand_chacha = "0.3"
-axum = { version = "0.8", optional = true, features = ["json", "http1", "tokio"] }
+axum = { version = "0.8", optional = true, features = ["json", "http1", "tokio", "ws"] }
 tokio = { version = "1", optional = true, features = ["full"] }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls", "stream"] }
 url = { version = "2", optional = true }
@@ -59,3 +59,6 @@ required-features = ["host"]
 name = "axum-service"
 path = "examples/axum-service.rs"
 required-features = ["host"]
+
+[dev-dependencies]
+tokio-tungstenite = "0.29"

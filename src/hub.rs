@@ -31,7 +31,10 @@ use tokio::sync::{RwLock, Semaphore};
 use url::Url;
 
 use crate::engine::Engine;
-use crate::live::{issue_ticket, ticket_hub, ticket_ttl_from_env, TicketClaims, TicketSigner};
+use crate::live::{
+    issue_ticket, live_allowed_origins_from_env, live_socket, ticket_hub, ticket_ttl_from_env,
+    LiveRooms, TicketClaims, TicketSigner,
+};
 
 pub const HUB_PROTOCOL: &str = "liveengine.hub/v1";
 
@@ -95,6 +98,8 @@ pub struct HubConfig {
     pub max_ttl: Duration,
     pub ticket_ttl: Duration,
     pub public_url: Option<String>,
+    /// Allowed browser WebSocket origins.
+    pub live_allowed_origins: Vec<String>,
     /// Seed for engines created by internal hub registrations.
     pub seed: u64,
 }
@@ -122,6 +127,7 @@ impl Default for HubConfig {
             max_ttl: Duration::from_secs(24 * 60 * 60),
             ticket_ttl: Duration::from_secs(60),
             public_url: None,
+            live_allowed_origins: Vec::new(),
             seed: 0,
         }
     }
@@ -145,6 +151,7 @@ impl HubConfig {
             allowed_remote_hosts,
             ..Self::default()
         };
+        config.live_allowed_origins = live_allowed_origins_from_env();
         config.public_url = std::env::var("LIVEENGINE_PUBLIC_URL").ok();
         config.ticket_ttl = ticket_ttl_from_env()?;
         config.max_depth = env_limit("LIVEENGINE_MAX_DEPTH", config.max_depth)?;
@@ -457,6 +464,7 @@ pub(crate) struct Inner {
     root: bool,
     pub(crate) ticket_signer: Arc<TicketSigner>,
     pub(crate) hub_path: Vec<String>,
+    pub(crate) live_rooms: Arc<LiveRooms>,
 }
 
 /// Cloneable state for a hosted hub registry.
@@ -515,6 +523,7 @@ impl HubService {
                 root: true,
                 ticket_signer: Arc::new(TicketSigner::new(signing_key)),
                 hub_path: Vec::new(),
+                live_rooms: Arc::new(LiveRooms::default()),
             }),
         };
         if let Some(snapshot) = snapshot {
@@ -620,6 +629,7 @@ impl HubService {
                 self.inner.clone(),
                 secure_request,
             ))
+            .route("/v1/live", get(live_socket))
             .with_state(self.inner.clone())
     }
 
@@ -856,6 +866,7 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
             inner.inflight_calls = state.inflight_calls.clone();
             inner.instance_id = state.instance_id.clone();
             inner.ticket_signer = state.ticket_signer.clone();
+            inner.live_rooms = state.live_rooms.clone();
             inner.hub_path = state
                 .hub_path
                 .iter()
@@ -2175,6 +2186,7 @@ async fn register_hub_inherited(
         inner.durable = state.durable;
         inner.instance_id = state.instance_id.clone();
         inner.ticket_signer = state.ticket_signer.clone();
+        inner.live_rooms = state.live_rooms.clone();
         inner.hub_path = state
             .hub_path
             .iter()

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add ticket-authenticated WebSocket room relay with presence and targeted delivery.
+
 - Issue short-lived, signed, single-use live room tickets to paired users.
 
 - Accept and validate channel declarations in hosted hub definitions and protect their referenced schemas from deletion.

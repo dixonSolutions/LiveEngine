@@ -96,4 +96,13 @@ The Rust `HubClient` exposes `route`, `tree`, `export_registry`, and a general `
 
 ### Live room tickets
 
-Set `LIVEENGINE_PUBLIC_URL` to the direct live endpoint advertised by this service and optionally set `LIVEENGINE_TICKET_TTL_SECONDS` (default 60). An administrator can request `POST /v1/hubs/{id}/tickets` with `userId`, `serverId`, and optional `role` (`peer` or `service`); the user must already be paired in that server. The response contains `ticket`, `url`, and the Unix-seconds `expiresAt`. For nested hubs, use the `ticket` route operation with the hub `id` in the body. The owning service issues the ticket. Tickets are single-use and bound to the hub path and room. The signing key is stored in the private state file; used-ticket tracking is in memory and resets on restart. WebSocket connections are not available in this release.
+Set `LIVEENGINE_PUBLIC_URL` to the direct live endpoint advertised by this service and optionally set `LIVEENGINE_TICKET_TTL_SECONDS` (default 60). An administrator can request `POST /v1/hubs/{id}/tickets` with `userId`, `serverId`, and optional `role` (`peer` or `service`); the user must already be paired in that server. The response contains `ticket`, `url`, and the Unix-seconds `expiresAt`. For nested hubs, use the `ticket` route operation with the hub `id` in the body. The owning service issues the ticket. Tickets are single-use and bound to the hub path and room. The signing key is stored in the private state file; used-ticket tracking is in memory and resets on restart.
+
+Live room connections use `GET /v1/live` as a WebSocket endpoint. Send the
+single-use ticket in the first JSON text frame as `{"type":"auth","ticket":"..."}`
+within five seconds; do not put it in the URL. Set
+`LIVEENGINE_LIVE_ALLOWED_ORIGINS` to a comma-separated list of exact browser
+origins. Requests without an Origin header are accepted; requests with one must
+match the list. A welcome message lists current peers, and presence messages
+announce joins and leaves. Relay messages contain `v`, `type`, `channel`,
+`seq`, and `payload`, with optional `to`; the server supplies `from`.
