@@ -83,3 +83,22 @@ test('HubClient requests nested routes and tree discovery', async () => {
   assert.equal(requests[0].init.headers.authorization, 'Bearer secret');
   assert.deepEqual(JSON.parse(requests[1].init.body), { path: ['eu', 'games'], op: 'tree', body: { depth: 2 } });
 });
+
+test('HubClient sends schema and registry operations with encoded identifiers', async () => {
+  const requests = [];
+  const client = new HubClient('https://hub.example', { token: 'test-administrator-token-long-enough', fetch: async (url, init) => {
+    requests.push({ url, init });
+    return new Response(init.method === 'DELETE' ? null : '{}', { status: init.method === 'DELETE' ? 204 : 200 });
+  } });
+  await client.createSchema({id: 'game', version: '1', schema: {type: 'object'}});
+  await client.listSchemas();
+  await client.getSchema('game@1');
+  await client.removeSchema('game@1');
+  await client.exportRegistry();
+  await client.importRegistry({address: 'https://remote.example', token: 'remote-administrator-token-long-enough', refreshSeconds: 60});
+  assert.deepEqual(requests.map(r => r.init.method), ['POST', 'GET', 'GET', 'DELETE', 'GET', 'POST']);
+  assert.match(requests[2].url, /\/v1\/schemas\/game%401$/);
+  assert.match(requests[4].url, /\/v1\/registry\/export$/);
+  assert.equal(JSON.parse(requests[5].init.body).refreshSeconds, 60);
+  assert.ok(requests.every(r => r.init.headers.authorization === 'Bearer test-administrator-token-long-enough'));
+});

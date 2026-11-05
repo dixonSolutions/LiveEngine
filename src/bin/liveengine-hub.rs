@@ -1,12 +1,13 @@
 use std::{net::SocketAddr, process::ExitCode, time::Duration};
 
-use liveengine::hub::{ping_hub, HubConfig, HubService};
+use liveengine::hub::{ping_hub, HubClient, HubConfig, HubService};
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("ping") => run_ping(&args[1..]).await,
+        Some("request") => run_request(&args[1..]).await,
         Some("serve") | None => run_serve().await,
         Some("help") | Some("--help") | Some("-h") => {
             print_usage();
@@ -31,7 +32,7 @@ async fn main() -> ExitCode {
 
 fn print_usage() {
     println!(
-        "Usage:\n  liveengine-hub [serve]\n  liveengine-hub ping <url> [--samples N] [--timeout-ms N] [--json]"
+        "Usage:\n  liveengine-hub [serve]\n  liveengine-hub ping <url> [--samples N] [--timeout-ms N] [--json]\n  liveengine-hub request <url> <method> <route> [json-body]"
     );
 }
 
@@ -114,5 +115,24 @@ async fn run_ping(args: &[String]) -> Result<(), String> {
             stats.samples.len()
         );
     }
+    Ok(())
+}
+
+async fn run_request(args: &[String]) -> Result<(), String> {
+    if !(3..=4).contains(&args.len()) {
+        return Err("request requires URL, method, route and optional JSON body".into());
+    }
+    let token = std::env::var("LIVEENGINE_TOKEN").map_err(|_| "LIVEENGINE_TOKEN must be set")?;
+    let client = HubClient::new(&args[0], token)?;
+    let method = args[1].parse().map_err(|_| "invalid HTTP method")?;
+    let body = args
+        .get(3)
+        .map(|s| serde_json::from_str(s).map_err(|_| "invalid JSON body"))
+        .transpose()?;
+    let result = client.request(method, &args[2], body).await?;
+    println!(
+        "{}",
+        serde_json::to_string(&result).map_err(|e| e.to_string())?
+    );
     Ok(())
 }

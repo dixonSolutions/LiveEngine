@@ -1,0 +1,17 @@
+---
+title: "Hub schemas"
+description: "Publish versioned JSON Schemas and bind them to hub scopes."
+---
+
+Publish an immutable schema version, then bind a hub to it:
+
+```js
+await hub.createSchema({ id: 'game', version: '1', schema: {
+  type: 'object', required: ['region'], properties: { region: { enum: ['au', 'nz'] } }
+} });
+await hub.register({ id: 'match', mode: 'internal', schemaRef: 'game@1', scopes: { region: 'au' } });
+```
+
+`listSchemas`, `getSchema('game@1')` and `removeSchema('game@1')` manage definitions. Deleting an in-use schema returns 409; `liveengine.default@1` is built in. Instead of `schemaRef`, use an inline `scopeSchema`. `userSchema` and `serverSchema` override validation for their respective upserts. Children inherit the nearest central schema unless overridden. Schema-bound hubs reject `generateUsers`; generate locally and upsert validated users.
+
+Schemas follow JSON Schema draft 2020-12. Only local JSON pointer references are allowed; remote references, schema IDs, anchors and cycles are refused. Schema size and complexity are bounded. Imports transfer definitions and reject conflicting versions. Export omits credentials. A configured state file persists schema definitions.

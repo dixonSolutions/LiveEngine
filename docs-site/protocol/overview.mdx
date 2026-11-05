@@ -1,6 +1,6 @@
 ---
 title: "Hub protocol overview"
-description: "Versioned HTTP contract, authentication, JSON envelope, route map, scopeSchema subset, and error format."
+description: "Versioned HTTP contract, authentication, JSON envelope, route map, JSON Schema, and error format."
 ---
 
 LiveEngine hosts and external hubs share one protocol: **`liveengine.hub/v1`**. The machine-readable schema is served at `GET /v1/contract/schema` and checked into the repository as `docs/hub-contract.schema.json`.
@@ -72,7 +72,14 @@ Application method results are wrapped in `result`; the Node `HubClient.call` un
 | `GET` | `/v1/hubs/{id}` | yes | Inspect one hub |
 | `DELETE` | `/v1/hubs/{id}` | yes | Remove a registration |
 | `POST` | `/v1/hubs/{id}/call` | yes | Exchange method/args for a result |
-| `POST` | `/v1/registries/import` | yes | Snapshot a remote registry |
+| `POST` | `/v1/registries/import` | yes | Import or refresh a remote registry |
+| `GET` | `/v1/registry/export` | yes | Export public definitions |
+| `POST` | `/v1/route` | yes | Route an operation into a central namespace |
+| `GET` | `/v1/tree` | yes | Discover nested branches |
+| `GET`, `POST` | `/v1/schemas` | yes | List or publish schemas |
+| `GET`, `DELETE` | `/v1/schemas/{id}` | yes | Read or delete a schema |
+| `GET`, `POST` | `/v1/templates` | yes | List or create templates |
+| `GET`, `DELETE` | `/v1/templates/{name}` | yes | Read or delete a template |
 
 See [Endpoints](/protocol/endpoints) for bodies and status codes, and [Registration DTOs](/protocol/registration) for field rules.
 
@@ -99,44 +106,10 @@ The prefix for registry imports is at most 64 characters of the same character s
 
 ## TTL
 
-`ttlSeconds` is optional, at least 1, and at most `max_ttl` (default 24 hours). Expired registrations are dropped lazily when the registry is accessed. They can be re-registered after expiry. TTL state is in memory.
+`ttlSeconds` is optional, at least 1, and at most `max_ttl` (default 24 hours). Expired registrations are removed by a background reaper.
 
-## scopeSchema subset
+## Schemas and forwarding
 
-When a registration includes `scopeSchema`, the host validates scopes for `upsertUser`, `upsertUsers`, `upsertServer`, and `upsertServers`. Supported keys:
+Schemas use JSON Schema 2020-12. Only local JSON pointer references are supported; remote references, IDs, anchors and cycles are rejected. A hub accepts `scopeSchema` or `schemaRef`, with optional `userSchema` and `serverSchema`; inherited schemas apply to nested children. Schema-bound hubs reject `generateUsers`.
 
-```json
-{
-  "type": "object",
-  "required": ["region"],
-  "properties": {
-    "region": { "type": "string", "enum": ["au", "nz"] },
-    "rating": { "type": "integer" }
-  },
-  "additionalProperties": false
-}
-```
-
-| Keyword | Behavior |
-| --- | --- |
-| `type` | If present, must be `object`; property types may be `string`, `number`, `integer`, `boolean`, `array`, `object`, or `null` |
-| `required` | Array of scope names that must be present |
-| `properties` | Object mapping scope names to `{ type?, enum? }` |
-| `additionalProperties: false` | Rejects scopes not listed in `properties` |
-| `enum` | Exact JSON membership test |
-
-It is **not** a complete JSON Schema validator. `generateUsers` is rejected for hubs with a schema; generate locally and submit through `upsertUsers`.
-
-## Forwarding
-
-Calls to external hubs are forwarded with `x-liveengine-hop`:
-
-- absent = `0`
-- allowed values are `0`, `1`, `2`
-- other values return `400`
-- an external hub receiving hop `2` returns `508`
-- forwarded calls use `hop + 1`
-
-## State model
-
-The registry, engines, TTLs, rate budgets, and credentials are in memory. The protocol has no persistence or replication semantics. Restarting a host loses its registrations and state.
+Forwarding uses `x-liveengine-trace` and `x-liveengine-depth`. Repeated instance IDs and depth exhaustion return 508. `LIVEENGINE_MAX_DEPTH` defaults to 8 and is capped at 16. Clients should not set forwarding headers. Registry definitions can be persisted using `LIVEENGINE_STATE_FILE`; live rooms and players remain in memory. See [nesting](/guides/nesting) and [schemas](/guides/schemas).

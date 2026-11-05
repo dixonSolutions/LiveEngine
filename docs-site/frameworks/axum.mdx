@@ -69,6 +69,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **`HubConfig::from_env()` requires `LIVEENGINE_TOKEN`.** Keep the token at least 24 bytes. Configure `LIVEENGINE_ALLOWED_REMOTE_HOSTS` before registering external hubs.
 - **Mounting under a prefix.** If you nest the router under `/matchmaking`, set the external base address to include that prefix when other services register this host.
 - **Custom handlers.** `register_internal` accepts any `HubHandler`. Implement `preflight` to reject oversized or invalid mutations before they change your state.
-- **Shutdown.** The hub is in-process; stopping the Axum server stops the registry. State is in memory and is not persisted.
+- **Shutdown.** The hub is in-process; stopping the Axum server stops the registry. Live engine state is in memory; `HubConfig.state_file` can persist registry definitions.
 
 For a router-free integration, depend on `liveengine` with `default-features = false` and use `Engine` directly. See [Rust engine](/rust/engine).

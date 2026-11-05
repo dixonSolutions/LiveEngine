@@ -77,54 +77,14 @@ Removing an external registration does not remove or stop the remote hub. It onl
 
 `GET /v1/hubs/{id}` returns one record or `404`. `expiresInSeconds` is recomputed from TTL when the record is read. Expired records are removed lazily on registry access.
 
-## TTL
+## Expiry, imports and persistence
 
-`ttlSeconds` is optional, must be at least 1, and cannot exceed the host's `max_ttl` (default 24 hours). Expiry is in memory only:
+Hubs can expire with `ttlSeconds`. Templates provide defaults, `ifAbsent` permits idempotent creation, and local centrals can set a `maxHubs` child quota. Imports are snapshots unless `refreshSeconds` enables periodic refresh; missing source entries become stale rather than being deleted.
 
-- Expired hubs disappear from discovery and calls.
-- A hub ID can be registered again after expiry.
-- Restarting the host drops every TTL and registration state.
+Set `LIVEENGINE_STATE_FILE` to persist definitions, schemas, templates, imports, credentials and instance ID. The file is created mode 0600 and rejected if group or world accessible; protect backups too. Live players and rooms remain in memory. See [hosting](/guides/hosting).
 
-TTL registrations and permanent registrations use the same record type; omit `ttlSeconds` for a permanent registration.
+## Nesting and schemas
 
-## Imports are snapshots
+A central is a namespace, either local or backed by another service. Route operations through a path of central IDs; tree discovery reports branch errors without failing the entire listing. Forwarding is bounded by `LIVEENGINE_MAX_DEPTH` (default 8, maximum 16), and repeated instance IDs in the trace return 508. See [nested hubs](/guides/nesting).
 
-`POST /v1/registries/import` reads the remote registry **now** and creates external aliases locally with an optional prefix:
-
-```json
-{
-  "address": "https://remote.example.net",
-  "token": "a-remote-administrative-token",
-  "prefix": "partner-"
-}
-```
-
-If the remote advertises `ranked-au`, the local ID becomes `partner-ranked-au`. The import:
-
-- Validates the address against the allowlist and performs health/contract handshakes.
-- Reads the remote hub list and rejects duplicates after prefixing.
-- Preserves remote `scopes` and `scopeSchema`.
-- Reuses an existing alias when address, remote hub ID, and token all match (idempotent).
-- Returns `409` when an ID is already mapped to a different target.
-- Returns `507` when the local registry would exceed `max_hubs` and `413` when the remote list is too large.
-
-Registrations added to the remote registry after the import are not discovered automatically. Run the import again to take a new snapshot. Imported aliases have no TTL.
-
-## Hub ID rules
-
-Hub IDs and remote hub IDs must be 1–128 characters of ASCII letters, digits, `.`, `_`, or `-`. The path segments `.` and `..` are rejected, as are IDs with leading or trailing whitespace. These rules prevent a hub from being unaddressable or escaping its route segment.
-
-## Forwarding hop limit
-
-Forwarded calls carry `x-liveengine-hop`:
-
-- A request without the header is treated as hop `0`.
-- Values must parse as an unsigned 8-bit integer and be at most `2`; other values return `400`.
-- When an external hub receives a call at hop `2`, it returns `508 LOOP_DETECTED`.
-- Otherwise the host forwards with `hop + 1`.
-
-This bounds forwarding chains and catches loops. The value counts forwarding steps, not application retries.
-
-## Scopes vs. scopeSchema
-
-`scopes` on a registration is metadata describing the hub; it is returned in discovery. `scopeSchema`, when present, is enforced for `upsertUser`, `upsertUsers`, `upsertServer`, and `upsertServers` calls. It is a small JSON Schema subset (object type, `required`, primitive property types, `enum`, and `additionalProperties: false`), not a general validator. Hubs with a schema reject `generateUsers`; generate users locally and submit them with `upsertUsers`.
+Schemas use JSON Schema 2020-12 with local JSON pointer references. Hubs can use an inline `scopeSchema` or immutable `schemaRef`, and override user and server schemas separately. Nearest central schemas are inherited. Schema-bound hubs reject `generateUsers`; submit validated users instead. See [schemas](/guides/schemas).

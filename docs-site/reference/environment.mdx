@@ -125,3 +125,12 @@ See [Gogh Strike integration](/guides/gogh-strike) for commands and behavior.
 - [Limits](/reference/limits): defaults and budget meanings.
 - [Rust HubConfig](/rust/config): programmatic fields and validation.
 - [Deployment](/guides/deployment): TLS, proxies, and state warnings.
+
+## Nested and durable hubs
+
+| Variable | Meaning |
+| --- | --- |
+| `LIVEENGINE_MAX_DEPTH` | Maximum routing depth, default 8, hard cap 16 |
+| `LIVEENGINE_INSTANCE_ID` | Stable unique service ID for loop detection |
+| `LIVEENGINE_STATE_FILE` | Durable definitions snapshot, containing plaintext remote credentials; protect with mode 0600 |
+| `LIVEENGINE_HUB_PATH` | Gogh Strike bridge path of central IDs separated by `/` |

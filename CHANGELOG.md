@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Expose nested registry operations in the Rust client and CLI, document schemas and nesting, and support `LIVEENGINE_HUB_PATH` in the Gogh Strike bridge.
+
 - Persist self-hosted registry definitions and refresh imported registries, marking missing entries stale.
 
 - Add remote and local nested central routing, bounded tree discovery, loop detection, and inherited schemas.

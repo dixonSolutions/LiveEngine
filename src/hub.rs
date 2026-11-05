@@ -2955,3 +2955,98 @@ fn env_limit(name: &str, default: usize) -> Result<usize, String> {
 fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({"error":message}))).into_response()
 }
+
+/// Authenticated HTTP client for the hub protocol. Keep the token server-side.
+#[derive(Clone)]
+pub struct HubClient {
+    base: Url,
+    token: String,
+    client: Client,
+    max_response_bytes: usize,
+}
+
+impl HubClient {
+    /// Create a client with a five-second timeout and a 4 MiB response limit.
+    pub fn new(address: &str, token: impl Into<String>) -> Result<Self, String> {
+        let base = Url::parse(address).map_err(|_| "invalid hub address")?;
+        if !matches!(base.scheme(), "http" | "https")
+            || base.host_str().is_none()
+            || !base.username().is_empty()
+            || base.password().is_some()
+            || base.query().is_some()
+            || base.fragment().is_some()
+        {
+            return Err("invalid hub address".into());
+        }
+        let token = token.into();
+        if token.is_empty() {
+            return Err("hub token is required".into());
+        }
+        let client = Client::builder()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            base,
+            token,
+            client,
+            max_response_bytes: 4 * 1024 * 1024,
+        })
+    }
+
+    /// Send an authenticated protocol request. A 204 response returns null.
+    pub async fn request(
+        &self,
+        method: reqwest::Method,
+        route: &str,
+        body: Option<Value>,
+    ) -> Result<Value, String> {
+        if !route.starts_with("/v1/") || route.contains('#') || route.starts_with("//") {
+            return Err("invalid hub route".into());
+        }
+        let mut base = self.base.to_string();
+        while base.ends_with('/') {
+            base.pop();
+        }
+        let url = Url::parse(&format!("{base}{route}")).map_err(|_| "invalid hub route")?;
+        let mut request = self.client.request(method, url).bearer_auth(&self.token);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| "hub request failed".to_string())?;
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(Value::Null);
+        }
+        read_remote_json(response, self.max_response_bytes).await
+    }
+
+    /// Route an operation to a central namespace. The empty path targets the root.
+    pub async fn route(&self, path: &[String], op: &str, body: Value) -> Result<Value, String> {
+        self.request(
+            reqwest::Method::POST,
+            "/v1/route",
+            Some(serde_json::json!({"path": path, "op": op, "body": body})),
+        )
+        .await
+    }
+
+    /// Recursively discover hub branches up to the given depth.
+    pub async fn tree(&self, depth: usize) -> Result<Value, String> {
+        self.request(
+            reqwest::Method::GET,
+            &format!("/v1/tree?depth={depth}"),
+            None,
+        )
+        .await
+    }
+
+    /// Export public registry definitions without credentials.
+    pub async fn export_registry(&self) -> Result<Value, String> {
+        self.request(reqwest::Method::GET, "/v1/registry/export", None)
+            .await
+    }
+}

@@ -114,14 +114,7 @@ Removing the registration deletes only the local route. The remote hub, its engi
 
 ## Forwarding depth
 
-Forwarded calls carry `x-liveengine-hop`:
-
-- Missing header means hop `0`.
-- Values above `2` or non-numeric values return `400`.
-- An external hub that receives a call at hop `2` returns `508` and does not forward again.
-- Other calls forward with `hop + 1`.
-
-Keep chains short. The limit is a loop and recursion guard, not a routing feature.
+Forwarding carries `x-liveengine-trace` instance IDs and `x-liveengine-depth`. Repeated instance IDs or a depth beyond `LIVEENGINE_MAX_DEPTH` return 508. The default depth is 8 and the hard maximum is 16. Give each service a stable unique `LIVEENGINE_INSTANCE_ID` or use its generated persisted identity. See [Nested hubs](/guides/nesting).
 
 ## Compose hostnames
 

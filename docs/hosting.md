@@ -15,6 +15,9 @@ Limits are configurable through `HubConfig` when embedding the router. The stand
 | Environment variable | Default |
 | --- | --- |
 | `LIVEENGINE_MAX_HUBS` | 256 |
+| `LIVEENGINE_MAX_DEPTH` | 8 (maximum 16) |
+| `LIVEENGINE_INSTANCE_ID` | generated and persisted |
+| `LIVEENGINE_STATE_FILE` | unset (in-memory registry) |
 | `LIVEENGINE_MAX_BODY_BYTES` | 1048576 |
 | `LIVEENGINE_MAX_RESPONSE_BYTES` | 4194304 |
 | `LIVEENGINE_MAX_ARGS` | 256 |
@@ -88,3 +91,5 @@ Set `LIVEENGINE_STATE_FILE` to a writable file path to persist hub definitions, 
 `GET /v1/registry/export` returns hub and schema definitions without credentials. `POST /v1/registries/import` accepts an optional `refreshSeconds` (1–86400); the service periodically re-syncs the source, retains entries no longer present with `stale: true`, and persists the refresh configuration and credential. A failed refresh leaves the previous registry intact.
 
 The Compose example provides three separate services and persistent volumes. After starting it, register `remote` as a remote central on `central`, then register `leaf` as a remote central on `remote` using their respective credentials and service addresses `http://remote:8787` and `http://leaf:8787`. Create child hubs on `leaf` to form a three-tier nest. Each volume contains sensitive credentials and should be secured and backed up accordingly.
+
+The Rust `HubClient` exposes `route`, `tree`, `export_registry`, and a general `request` method. Node `HubClient` provides schema and template operations as well as nested routing. The CLI accesses any authenticated endpoint using `liveengine-hub request <url> <method> <route> [json-body]`; set `LIVEENGINE_TOKEN` in its environment.

@@ -272,7 +272,7 @@ The host checks, in order:
 7. The hub exists.
 8. If the hub has `scopeSchema`, upsert scopes are valid and `generateUsers` is rejected.
 9. An in-flight slot is available.
-10. `x-liveengine-hop` is valid and within the forwarding limit.
+10. The forwarding trace and depth are valid and within the configured limit.
 11. The internal handler or remote call runs.
 12. The result is within response size, entity, and event limits.
 
@@ -289,7 +289,7 @@ The host checks, in order:
 | `502` | Remote request/handshake/JSON failure |
 | `503` | In-flight capacity busy or handler unavailable |
 | `504` | Request timeout |
-| `508` | Forwarding hop limit reached |
+| `508` | Forwarding depth or loop detected |
 
 An application failure is a `200` with a result such as:
 
@@ -346,7 +346,7 @@ curl --silent -X POST \
 | `504` | Request timeout |
 | `507` | Local registry would exceed `max_hubs` |
 
-Imports are not subscriptions. Run the request again to discover hubs registered remotely after the previous snapshot.
+Set `refreshSeconds` to periodically refresh; missing entries are marked stale.
 
 ## Common statuses
 
@@ -363,4 +363,20 @@ Imports are not subscriptions. Run the request again to discover hubs registered
 | `503` | Service Unavailable | In-flight capacity or unavailable handler |
 | `504` | Gateway Timeout | Request exceeded `request_timeout` |
 | `507` | Insufficient Storage | Hub registry is full |
-| `508` | Loop Detected | External forwarding at hop `2` |
+| `508` | Loop Detected | Forwarding depth or loop detected |
+
+## Nested routing, schemas, templates and export
+
+All routes below require the admin bearer token.
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| POST | `/v1/route` | `{path, op, body}`; op is `get`, `list`, `register`, `delete`, `call`, or `tree` |
+| GET | `/v1/tree?depth=2` | Bounded recursive discovery with per-branch status |
+| GET, POST | `/v1/schemas` | List or create immutable `{id, version, schema}` definitions |
+| GET, DELETE | `/v1/schemas/{id@version}` | Read or delete a schema; in-use deletion returns 409 |
+| GET, POST | `/v1/templates` | List or create templates |
+| GET, DELETE | `/v1/templates/{name}` | Read or delete a template |
+| GET | `/v1/registry/export` | Export hub and schema definitions without credentials |
+
+For route `get`, `delete` and `call`, provide `body.id`; calls also require `method` and optional `args`. A path selects central namespaces, and an empty path targets the root. A registration accepts `template`, `ifAbsent`, `schemaRef`, `userSchema`, `serverSchema`, and `maxHubs`. Registry import accepts `refreshSeconds`. See [nesting](/guides/nesting) and [schemas](/guides/schemas).

@@ -151,7 +151,7 @@ const events = await hub.call('ranked-au', 'drainEvents');
 Calling `drainEvents` through the HTTP contract is a mutating engine method; the result is the event array that was removed.
 
 <Warning>
-Registry and engine state are in memory. Restarting the host loses every registration, user, membership, and queued event. Add application persistence before relying on restart recovery.
+Set `LIVEENGINE_STATE_FILE` to persist registry definitions, schemas, templates, imports, and the service identity. The file contains plaintext remote credentials; it is created mode 0600 and startup refuses an insecure or corrupt file. Live users, rooms, memberships, and queued events remain in memory and are lost on restart.
 </Warning>
 
 ## Container connectivity check

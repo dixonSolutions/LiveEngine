@@ -28,7 +28,7 @@ Do not treat every non-OK application result as an exception, and do not treat e
 | `503` | Service Unavailable | In-flight call capacity busy, or handler unavailable |
 | `504` | Gateway Timeout | Request exceeded the configured timeout |
 | `507` | Insufficient Storage | Hub registry is full |
-| `508` | Loop Detected | External forwarding reached the hop limit |
+| `508` | Loop Detected | Forwarding loop or depth limit reached |
 
 ### 400 vs 413
 
@@ -63,7 +63,7 @@ The local request may have been valid.
 
 ### 508 is the hop guard
 
-An external hub that receives `x-liveengine-hop: 2` refuses to forward again. This prevents loops and unbounded chains. It is not a rate limit.
+Repeated instance IDs in the forwarding trace or exhaustion of the configured maximum depth return 508.
 
 ## Engine result reasons
 

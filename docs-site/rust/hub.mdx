@@ -200,8 +200,12 @@ liveengine-hub: could not bind 127.0.0.1:8787: ...
 
 ## Operational notes
 
-- State is in memory; restarting loses registrations and engines.
-- The router does not persist, replicate, or elect a leader between processes.
+- Definitions can persist with `HubConfig.state_file`; live engine state remains in memory.
+- Registry snapshots are optional; the router does not replicate or elect a leader between processes.
 - Outbound calls use the configured request timeout and never follow redirects.
 - Remote hosts must be allowlisted before any connection is attempted.
 - The response to a timed-out handler does not cancel the handler; reconcile before retrying.
+
+## HTTP client
+
+`liveengine::hub::HubClient::new(address, token)` provides `route`, `tree`, `export_registry`, and `request` for every protocol endpoint. Requests use a five-second timeout, no redirects, and a 4 MiB response limit.

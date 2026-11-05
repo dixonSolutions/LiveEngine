@@ -130,7 +130,7 @@ const info = await client.register({
 ```ts
 interface HubDefinition {
   id: string;
-  mode: 'internal' | 'external';
+  mode: 'internal' | 'external' | 'central';
   address?: string;
   remoteHubId?: string;
   remoteToken?: string;
@@ -279,3 +279,7 @@ await client.register(definition);
 interface Counter { count: number; }
 const counter = await client.call<Counter>('counter', 'increment', [1]);
 ```
+
+## Nested registries and schemas
+
+Use `route(path, op, body)`, `tree(depth)`, `listSchemas`, `createSchema`, `getSchema`, `removeSchema`, `listTemplates`, `createTemplate`, `getTemplate`, `removeTemplate`, and `exportRegistry`. `importRegistry` accepts `refreshSeconds`. See [nesting](/guides/nesting) and [schemas](/guides/schemas).

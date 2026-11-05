@@ -167,11 +167,11 @@ The central container can resolve `remote`, but your laptop cannot. Use `http://
 
 ### Imported hub is missing
 
-Imports are snapshots. Register the remote hub first, then import again. Check that the prefix produces the ID you expect.
+Imports are snapshots unless `refreshSeconds` is set. Register the remote hub first, then refresh or import again. Check the prefix.
 
 ### `508 forwarding hop limit reached`
 
-The external chain is too long or loops. Shorten it. A hop value of `2` at an external hub is terminal.
+The chain exceeds `LIVEENGINE_MAX_DEPTH` or repeats a service instance ID. Shorten it and ensure each service has a unique stable identity.
 
 ## Containers
 
@@ -221,7 +221,7 @@ The repository does not include a docs deployment workflow. Connect `docs-site/`
 
 ## FAQ
 
-**Does LiveEngine persist matchmaking state?** No. State is in memory in 0.2.4.
+**Does LiveEngine persist matchmaking state?** Live rooms and players are in memory; `LIVEENGINE_STATE_FILE` can persist registry definitions.
 
 **Can I use it without Rust installed?** Yes, on a supported platform with a release tarball. Unsupported platforms and source installs need Rust 1.88+.
 
@@ -237,6 +237,6 @@ The repository does not include a docs deployment workflow. Connect `docs-site/`
 
 **Does a timeout roll back a mutation?** No. The handler may finish after the caller receives `504`.
 
-**Is `scopeSchema` a full JSON Schema validator?** No. It is a documented subset.
+**Is `scopeSchema` a JSON Schema validator?** Yes, draft 2020-12 with bounded complexity and local JSON pointer references only.
 
 **Does Gogh Strike synchronize game state?** No. Gameplay is locally simulated.

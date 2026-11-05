@@ -3,7 +3,7 @@ title: "Import a foreign registry"
 description: "Take a snapshot of another registry and attach its advertised hubs under a local prefix."
 ---
 
-Instead of registering each remote hub by hand, a central host can read another registry and create local external aliases in one request. An import is a **snapshot taken at request time**, not a subscription.
+Instead of registering each remote hub by hand, a central host can read another registry and create local external aliases in one request. An import is a snapshot by default; `refreshSeconds` enables periodic refresh.
 
 ## Request
 
@@ -94,9 +94,9 @@ Running the same import twice with the same address, token, and prefix:
 
 The import returns `409` when an imported ID already exists locally but maps to a different address, remote hub ID, or token. Remove the conflicting alias or choose a different prefix.
 
-## Snapshots, not subscriptions
+## Snapshots and refresh
 
-Registrations added to the remote registry **after** an import are not discovered automatically. Run the import again to take a new snapshot:
+Without `refreshSeconds`, run the import again to discover later registrations:
 
 ```js
 await central.importRegistry({
@@ -106,7 +106,7 @@ await central.importRegistry({
 });
 ```
 
-The second import adds new remote hubs and leaves existing aliases intact.
+The second import adds new remote hubs and leaves existing aliases intact. Alternatively, set `refreshSeconds` (1–86400) to refresh automatically; entries missing from the source are marked stale.
 
 ## Capacity and size errors
 
@@ -118,7 +118,7 @@ The second import adds new remote hubs and leaves existing aliases intact.
 | `502` | Health/contract/hub-list/handshake failure, malformed remote registry, or duplicate remote IDs |
 | `507` | The local registry would exceed `max_hubs` |
 
-Imported aliases have no TTL. They remain until removed or the central host restarts.
+Imported aliases have no TTL. They remain until removed; a state file preserves them across restarts.
 
 <Note>
 The remote service must allow the central host to call it. In a two-host deployment, the central and remote tokens are independent; the import token must be the remote service's administrative token.

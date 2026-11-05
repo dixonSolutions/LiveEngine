@@ -87,7 +87,7 @@ Operators: `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `in`, `nin`, `between`, `exists
 
 The API includes user/server upsert, bulk upsert, get/list/remove/status operations, `fits`, `findServersForUser`, `findUsersForServer`, `join`, `leave`, `autoJoin`, `matchAll`, `advertise`, `advertiseAll`, `generateUsers`, `stats`, `clear`, `reseed`, and `drainEvents`. The `LiveEngine` wrapper adds `pair`, `joinHub`, `startAutoMatch` and `stopAutoMatch`. `HubClient` adds `contract`, `list`, `register`, `get`, `remove`, `call`, `importRegistry`, and `ping`. See [TypeScript definitions](index.d.ts) for complete signatures.
 
-`autoEmit: false` retains events for manual draining. For network hubs, explicitly drain events as part of your service's event delivery loop. Registries and engine state are held in memory; restart loses registrations, users and memberships. Add application persistence before relying on restart recovery.
+`autoEmit: false` retains events for manual draining. For network hubs, explicitly drain events as part of your service's event delivery loop. Registry definitions can persist with `LIVEENGINE_STATE_FILE`; live users, rooms and memberships remain in memory and are lost on restart. The state file contains credentials, is created mode 0600 and must be protected along with its backups.
 
 ## Hosted and remote hubs
 
@@ -149,7 +149,7 @@ await central.importRegistry({
 });
 ```
 
-Remote imports are explicit snapshots taken at request time; registrations added remotely later require another import. An external hub must implement `liveengine.hub/v1`, pass a health/contract handshake and expose its declared remote hub. Forwarded calls use the same `{ method, args }` request and `{ result }` response as internal calls. Custom external methods can use arbitrary JSON arguments and results within configured limits.
+Remote imports are snapshots by default; optional `refreshSeconds` enables periodic refresh and marks missing entries stale. An external hub must implement `liveengine.hub/v1`, pass a health/contract handshake and expose its declared remote hub. Forwarded calls use the same `{ method, args }` request and `{ result }` response as internal calls. Custom external methods can use arbitrary JSON arguments and results within configured limits.
 
 ## Native ping
 
@@ -268,3 +268,9 @@ cargo package --locked
 CI runs Rust and Node tests on Linux, macOS and Windows, and an independent central/remote container test on Linux. The [release workflow](.github/workflows/release.yml) also runs on pushes to `main`: when the manifest version is missing from npm or crates.io, it builds native addons and host binaries, publishes npm with GitHub OIDC/provenance, and publishes Cargo with crates.io trusted publishing. Unchanged versions skip the build. Tag pushes build the platform artifacts and create the GitHub release. Registry-side trust must be configured before an OIDC release can succeed. Observed test evidence is recorded in [validation](docs/validation.md). See [publishing](docs/publishing.md) for the bootstrap and exact workflow identity.
 
 MIT licensed. See [LICENSE](LICENSE).
+
+### Nested hubs and schemas
+
+Register a local or remote `central` hub and use `HubClient.route(["region"], "register", {id: "game", mode: "internal"})` to create a child. `tree(depth)` lists branches, including errors. Depth defaults to 8 and is capped at 16; repeated instance IDs return 508. Use `LIVEENGINE_INSTANCE_ID` for a stable unique service identity.
+
+Publish immutable JSON Schema 2020-12 definitions with `createSchema`, bind them using `schemaRef`, or supply inline `scopeSchema`, `userSchema`, and `serverSchema`. Children inherit the nearest schemas. Templates support on-demand creation, `ifAbsent`, TTLs and quotas. See [hosting](docs/hosting.md). The CLI can access all authenticated routes with `liveengine-hub request <url> <method> <route> [json-body]`, reading its token from `LIVEENGINE_TOKEN`.

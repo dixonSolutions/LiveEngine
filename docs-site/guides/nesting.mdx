@@ -1,0 +1,20 @@
+---
+title: "Nested hubs"
+description: "Create central namespaces and route operations through them."
+---
+
+A `central` hub holds children locally, or forwards to another LiveEngine service when `address` and `remoteToken` are set. Every remote hostname must be in the originating service's `LIVEENGINE_ALLOWED_REMOTE_HOSTS`; use a separate credential per service.
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+const hub = new HubClient(process.env.HUB_URL, { token: process.env.LIVEENGINE_TOKEN });
+await hub.register({ id: 'eu', mode: 'central', maxHubs: 32 });
+await hub.route(['eu'], 'register', { id: 'games', mode: 'central' });
+await hub.route(['eu', 'games'], 'register', { id: 'chess', mode: 'internal', ifAbsent: true });
+await hub.route(['eu', 'games'], 'call', { id: 'chess', method: 'stats', args: [] });
+console.log(await hub.tree(3));
+```
+
+`route` supports `list`, `get`, `register`, `delete`, `call`, and `tree`; an empty path selects the current service. `get`, `delete`, and `call` identify the target in `body.id`. Tree branches report `ok` or `error` independently. Discovery and forwarding are bounded. `LIVEENGINE_MAX_DEPTH` defaults to 8, maximum 16. Forwarding uses a trace of service instance IDs to detect loops; repeated IDs return 508. Set `LIVEENGINE_INSTANCE_ID` to a unique stable value per service or use the persisted generated identity.
+
+Flat routes still address immediate children. Templates, schema inheritance, `ifAbsent`, TTL expiry and central `maxHubs` quotas also apply to nested registration. See [schemas](/guides/schemas) and [remote hubs](/guides/remote-hubs).

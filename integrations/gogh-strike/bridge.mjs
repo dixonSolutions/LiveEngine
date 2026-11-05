@@ -30,6 +30,8 @@ const token = process.env.LIVEENGINE_TOKEN || '';
 const remoteToken = process.env.LIVEENGINE_REMOTE_TOKEN || '';
 const hubId = process.env.LIVEENGINE_HUB_ID || 'gogh-strike';
 const hubMode = process.env.LIVEENGINE_HUB_MODE || 'internal';
+// Slash-separated central IDs; an empty path selects the root registry.
+const hubPath = (process.env.LIVEENGINE_HUB_PATH || '').split('/').filter(Boolean);
 const remoteAddress = process.env.LIVEENGINE_REMOTE_ADDRESS || '';
 const remoteHubId = process.env.LIVEENGINE_REMOTE_HUB_ID || hubId;
 const hubScopes = {game: 'gogh-strike'};
@@ -85,13 +87,14 @@ class LiveEngineClient {
   }
 
   async call(method, ...args) {
-    return this.client.call(hubId, method, args);
+    if (!hubPath.length) return this.client.call(hubId, method, args);
+    return (await this.client.route(hubPath, 'call', {id: hubId, method, args})).result;
   }
 
   async ensureReady() {
     this.ready ||= (async () => {
       await this.client.contract();
-      const listing = await this.client.list();
+      const listing = hubPath.length ? await this.client.route(hubPath, 'list') : await this.client.list();
       const hubs = Array.isArray(listing) ? listing : listing?.hubs;
       const existing = Array.isArray(hubs) ? hubs.find(hub => hub.id === hubId) : null;
       if (!existing) {
@@ -101,10 +104,11 @@ class LiveEngineClient {
           ? {id: hubId, mode: 'external', address: remoteAddress, remoteHubId, remoteToken, scopes: hubScopes}
           : {id: hubId, mode: 'internal', scopes: hubScopes};
         try {
-          await this.client.register(dto);
+          if (hubPath.length) await this.client.route(hubPath, 'register', dto);
+          else await this.client.register(dto);
         } catch (error) {
           // Another local bridge may have registered the same stable hub id concurrently.
-          const latest = await this.client.list();
+          const latest = hubPath.length ? await this.client.route(hubPath, 'list') : await this.client.list();
           const latestHubs = Array.isArray(latest) ? latest : latest?.hubs;
           if (!Array.isArray(latestHubs) || !latestHubs.some(hub => hub.id === hubId)) throw error;
         }

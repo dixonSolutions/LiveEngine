@@ -43,6 +43,8 @@
               "guides/first-match",
               "guides/hosting",
               "guides/remote-hubs",
+              "guides/nesting",
+              "guides/schemas",
               "guides/import-registry",
               "guides/custom-handler",
               "guides/docker",

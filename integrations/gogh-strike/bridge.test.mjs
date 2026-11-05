@@ -225,3 +225,43 @@ test('bridge reaps idle seats while retaining seats with heartbeats', async () =
     reaperChild.kill('SIGTERM');
   }
 });
+
+test('bridge targets a nested central path for registration and calls', async () => {
+  const seen = [];
+  const nested = http.createServer(async (req, res) => {
+    const json = (status, value) => { res.writeHead(status, {'Content-Type': 'application/json'}); res.end(JSON.stringify(value)); };
+    if (req.url === '/v1/contract') return json(200, {protocol: 'liveengine.hub/v1'});
+    if (req.url !== '/v1/route') return json(404, {error: 'unexpected route'});
+    let raw = ''; for await (const chunk of req) raw += chunk;
+    const dto = JSON.parse(raw); seen.push(dto);
+    if (dto.op === 'list') return json(200, {hubs: []});
+    if (dto.op === 'register') return json(201, dto.body);
+    if (dto.op === 'call') {
+      if (dto.body.method === 'getUser') return json(200, {result: null});
+      if (dto.body.method === 'autoJoin') return json(200, {result: {ok: true, userId: dto.body.args[0], serverId: 'room'}});
+      return json(200, {result: true});
+    }
+    return json(400, {error: 'unexpected operation'});
+  });
+  const nestedPort = await listen(nested);
+  const port = await freePort();
+  const proc = spawn(process.execPath, [bridge], {cwd: root, stdio: 'ignore', env: {...process.env,
+    PORT: String(port), HOST: '127.0.0.1', GOGH_STRIKE_ROOT: root,
+    LIVEENGINE_URL: `http://127.0.0.1:${nestedPort}`, LIVEENGINE_TOKEN: 'test-administrator-token-long-enough',
+    LIVEENGINE_HUB_ID: 'nested-game', LIVEENGINE_HUB_PATH: 'eu/games'}});
+  try {
+    const base = `http://127.0.0.1:${port}`;
+    let ready = false;
+    for (let i = 0; i < 60; i++) { try { if ((await fetch(`${base}/health`)).ok) { ready = true; break; } } catch {} await new Promise(resolve => setTimeout(resolve, 50)); }
+    assert.ok(ready);
+    const response = await fetch(`${base}/api/liveengine/join`, {method: 'POST', headers: {'Content-Type': 'application/json', Origin: base}, body: JSON.stringify({userId: 'nested-user'})});
+    assert.equal(response.status, 200);
+    assert.ok(seen.every(request => JSON.stringify(request.path) === JSON.stringify(['eu', 'games'])));
+    assert.equal(seen.find(request => request.op === 'register').body.id, 'nested-game');
+    assert.equal(seen.find(request => request.body.method === 'autoJoin').body.id, 'nested-game');
+  } finally {
+    proc.kill('SIGTERM');
+    await new Promise(resolve => proc.once('exit', resolve));
+    await new Promise(resolve => nested.close(resolve));
+  }
+});

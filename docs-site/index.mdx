@@ -68,11 +68,11 @@ See [Installation](/node/installation) for the platform matrix and source fallba
 
 LiveEngine is deliberately small and explicit about what it does not do:
 
-- **State is in memory.** Restarting a host loses registrations, users, memberships, events, and TTL state. Add application persistence if you need restart recovery.
+- **Live matchmaking state is in memory.** A state file can persist registry definitions, but users, rooms, memberships and events are lost on restart.
 - **Authentication is administrative.** The host verifies one bearer token. There is no per-player authentication, authorization policy, or tenant isolation. Keep tokens in server code and expose application-specific routes to clients.
 - **Request timeouts do not roll back work.** An internal handler that already started continues on a blocking worker. Capacity stays occupied until it finishes. Reconcile state before retrying a mutation.
-- **`scopeSchema` is a documented subset of JSON Schema**, not a general validator or dynamic code loader.
-- **Remote imports are snapshots.** Registrations added remotely later require another import.
+- **Schemas use JSON Schema 2020-12.** References must be local JSON pointers and are bounded.
+- **Remote imports can refresh.** Set `refreshSeconds` to discover changes and mark missing entries stale.
 - **Gogh Strike integration validates matchmaking and connectivity.** Gameplay remains locally simulated; it does not synchronize multiplayer state.
 - **Ping is a latency probe, not a matchmaking input.** Use `HubClient.ping()` or `liveengine-hub ping` to measure a hub; add your own scope/requirement rules if you want ping to influence matching.
 

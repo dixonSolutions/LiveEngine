@@ -463,6 +463,68 @@
           }
         }
       }
+    },
+    "SchemaDefinition": {
+      "type": "object",
+      "required": [
+        "ref",
+        "schema"
+      ],
+      "properties": {
+        "ref": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$"
+        },
+        "schema": {
+          "type": [
+            "object",
+            "boolean"
+          ]
+        }
+      }
+    },
+    "RegistryExport": {
+      "type": "object",
+      "required": [
+        "protocol",
+        "hubs",
+        "schemas"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "liveengine.hub/v1"
+        },
+        "hubs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HubInfo"
+          }
+        },
+        "schemas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SchemaDefinition"
+          }
+        }
+      }
+    },
+    "TreeResponse": {
+      "type": "object",
+      "required": [
+        "status",
+        "hubs"
+      ],
+      "properties": {
+        "status": {
+          "const": "ok"
+        },
+        "hubs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TreeBranch"
+          }
+        }
+      }
     }
   }
 }

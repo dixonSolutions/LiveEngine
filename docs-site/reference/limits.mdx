@@ -88,7 +88,7 @@ The 64 MiB generation output budget is enforced by the engine itself, independen
 | Remote address length | 2048 bytes |
 | Remote token | at least 24 bytes |
 | TTL | at least 1 second, at most `max_ttl` (default 86400 seconds) |
-| Forwarding hop | `0`, `1`, `2`; external at `2` gets `508` |
+| Forwarding hop | default depth 8, configurable to at most 16; repeated instance IDs return `508` |
 | JSON nesting | 64 |
 
 ## Client defaults

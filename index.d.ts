@@ -170,6 +170,8 @@ export interface HubDefinition {
   ttlSeconds?: number;
   maxHubs?: number;
 }
+export interface HubSchema { id: string; version: string; schema: Record<string, unknown> | boolean; }
+export type HubTemplate = Omit<HubDefinition, 'id' | 'template' | 'ifAbsent'> & { name: string; mode: HubMode };
 export interface HubClientOptions {
   token: string;
   timeoutMs?: number;
@@ -201,11 +203,11 @@ export declare class HubClient {
   tree(depth?: number): Promise<unknown>;
   route(path: string[], op: 'register' | 'list' | 'get' | 'delete' | 'call' | 'tree', body?: Record<string, unknown>): Promise<unknown>;
   listTemplates(): Promise<unknown>;
-  createTemplate(template: Omit<HubDefinition, 'id' | 'template' | 'ifAbsent'> & { name: string; mode: HubMode }): Promise<unknown>;
+  createTemplate(template: HubTemplate): Promise<unknown>;
   getTemplate(name: string): Promise<unknown>;
   removeTemplate(name: string): Promise<unknown>;
   listSchemas(): Promise<unknown>;
-  createSchema(schema: { id: string; version: string; schema: Record<string, unknown> | boolean }): Promise<unknown>;
+  createSchema(schema: HubSchema): Promise<unknown>;
   getSchema(id: string): Promise<unknown>;
   removeSchema(id: string): Promise<unknown>;
   exportRegistry(): Promise<unknown>;

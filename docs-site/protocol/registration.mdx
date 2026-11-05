@@ -10,13 +10,19 @@ All DTOs use camelCase. Registration, call, and import bodies reject unknown fie
 ```ts
 interface HubRegistration {
   id: string;
-  mode: 'internal' | 'external';
+  mode?: 'internal' | 'external' | 'central'; // required unless a template supplies it
   address?: string;
   remoteHubId?: string;
   remoteToken?: string;
   scopes?: object;       // default {}
   scopeSchema?: object;
   ttlSeconds?: number;
+  schemaRef?: string;
+  userSchema?: object | boolean;
+  serverSchema?: object | boolean;
+  template?: string;
+  ifAbsent?: boolean;
+  maxHubs?: number;
 }
 ```
 
@@ -74,9 +80,9 @@ External requirements:
 | Field | Rules |
 | --- | --- |
 | `id` | 1–128 chars of `A-Z a-z 0-9 . _ -`; not `.` or `..`; no surrounding whitespace |
-| `mode` | `internal` or `external` |
+| `mode` | `internal`, `external`, or `central` |
 | `scopes` | Must be a JSON object; must fit `max_request_bytes`; validated by `scopeSchema` when present |
-| `scopeSchema` | Supported subset only; see below |
+| `scopeSchema` | JSON Schema 2020-12; see below |
 | `ttlSeconds` | Integer at least 1; at most `max_ttl` (default 86400) |
 
 `remoteToken` is write-only and is omitted from every response.
@@ -86,7 +92,7 @@ External requirements:
 ```ts
 interface HubInfo {
   id: string;
-  mode: 'internal' | 'external';
+  mode: 'internal' | 'external' | 'central';
   address?: string;
   remoteHubId: string;
   scopes: object;
@@ -165,6 +171,7 @@ interface RegistryImport {
   address: string;
   token: string;    // at least 24 bytes
   prefix?: string;  // at most 64 chars of A-Z a-z 0-9 . _ -
+  refreshSeconds?: number; // 1–86400
 }
 ```
 
@@ -204,44 +211,8 @@ interface ErrorResponse {
 { "error": "hub id already registered" }
 ```
 
-## scopeSchema subset
+## Schemas and forwarding
 
-```json
-{
-  "type": "object",
-  "required": ["region"],
-  "properties": {
-    "region": { "type": "string", "enum": ["au", "nz"] },
-    "rating": { "type": "integer" },
-    "premium": { "type": "boolean" }
-  },
-  "additionalProperties": false
-}
-```
+Schemas use JSON Schema 2020-12. Only local JSON pointer references are supported; remote references, IDs, anchors and cycles are rejected. A hub accepts `scopeSchema` or `schemaRef`, with optional `userSchema` and `serverSchema`; inherited schemas apply to nested children. Schema-bound hubs reject `generateUsers`.
 
-Supported property `type` values: `string`, `number`, `integer`, `boolean`, `array`, `object`, `null`.
-
-Behavior:
-
-- `type` at the schema root, if present, must be `object`.
-- `required` must be an array of strings; each must be present in scopes.
-- `properties` must be an object when present.
-- Unknown scopes are rejected only when `additionalProperties` is exactly `false`.
-- `enum` is exact JSON equality.
-- Unsupported property types or malformed keywords return `400`.
-- `generateUsers` is rejected for a hub with a schema.
-- Validation applies to `upsertUser`, `upsertUsers`, `upsertServer`, `upsertServers`. Other methods, including custom handler methods, are not schema-validated.
-
-## Forwarding header
-
-`x-liveengine-hop` is an unsigned integer header:
-
-| Value | Behavior |
-| --- | --- |
-| absent | Treated as `0` |
-| `0`, `1`, `2` | Accepted |
-| anything else, or `> 2` | `400 invalid forwarding hop` |
-| external hub receiving `2` | `508 forwarding hop limit reached` |
-| forwarded request | Sends `hop + 1` |
-
-The header is for the host's forwarding chain, not for application logic. Do not set it on client requests unless you are implementing a compatible forwarder.
+Forwarding uses `x-liveengine-trace` and `x-liveengine-depth`. Repeated instance IDs and depth exhaustion return 508. `LIVEENGINE_MAX_DEPTH` defaults to 8 and is capped at 16. Clients should not set forwarding headers. Registry definitions can be persisted using `LIVEENGINE_STATE_FILE`; live rooms and players remain in memory. See [nesting](/guides/nesting) and [schemas](/guides/schemas).

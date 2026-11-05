@@ -25,6 +25,8 @@ node integrations/gogh-strike/bridge.mjs
 
 Open `http://127.0.0.1:8967/`, select **Find a LiveEngine match**, then press **Play**. The bridge checks `/v1/contract`, creates the configured internal hub if it is missing, registers a 12-seat Gogh Strike room, upserts the player and calls `autoJoin`. Hub ids and server ids are configurable with `LIVEENGINE_HUB_ID` and `GOGH_MATCH_SERVER_ID`.
 
+Set `LIVEENGINE_HUB_PATH=region/games` to register and call the configured hub under those central IDs. Omit it for the root registry.
+
 To target an external hub, set `LIVEENGINE_HUB_MODE=external`, `LIVEENGINE_REMOTE_ADDRESS`, `LIVEENGINE_REMOTE_HUB_ID`, and a separate `LIVEENGINE_REMOTE_TOKEN` (at least 24 characters). The bridge registers that external hub on the local service and passes the remote credential only in that server-side registration. The service must allow the remote host and use matching credentials on the remote service.
 
 The bridge validates the Host header on every request and checks Origin on API requests when present; matchmaking mutations require an allowed Origin. It limits request bodies to 16 KiB and rate-limits matchmaking mutations. The game releases its seat on return to the menu or page hide and sends periodic heartbeats; the bridge reclaims seats after three minutes without a heartbeat. Restarting the bridge loses its in-memory seat tracking. It has no browser-facing token. The upstream game's own `npm start` does not include the proxy; use this bridge command so credentials are not placed in browser storage or URLs. Outbound service calls use `HubClient` with its five-second request timeout.

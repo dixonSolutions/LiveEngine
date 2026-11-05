@@ -878,3 +878,53 @@ fn standalone_state_file_environment_and_startup_errors() {
     assert_eq!(std::fs::read(&path).unwrap(), b"{invalid");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn rust_client_routes_and_exports_over_tcp() {
+    let service = HubService::new(config()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            service
+                .router()
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let client = liveengine::hub::HubClient::new(&format!("http://{address}"), TOKEN).unwrap();
+    client
+        .route(&[], "register", json!({"id":"region","mode":"central"}))
+        .await
+        .unwrap();
+    client
+        .route(
+            &["region".into()],
+            "register",
+            json!({"id":"game","mode":"internal"}),
+        )
+        .await
+        .unwrap();
+    let result = client
+        .route(
+            &["region".into()],
+            "call",
+            json!({"id":"game","method":"stats","args":[]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["result"]["users"], 0);
+    assert_eq!(
+        client.tree(2).await.unwrap()["hubs"][0]["hub"]["id"],
+        "region"
+    );
+    assert!(client
+        .export_registry()
+        .await
+        .unwrap()
+        .get("hubs")
+        .is_some());
+    task.abort();
+}
