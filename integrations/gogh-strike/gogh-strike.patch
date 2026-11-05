@@ -12,14 +12,14 @@ index 3d9d4e7..292cb2e 100644
        <div class="rival-preview"><div id="enemy-portraits" class="enemy-portraits" aria-hidden="true"></div><p>Against <strong id="enemy-faction-name">The Independents</strong><span>Real artists. An entirely imagined paint fight.</span></p></div>
      </main>
 diff --git a/src/game.js b/src/game.js
-index 22dacf2..bbcd05f 100644
+index 22dacf2..f061ace 100644
 --- a/src/game.js
 +++ b/src/game.js
 @@ -21,6 +21,7 @@ import {bodyProfile} from './actor-profile.js';
  import {actorPose,bodyPoint,intersectActorBody} from './actor-body.js';
  import {UtilitySystem} from './utility.js';
  import {initEquipment,equip,stashMagazine,absorbDamage} from './loadout.js';
-+import {joinLiveEngineMatch} from './liveengine-matchmaking.js';
++import {joinLiveEngineMatch,leaveLiveEngineMatch} from './liveengine-matchmaking.js';
  
  const V=(x=0,y=0,z=0)=>new THREE.Vector3(x,y,z),clamp=THREE.MathUtils.clamp,lerp=THREE.MathUtils.lerp;
  const teamColors=FACTIONS.map(f=>new THREE.Color(f.color).getHex());
@@ -32,13 +32,24 @@ index 22dacf2..bbcd05f 100644
   onWeaponSelect:value=>{if(controlsReady())switchWeapon(typeof value==='number'?player?.carriedWeapons[value]:value);}});
  const pointerCapture=new PointerCapture({element:renderer.domElement,document,
   canCapture:()=>phase==='playing'&&!paused&&!document.hidden&&document.hasFocus(),
+@@ -111,7 +112,7 @@ function simulationReady(){return phase==='playing'&&!paused&&!input.suspended&&
+ function controlsReady(){return simulationReady()&&!intro.active&&rules?.phase==='playing'&&player?.alive;}
+ function clearInput(options){input.clear(options);fireHeld=fireLatch=ads=false;audio.cancelReload?.();ui.showScoreboard(false);if(player){player.burstRemaining=0;cancelActorTaunt(player);}}
+ function releaseLock(){pointerCapture.release();}
+-function showMenu(){intro.cancel();ui.endIntro?.();phase='menu';paused=false;awaitingLock=false;clearInput();releaseLock();actors.forEach(a=>a.model.setVisible(false));utility.clear();sprays.clear();effects.clear?.();view.setVisible(false);town.setView(1);ui.showMenu();}
++function showMenu(){leaveLiveEngineMatch();intro.cancel();ui.endIntro?.();phase='menu';paused=false;awaitingLock=false;clearInput();releaseLock();actors.forEach(a=>a.model.setVisible(false));utility.clear();sprays.clear();effects.clear?.();view.setVisible(false);town.setView(1);ui.showMenu();}
+ function requestLock(){return pointerCapture.request();}
+ function setPause(value){if(phase!=='playing')return;paused=!!value;clearInput();if(value){releaseLock();ui.showPause();}else{ui.hidePause();audio.unlock();requestLock();}}
+ function applySettings(next){Object.assign(settings,next);settings.volume=clamp(Number(settings.volume)||0,0,1);settings.sensitivity=clamp(Number(settings.sensitivity)||1,.25,2.5);try{localStorage.setItem('vgs-settings',JSON.stringify(settings));}catch{}audio.setVolume(settings.volume);const q=settings.graphics;town.setQuality(q==='full'?1:q==='performance'?.48:.73);renderer.setPixelRatio(Math.min(devicePixelRatio,q==='full'?1.7:q==='performance'?1:1.25));renderer.setSize(innerWidth,innerHeight);}
 diff --git a/src/liveengine-matchmaking.js b/src/liveengine-matchmaking.js
 new file mode 100644
-index 0000000..fb5c3db
+index 0000000..aa8d8df
 --- /dev/null
 +++ b/src/liveengine-matchmaking.js
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,61 @@
 +const USER_KEY = 'gogh-strike-liveengine-user';
++let activeUser;
++let heartbeat;
 +
 +function randomToken() {
 +  try {
@@ -70,15 +81,33 @@ index 0000000..fb5c3db
 +}
 +
 +export async function joinLiveEngineMatch(config) {
++  const userId = localUserId();
 +  const response = await fetch('/api/liveengine/join', {
 +    method: 'POST',
 +    headers: {'Content-Type': 'application/json', Accept: 'application/json'},
-+    body: JSON.stringify({userId: localUserId(), team: config.team, role: config.role}),
++    body: JSON.stringify({userId, team: config.team, role: config.role}),
 +  });
 +  const result = await response.json().catch(() => ({}));
 +  if (!response.ok) throw new Error(result.error || result.reason || `Matchmaking failed (${response.status})`);
++  activeUser = userId;
++  clearInterval(heartbeat);
++  heartbeat = setInterval(() => {
++    fetch('/api/liveengine/heartbeat', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({userId})}).catch(() => {});
++  }, 60_000);
 +  return result;
 +}
++
++export function leaveLiveEngineMatch() {
++  clearInterval(heartbeat);
++  if (!activeUser) return;
++  const body = JSON.stringify({userId: activeUser});
++  activeUser = undefined;
++  if (!navigator.sendBeacon('/api/liveengine/leave', new Blob([body], {type: 'application/json'}))) {
++    fetch('/api/liveengine/leave', {method: 'POST', headers: {'Content-Type': 'application/json'}, body, keepalive: true}).catch(() => {});
++  }
++}
++
++window.addEventListener('pagehide', leaveLiveEngineMatch);
 diff --git a/src/style.css b/src/style.css
 index b41b102..c8ff47e 100644
 --- a/src/style.css

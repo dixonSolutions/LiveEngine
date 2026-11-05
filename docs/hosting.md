@@ -31,7 +31,7 @@ Limits and windows must be positive. Internal handlers run on blocking workers s
 
 The host uses actual socket peers for request budgets. It ignores arbitrary `X-Forwarded-For` headers. A reverse proxy therefore shares its peer budget across clients; apply public-client limits at the proxy as well when required by your deployment.
 
-The scope schema is a documented subset of JSON Schema, not an execution or dynamic code-loading mechanism. A dynamically registered internal hub is a matchmaking engine. Custom internal handlers are compiled into the embedding Rust service, and custom external services implement the HTTP contract independently.
+Scope schemas use JSON Schema draft 2020-12. References must be local JSON pointers; remote references, schema IDs, anchor references and cycles are refused. Schemas are limited to 64 KiB, 32 levels and 2048 JSON nodes. A dynamically registered internal hub is a matchmaking engine. Custom internal handlers are compiled into the embedding Rust service, and custom external services implement the HTTP contract independently.
 
 ## Container connectivity check
 
@@ -61,3 +61,9 @@ Keep administrative credentials in the server-side bridge rather than browser ga
 The Compose example exposes central port 8787 on the chosen interface and remote management port 8788 only on loopback. It uses separate credentials from `.env`.
 
 For hubs with a `scopeSchema`, user/server upserts are validated before dispatch. `generateUsers` is rejected for these hubs; generate locally and submit validated users with `upsertUsers`. The active peer budget table rejects new peers at capacity instead of evicting and resetting existing budgets.
+
+## Schema registry
+
+Authenticated `POST /v1/schemas` accepts `{ "id": "game", "version": "1", "schema": { "type": "object" } }`. `GET /v1/schemas` lists definitions, and `GET` or `DELETE /v1/schemas/game@1` retrieves or deletes one. Versions are immutable, and deletion fails while a hub references the version. `liveengine.default@1` is built in.
+
+Hub registration accepts `schemaRef` instead of `scopeSchema`; `userSchema` and `serverSchema` optionally override the shared schema for the corresponding upserts. Registry imports transfer schema definitions and reject conflicting versions; `GET /v1/registry/export` includes definitions without credentials. Schema definitions remain in memory.

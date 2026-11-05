@@ -39,6 +39,17 @@ const RATE_WINDOW_MS = 60_000;
 const JOIN_LIMIT = 10;
 const serverId = process.env.GOGH_MATCH_SERVER_ID || 'gogh-strike-local';
 const capacity = Number(process.env.GOGH_MATCH_CAPACITY || 12);
+const idleMs = 3 * 60_000;
+const seats = new Map();
+const seatOperations = new Map();
+
+async function withSeat(userId, operation) {
+  const previous = seatOperations.get(userId) || Promise.resolve();
+  const current = previous.catch(() => {}).then(operation);
+  seatOperations.set(userId, current);
+  try { return await current; }
+  finally { if (seatOperations.get(userId) === current) seatOperations.delete(userId); }
+}
 
 const mime = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -53,11 +64,14 @@ function json(res, status, value) {
 }
 
 async function readJson(req) {
-  let raw = '';
+  const chunks = [];
+  let size = 0;
   for await (const chunk of req) {
-    raw += chunk;
-    if (raw.length > 16_384) throw Object.assign(new Error('Request body is too large'), {status: 413});
+    size += chunk.length;
+    if (size > 16_384) throw Object.assign(new Error('Request body is too large'), {status: 413});
+    chunks.push(chunk);
   }
+  const raw = Buffer.concat(chunks).toString('utf8');
   try { return raw ? JSON.parse(raw) : {}; }
   catch { throw Object.assign(new Error('Expected a JSON object'), {status: 400}); }
 }
@@ -116,10 +130,29 @@ class LiveEngineClient {
     if (!result?.ok) return result || {ok: false, reason: 'empty_response', userId};
     return {...result, localSimulation: true};
   }
+
+  async leave(userId) {
+    await this.ensureReady();
+    return this.call('leave', userId);
+  }
 }
 
 let client;
 function getClient() { return client ||= new LiveEngineClient(); }
+
+const reaper = setInterval(async () => {
+  for (const [userId, lastSeen] of seats) {
+    if (Date.now() - lastSeen < idleMs) continue;
+    try {
+      await withSeat(userId, async () => {
+        if (seats.get(userId) !== lastSeen) return;
+        await getClient().leave(userId);
+        seats.delete(userId);
+      });
+    } catch { /* Retry on the next sweep. */ }
+  }
+}, 30_000);
+reaper.unref();
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -127,10 +160,13 @@ const server = http.createServer(async (req, res) => {
     if (!allowedHosts.has(hostHeader)) return json(res, 403, {error: 'Invalid Host header'});
     const url = new URL(req.url, `http://${host}:${port}`);
     if (url.pathname === '/health') return json(res, 200, {app: 'Gogh Strike LiveEngine bridge', hubId});
+    if (url.pathname.startsWith('/api/') && req.headers.origin && !allowedOrigins.has(req.headers.origin)) {
+      return json(res, 403, {error: 'Cross-origin request rejected'});
+    }
     if (url.pathname === '/api/liveengine/status' && req.method === 'GET') {
       return json(res, 200, {configured: Boolean(apiBase && token), hubId, mode: hubMode, externalConfigured: Boolean(remoteAddress), localSimulation: true});
     }
-    if (url.pathname === '/api/liveengine/join' && req.method === 'POST') {
+    if (['/api/liveengine/join', '/api/liveengine/leave', '/api/liveengine/heartbeat'].includes(url.pathname) && req.method === 'POST') {
       const origin = req.headers.origin;
       if (!allowedOrigins.has(origin)) return json(res, 403, {error: 'Cross-origin request rejected'});
       const now = Date.now();
@@ -140,9 +176,34 @@ const server = http.createServer(async (req, res) => {
       joinRates.set(req.socket.remoteAddress, timestamps);
       const input = await readJson(req);
       if (typeof input.userId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(input.userId)) return json(res, 400, {error: 'Invalid userId'});
+      if (url.pathname.endsWith('/heartbeat')) {
+        const found = await withSeat(input.userId, () => {
+          if (!seats.has(input.userId)) return false;
+          seats.set(input.userId, Date.now());
+          return true;
+        });
+        if (!found) return json(res, 404, {error: 'Seat not found'});
+        return json(res, 200, {ok: true});
+      }
+      if (url.pathname.endsWith('/leave')) {
+        try {
+          const result = await withSeat(input.userId, async () => {
+            const left = await getClient().leave(input.userId);
+            seats.delete(input.userId);
+            return left;
+          });
+          return json(res, 200, result);
+        } catch { return json(res, 502, {error: 'LiveEngine matchmaking request failed'}); }
+      }
       const player = {team: input.team === 1 ? 1 : 0, role: typeof input.role === 'string' ? input.role.slice(0, 40) : 'vanguard'};
       let result;
-      try { result = await getClient().join(input.userId, player); }
+      try {
+        result = await withSeat(input.userId, async () => {
+          const joined = await getClient().join(input.userId, player);
+          if (joined.ok) seats.set(input.userId, Date.now());
+          return joined;
+        });
+      }
       catch (error) {
         if (error.message?.startsWith('Set LIVEENGINE_')) return json(res, 503, {error: error.message});
         return json(res, error.status || 502, {error: 'LiveEngine matchmaking request failed'});

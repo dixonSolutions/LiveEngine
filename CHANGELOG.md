@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add a versioned schema registry and JSON Schema validation for hub scopes, users and servers, with schema transfer during registry imports.
+
+- Release Gogh Strike matchmaking seats on menu return and page hide, and reclaim idle seats. Check API Origins and enforce the bridge body limit in bytes.
+
 ## 0.2.4 — 2026-11-04
 
 - The release workflow now runs on every push to `main`. A version that is missing

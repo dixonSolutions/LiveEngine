@@ -224,6 +224,12 @@ pub struct HubInfo {
     pub scope_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_in_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_schema: Option<Value>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -266,6 +272,7 @@ enum HandlerCallError {
 struct Inner {
     config: HubConfig,
     hubs: RwLock<HashMap<String, HubRecord>>,
+    schemas: RwLock<HashMap<String, Value>>,
     client: Client,
     rate: Mutex<HashMap<String, RateEntry>>,
     boot: Instant,
@@ -291,6 +298,10 @@ impl HubService {
             inner: Arc::new(Inner {
                 config,
                 hubs: RwLock::new(HashMap::new()),
+                schemas: RwLock::new(HashMap::from([(
+                    "liveengine.default@1".to_string(),
+                    serde_json::json!({"type":"object"}),
+                )])),
                 client,
                 rate: Mutex::new(HashMap::new()),
                 boot: Instant::now(),
@@ -307,10 +318,13 @@ impl HubService {
             .route("/v1/ping", get(ping))
             .route("/v1/contract", get(contract))
             .route("/v1/contract/schema", get(contract_schema))
+            .route("/v1/schemas", get(list_schemas).post(create_schema))
+            .route("/v1/schemas/{id}", get(get_schema).delete(delete_schema))
             .route("/v1/hubs", get(list_hubs).post(register_hub))
             .route("/v1/hubs/{id}", get(get_hub).delete(delete_hub))
             .route("/v1/hubs/{id}/call", post(call_hub))
             .route("/v1/registries/import", post(import_registry))
+            .route("/v1/registry/export", get(export_registry))
             .layer(axum::extract::DefaultBodyLimit::max(
                 self.inner.config.max_request_bytes,
             ))
@@ -354,6 +368,9 @@ impl HubService {
             scopes: registration.scopes,
             scope_schema: registration.scope_schema,
             expires_in_seconds: ttl.map(|d| d.as_secs()),
+            schema_ref: None,
+            user_schema: None,
+            server_schema: None,
         };
         let record = HubRecord {
             info: info.clone(),
@@ -460,7 +477,7 @@ async fn ping(State(state): State<Arc<Inner>>) -> Json<Value> {
 
 async fn contract() -> Json<Value> {
     Json(
-        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/registries/import"],"schema":"/v1/contract/schema"}),
+        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}"],"schema":"/v1/contract/schema"}),
     )
 }
 async fn contract_schema() -> Response {
@@ -471,6 +488,102 @@ async fn contract_schema() -> Response {
             "contract schema is unavailable",
         ),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaRegistration {
+    id: String,
+    version: String,
+    schema: Value,
+}
+fn schema_key(id: &str, version: &str) -> Option<String> {
+    if [id, version].iter().all(|s| {
+        !s.is_empty()
+            && s.len() <= 128
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    }) {
+        Some(format!("{id}@{version}"))
+    } else {
+        None
+    }
+}
+async fn create_schema(
+    State(state): State<Arc<Inner>>,
+    payload: Result<Json<SchemaRegistration>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(reg) = match payload {
+        Ok(v) => v,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid schema registration"),
+    };
+    let Some(key) = schema_key(&reg.id, &reg.version) else {
+        return error(StatusCode::BAD_REQUEST, "invalid schema id or version");
+    };
+    if let Err(e) = compile_schema(&reg.schema) {
+        return error(StatusCode::BAD_REQUEST, &e);
+    }
+    let mut schemas = state.schemas.write().await;
+    if schemas.contains_key(&key) {
+        return error(StatusCode::CONFLICT, "schema already exists");
+    }
+    if schemas.len() >= state.config.max_hubs {
+        return error(StatusCode::INSUFFICIENT_STORAGE, "schema registry is full");
+    }
+    schemas.insert(key.clone(), reg.schema.clone());
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({"id":reg.id,"version":reg.version,"ref":key,"schema":reg.schema})),
+    )
+        .into_response()
+}
+async fn list_schemas(State(state): State<Arc<Inner>>) -> Json<Value> {
+    let schemas = state.schemas.read().await;
+    let mut list: Vec<_> = schemas
+        .iter()
+        .map(|(key, schema)| serde_json::json!({"ref":key,"schema":schema}))
+        .collect();
+    list.sort_by(|a, b| a["ref"].as_str().cmp(&b["ref"].as_str()));
+    Json(serde_json::json!({"schemas":list}))
+}
+async fn get_schema(State(state): State<Arc<Inner>>, Path(id): Path<String>) -> Response {
+    match state.schemas.read().await.get(&id) {
+        Some(schema) => Json(serde_json::json!({"ref":id,"schema":schema})).into_response(),
+        None => error(StatusCode::NOT_FOUND, "schema not found"),
+    }
+}
+async fn delete_schema(State(state): State<Arc<Inner>>, Path(id): Path<String>) -> Response {
+    let mut schemas = state.schemas.write().await;
+    if id == "liveengine.default@1" {
+        return error(StatusCode::CONFLICT, "built-in schema cannot be deleted");
+    }
+    let mut hubs = state.hubs.write().await;
+    expire_hubs(&mut hubs);
+    if hubs
+        .values()
+        .any(|h| h.info.schema_ref.as_deref() == Some(&id))
+    {
+        return error(StatusCode::CONFLICT, "schema is in use");
+    }
+    if schemas.remove(&id).is_some() {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        error(StatusCode::NOT_FOUND, "schema not found")
+    }
+}
+
+async fn export_registry(State(state): State<Arc<Inner>>) -> Json<Value> {
+    let schemas = state.schemas.read().await;
+    let mut hubs = state.hubs.write().await;
+    expire_hubs(&mut hubs);
+    let mut list: Vec<_> = hubs.values().map(public_info).collect();
+    list.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut definitions: Vec<_> = schemas
+        .iter()
+        .map(|(key, schema)| serde_json::json!({"ref":key,"schema":schema}))
+        .collect();
+    definitions.sort_by(|a, b| a["ref"].as_str().cmp(&b["ref"].as_str()));
+    Json(serde_json::json!({"protocol":HUB_PROTOCOL,"hubs":list,"schemas":definitions}))
 }
 
 async fn list_hubs(State(state): State<Arc<Inner>>) -> Json<Value> {
@@ -492,9 +605,9 @@ async fn get_hub(State(state): State<Arc<Inner>>, Path(id): Path<String>) -> Res
 
 async fn register_hub(
     State(state): State<Arc<Inner>>,
-    payload: Result<Json<HubRegistration>, axum::extract::rejection::JsonRejection>,
+    payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let Json(reg) = match payload {
+    let Json(mut raw) = match payload {
         Ok(v) => v,
         Err(e) => {
             return error(
@@ -503,6 +616,47 @@ async fn register_hub(
             )
         }
     };
+    let Some(object) = raw.as_object_mut() else {
+        return error(StatusCode::BAD_REQUEST, "invalid registration");
+    };
+    let schema_ref = match object.remove("schemaRef") {
+        None => None,
+        Some(Value::String(s)) => Some(s),
+        _ => return error(StatusCode::BAD_REQUEST, "invalid schemaRef"),
+    };
+    let user_schema = object.remove("userSchema");
+    let server_schema = object.remove("serverSchema");
+    let reg: HubRegistration = match serde_json::from_value(raw) {
+        Ok(v) => v,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid registration"),
+    };
+    if schema_ref.is_some() && reg.scope_schema.is_some() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "scopeSchema and schemaRef are mutually exclusive",
+        );
+    }
+    let schemas = state.schemas.read().await;
+    let effective = match &schema_ref {
+        Some(id) => match schemas.get(id) {
+            Some(s) => Some(s.clone()),
+            None => return error(StatusCode::BAD_REQUEST, "schema not found"),
+        },
+        None => reg.scope_schema.clone(),
+    };
+    if let Some(schema) = &effective {
+        if let Err(e) = validate_scope_schema(&reg.scopes, schema) {
+            return error(StatusCode::BAD_REQUEST, &e);
+        }
+    }
+    for schema in [user_schema.as_ref(), server_schema.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Err(e) = compile_schema(schema) {
+            return error(StatusCode::BAD_REQUEST, &e);
+        }
+    }
     if let Err(message) = validate_registration(&state, &reg) {
         return error(StatusCode::BAD_REQUEST, &message);
     }
@@ -548,6 +702,9 @@ async fn register_hub(
         scopes: reg.scopes,
         scope_schema: reg.scope_schema,
         expires_in_seconds: ttl.map(|d| d.as_secs()),
+        schema_ref,
+        user_schema,
+        server_schema,
     };
     let record = HubRecord {
         info,
@@ -624,6 +781,49 @@ async fn import_registry(
     if contract.get("protocol").and_then(Value::as_str) != Some(HUB_PROTOCOL) {
         return error(StatusCode::BAD_GATEWAY, "remote contract protocol mismatch");
     }
+    let mut imported_schemas = HashMap::new();
+    if contract
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|v| v.as_str() == Some("/v1/schemas")))
+    {
+        let url = match endpoint(&base, "v1/schemas") {
+            Ok(url) => url,
+            Err(e) => return error(StatusCode::BAD_REQUEST, &e),
+        };
+        let list = match remote_get(&state, url, &request.token).await {
+            Ok(v) => v,
+            Err(e) => return error(StatusCode::BAD_GATEWAY, &e),
+        };
+        let Some(entries) = list.get("schemas").and_then(Value::as_array) else {
+            return error(StatusCode::BAD_GATEWAY, "invalid remote schemas");
+        };
+        if entries.len() > state.config.max_hubs {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "remote schema registry exceeds limit",
+            );
+        }
+        for entry in entries {
+            let Some(key) = entry.get("ref").and_then(Value::as_str) else {
+                return error(StatusCode::BAD_GATEWAY, "invalid remote schema");
+            };
+            let Some((id, version)) = key.split_once('@') else {
+                return error(StatusCode::BAD_GATEWAY, "invalid remote schema id");
+            };
+            let Some(schema) = entry.get("schema") else {
+                return error(StatusCode::BAD_GATEWAY, "invalid remote schema");
+            };
+            if schema_key(id, version).as_deref() != Some(key)
+                || compile_schema(schema).is_err()
+                || imported_schemas
+                    .insert(key.to_string(), schema.clone())
+                    .is_some()
+            {
+                return error(StatusCode::BAD_GATEWAY, "invalid remote schema");
+            }
+        }
+    }
     let list_url = match endpoint(&base, "v1/hubs") {
         Ok(url) => url,
         Err(e) => return error(StatusCode::BAD_REQUEST, &e),
@@ -684,7 +884,33 @@ async fn import_registry(
             scopes: registration.scopes,
             scope_schema: registration.scope_schema,
             expires_in_seconds: None,
+            schema_ref: remote
+                .get("schemaRef")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            user_schema: remote.get("userSchema").cloned(),
+            server_schema: remote.get("serverSchema").cloned(),
         };
+        if info
+            .schema_ref
+            .as_ref()
+            .is_some_and(|id| !imported_schemas.contains_key(id))
+            || [info.user_schema.as_ref(), info.server_schema.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|schema| compile_schema(schema).is_err())
+        {
+            return error(StatusCode::BAD_GATEWAY, "invalid remote schema metadata");
+        }
+        if let Some(schema) = info
+            .schema_ref
+            .as_ref()
+            .and_then(|id| imported_schemas.get(id))
+        {
+            if validate_scope_schema(&info.scopes, schema).is_err() {
+                return error(StatusCode::BAD_GATEWAY, "invalid remote schema metadata");
+            }
+        }
         candidates.push(HubRecord {
             info,
             expires_at: None,
@@ -730,11 +956,41 @@ async fn import_registry(
             return error(StatusCode::BAD_GATEWAY, &e);
         }
     }
+    let mut schemas = state.schemas.write().await;
+    if imported_schemas
+        .iter()
+        .any(|(id, schema)| schemas.get(id).is_some_and(|existing| existing != schema))
+    {
+        return error(
+            StatusCode::CONFLICT,
+            "imported schema conflicts with existing schema",
+        );
+    }
+    if schemas.len()
+        + imported_schemas
+            .keys()
+            .filter(|id| !schemas.contains_key(*id))
+            .count()
+        > state.config.max_hubs
+    {
+        return error(StatusCode::INSUFFICIENT_STORAGE, "schema registry is full");
+    }
     let mut hubs = state.hubs.write().await;
     expire_hubs(&mut hubs);
     if hubs.len().saturating_add(new_ids.len()) > state.config.max_hubs {
         return error(StatusCode::INSUFFICIENT_STORAGE, "hub registry is full");
     }
+    if candidates
+        .iter()
+        .filter(|c| new_ids.contains(&c.info.id))
+        .any(|entry| hubs.contains_key(&entry.info.id))
+    {
+        return error(
+            StatusCode::CONFLICT,
+            "import id was concurrently registered",
+        );
+    }
+    schemas.extend(imported_schemas);
     let mut imported = existing_infos;
     for entry in candidates
         .into_iter()
@@ -815,7 +1071,31 @@ async fn call_hub(
     let Some(record) = record else {
         return error(StatusCode::NOT_FOUND, "hub not found");
     };
-    if let Some(schema) = record.info.scope_schema.as_ref() {
+    let schemas = state.schemas.read().await;
+    let base = record
+        .info
+        .schema_ref
+        .as_ref()
+        .and_then(|id| schemas.get(id))
+        .or(record.info.scope_schema.as_ref());
+    let schema = if call.method.contains("User") {
+        record.info.user_schema.as_ref().or(base)
+    } else if call.method.contains("Server") {
+        record.info.server_schema.as_ref().or(base)
+    } else {
+        base
+    };
+    if call.method == "generateUsers"
+        && (base.is_some()
+            || record.info.user_schema.is_some()
+            || record.info.server_schema.is_some())
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "generateUsers requires an unbound hub",
+        );
+    }
+    if let Some(schema) = schema {
         if let Err(message) = validate_call_scopes(schema, &call) {
             return error(StatusCode::BAD_REQUEST, &message);
         }
@@ -1182,61 +1462,97 @@ fn validate_registration(state: &Inner, r: &HubRegistration) -> Result<(), Strin
     Ok(())
 }
 
-/// `scopeSchema` supports a small JSON-schema subset: object type, required,
-/// properties with primitive `type` and `enum`, and additionalProperties=false.
+// Reject non-fragment references before compilation, including in nested resources.
+fn compile_schema(schema: &Value) -> Result<jsonschema::Validator, String> {
+    if serde_json::to_vec(schema).map_or(true, |v| v.len() > 65536) || json_depth(schema, 0) > 32 {
+        return Err("schema exceeds size or depth limit".into());
+    }
+    fn inspect(v: &Value, count: &mut usize) -> bool {
+        *count += 1;
+        if *count > 2048 {
+            return false;
+        }
+        match v {
+            Value::Object(map) => map.iter().all(|(k, v)| {
+                if matches!(k.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef")
+                    && !v.as_str().is_some_and(|s| s.starts_with('#'))
+                {
+                    return false;
+                }
+                if k == "$id" {
+                    return false;
+                }
+                if k == "pattern" && v.as_str().is_some_and(|s| s.len() > 512) {
+                    return false;
+                }
+                inspect(v, count)
+            }),
+            Value::Array(a) => a.iter().all(|v| inspect(v, count)),
+            _ => true,
+        }
+    }
+    if !inspect(schema, &mut 0) {
+        return Err("schema contains forbidden references or exceeds complexity limits".into());
+    }
+    // Cap reference expansion and reject cycles before the validator can recurse.
+    fn references_safe(
+        root: &Value,
+        value: &Value,
+        active: &mut Vec<String>,
+        budget: &mut usize,
+    ) -> bool {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        match value {
+            Value::Object(map) => map.iter().all(|(key, value)| {
+                if matches!(key.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef") {
+                    let Some(reference) = value.as_str() else {
+                        return false;
+                    };
+                    let Some(pointer) = reference.strip_prefix('#') else {
+                        return false;
+                    };
+                    // Restrict local references to JSON pointers so that cycle checks are unambiguous.
+                    if !pointer.is_empty() && !pointer.starts_with('/') {
+                        return false;
+                    }
+                    if active.iter().any(|entry| entry == pointer) {
+                        return false;
+                    }
+                    let Some(target) = root.pointer(pointer) else {
+                        return false;
+                    };
+                    active.push(pointer.to_string());
+                    let ok = references_safe(root, target, active, budget);
+                    active.pop();
+                    ok
+                } else {
+                    references_safe(root, value, active, budget)
+                }
+            }),
+            Value::Array(items) => items
+                .iter()
+                .all(|item| references_safe(root, item, active, budget)),
+            _ => true,
+        }
+    }
+    if !references_safe(schema, schema, &mut vec![String::new()], &mut 8192) {
+        return Err("schema references are cyclic, unsupported, or too complex".into());
+    }
+    jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .build(schema)
+        .map_err(|_| "invalid JSON schema".into())
+}
 fn validate_scope_schema(scopes: &Value, schema: &Value) -> Result<(), String> {
-    if schema
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|t| t != "object")
-    {
-        return Err("scopeSchema type must be object".into());
+    if !scopes.is_object() {
+        return Err("scopes must be an object".into());
     }
-    let object = scopes.as_object().ok_or("scopes must be an object")?;
-    if let Some(required) = schema.get("required") {
-        let values = required
-            .as_array()
-            .ok_or("scopeSchema.required must be an array")?;
-        for key in values {
-            let key = key
-                .as_str()
-                .ok_or("scopeSchema.required entries must be strings")?;
-            if !object.contains_key(key) {
-                return Err(format!("scope '{key}' is required"));
-            }
-        }
-    }
-    let properties = schema.get("properties").and_then(Value::as_object);
-    if schema.get("properties").is_some() && properties.is_none() {
-        return Err("scopeSchema.properties must be an object".into());
-    }
-    for (key, value) in object {
-        let Some(rule) = properties.and_then(|p| p.get(key)) else {
-            if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
-                return Err(format!("scope '{key}' is not allowed"));
-            }
-            continue;
-        };
-        if let Some(kind) = rule.get("type").and_then(Value::as_str) {
-            let ok = match kind {
-                "string" => value.is_string(),
-                "number" => value.is_number(),
-                "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-                "boolean" => value.is_boolean(),
-                "array" => value.is_array(),
-                "object" => value.is_object(),
-                "null" => value.is_null(),
-                _ => return Err(format!("scopeSchema has unsupported type '{kind}'")),
-            };
-            if !ok {
-                return Err(format!("scope '{key}' must have type {kind}"));
-            }
-        }
-        if let Some(choices) = rule.get("enum").and_then(Value::as_array) {
-            if !choices.contains(value) {
-                return Err(format!("scope '{key}' is not an allowed value"));
-            }
-        }
+    let validator = compile_schema(schema)?;
+    if !validator.is_valid(scopes) {
+        return Err("scopes do not match schema".into());
     }
     Ok(())
 }
@@ -1253,9 +1569,12 @@ fn validate_call_scopes(schema: &Value, call: &CallRequest) -> Result<(), String
             .unwrap_or_default(),
         _ => return Ok(()),
     };
+    let validator = compile_schema(schema)?;
     for item in items {
         let scopes = item.get("scopes").cloned().unwrap_or_else(empty_object);
-        validate_scope_schema(&scopes, schema)?;
+        if !scopes.is_object() || !validator.is_valid(&scopes) {
+            return Err("scopes do not match schema".into());
+        }
     }
     Ok(())
 }

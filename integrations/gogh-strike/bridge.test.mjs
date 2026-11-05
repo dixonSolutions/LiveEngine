@@ -42,17 +42,17 @@ before(async () => {
     const url = new URL(req.url, 'http://localhost');
     const auth = req.headers.authorization;
     const json = (status, value) => { res.writeHead(status, {'Content-Type': 'application/json'}); res.end(JSON.stringify(value)); };
-    if (url.pathname === '/v1/contract') return auth === 'Bearer test-token' ? json(200, {protocol: 'liveengine.hub/v1'}) : json(401, {error: 'unauthorized'});
-    if (url.pathname === '/v1/hubs' && req.method === 'GET') return auth === 'Bearer test-token' ? json(200, {hubs: []}) : json(401, {error: 'unauthorized'});
+    if (url.pathname === '/v1/contract') return auth === 'Bearer test-administrator-token-long-enough' ? json(200, {protocol: 'liveengine.hub/v1'}) : json(401, {error: 'unauthorized'});
+    if (url.pathname === '/v1/hubs' && req.method === 'GET') return auth === 'Bearer test-administrator-token-long-enough' ? json(200, {hubs: []}) : json(401, {error: 'unauthorized'});
     if (url.pathname === '/v1/hubs' && req.method === 'POST') {
-      if (auth !== 'Bearer test-token') return json(401, {error: 'unauthorized'});
+      if (auth !== 'Bearer test-administrator-token-long-enough') return json(401, {error: 'unauthorized'});
       const dto = JSON.parse(await new Promise(resolve => { let body = ''; req.on('data', chunk => body += chunk); req.on('end', () => resolve(body)); }));
       calls.push({register: dto});
       return json(201, dto);
     }
     const call = url.pathname.match(/^\/v1\/hubs\/[^/]+\/call$/);
     if (call && req.method === 'POST') {
-      if (auth !== 'Bearer test-token') return json(401, {error: 'unauthorized'});
+      if (auth !== 'Bearer test-administrator-token-long-enough') return json(401, {error: 'unauthorized'});
       const body = JSON.parse(await new Promise(resolve => { let raw = ''; req.on('data', chunk => raw += chunk); req.on('end', () => resolve(raw)); }));
       calls.push(body);
       const [arg] = body.args;
@@ -62,6 +62,7 @@ before(async () => {
         const user = users.get(arg); Object.assign(user, {status: 'paired', serverId: 'gogh-room'});
         return json(200, {result: {ok: true, userId: arg, serverId: 'gogh-room'}});
       }
+      if (body.method === 'leave') { users.delete(arg); return json(200, {result: {ok: true, userId: arg}}); }
       return json(200, {result: true});
     }
     return json(404, {error: 'missing'});
@@ -72,7 +73,7 @@ before(async () => {
     cwd: root,
     env: {...process.env, PORT: String(bridgePort), HOST: '0.0.0.0', GOGH_STRIKE_ROOT: root,
       GOGH_ALLOWED_HOSTS: `gogh.test:${bridgePort}`,
-      LIVEENGINE_URL: `http://127.0.0.1:${upstreamPort}`, LIVEENGINE_TOKEN: 'test-token', LIVEENGINE_HUB_ID: 'gogh-test'},
+      LIVEENGINE_URL: `http://127.0.0.1:${upstreamPort}`, LIVEENGINE_TOKEN: 'test-administrator-token-long-enough', LIVEENGINE_HUB_ID: 'gogh-test'},
     stdio: 'ignore',
   });
   let startupError;
@@ -134,11 +135,22 @@ test('bridge serves the game and keeps the service bearer token server-side', as
   assert.equal(repeated.status, 200);
   assert.equal((await repeated.json()).existing, true);
 
+  const statusAttack = await fetch(`${base}/api/liveengine/status`, {headers: {Origin: 'https://attacker.example'}});
+  assert.equal(statusAttack.status, 403);
+  const oversized = await rawPost(bridgePort, {'Content-Type': 'application/json', Origin: base}, JSON.stringify({userId: 'x', padding: 'é'.repeat(9000)}));
+  assert.equal(oversized, 413);
+  const leave = await fetch(`${base}/api/liveengine/leave`, {
+    method: 'POST', headers: {'Content-Type': 'application/json', Origin: base}, body: JSON.stringify({userId: 'player-1'}),
+  });
+  assert.equal(leave.status, 200);
+  assert.equal(users.has('player-1'), false);
+  assert.equal(calls.at(-1).method, 'leave');
+
   const externalPort = await freePort();
   const externalChild = spawn(process.execPath, [bridge], {
     cwd: root,
     env: {...process.env, PORT: String(externalPort), HOST: '127.0.0.1', GOGH_STRIKE_ROOT: root,
-      LIVEENGINE_URL: `http://127.0.0.1:${upstreamPort}`, LIVEENGINE_TOKEN: 'test-token',
+      LIVEENGINE_URL: `http://127.0.0.1:${upstreamPort}`, LIVEENGINE_TOKEN: 'test-administrator-token-long-enough',
       LIVEENGINE_HUB_ID: 'gogh-remote', LIVEENGINE_HUB_MODE: 'external',
       LIVEENGINE_REMOTE_ADDRESS: 'http://127.0.0.1:9000', LIVEENGINE_REMOTE_HUB_ID: 'gogh',
       LIVEENGINE_REMOTE_TOKEN: 'separate-remote-token-32-characters'},

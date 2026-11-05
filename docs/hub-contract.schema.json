@@ -57,12 +57,30 @@
           "default": {}
         },
         "scopeSchema": {
-          "type": "object",
-          "description": "Supported JSON Schema subset: type, properties with primitive type and enum, required, additionalProperties."
+          "description": "JSON Schema draft 2020-12 for scopes; only local references are allowed.",
+          "type": [
+            "object",
+            "boolean"
+          ]
         },
         "ttlSeconds": {
           "type": "integer",
           "minimum": 1
+        },
+        "schemaRef": {
+          "type": "string"
+        },
+        "userSchema": {
+          "type": [
+            "object",
+            "boolean"
+          ]
+        },
+        "serverSchema": {
+          "type": [
+            "object",
+            "boolean"
+          ]
         }
       },
       "allOf": [
@@ -144,11 +162,30 @@
           "type": "object"
         },
         "scopeSchema": {
-          "type": "object"
+          "description": "JSON Schema draft 2020-12 for scopes; only local references are allowed.",
+          "type": [
+            "object",
+            "boolean"
+          ]
         },
         "expiresInSeconds": {
           "type": "integer",
           "minimum": 0
+        },
+        "schemaRef": {
+          "type": "string"
+        },
+        "userSchema": {
+          "type": [
+            "object",
+            "boolean"
+          ]
+        },
+        "serverSchema": {
+          "type": [
+            "object",
+            "boolean"
+          ]
         }
       }
     },
@@ -211,6 +248,29 @@
       "properties": {
         "error": {
           "type": "string"
+        }
+      }
+    },
+    "SchemaRegistration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "schema"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "schema": {
+          "type": [
+            "object",
+            "boolean"
+          ]
         }
       }
     }

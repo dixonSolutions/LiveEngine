@@ -162,6 +162,9 @@ export interface HubDefinition {
   remoteToken?: string;
   scopes?: Record<string, unknown>;
   scopeSchema?: Record<string, unknown>;
+  schemaRef?: string;
+  userSchema?: Record<string, unknown> | boolean;
+  serverSchema?: Record<string, unknown> | boolean;
   ttlSeconds?: number;
 }
 export interface HubClientOptions {
@@ -192,6 +195,11 @@ export declare class HubClient {
   readonly address: string;
   contract(): Promise<{ protocol: typeof HUB_PROTOCOL; [key: string]: unknown }>;
   ping(options?: HubPingOptions): Promise<HubPing>;
+  listSchemas(): Promise<unknown>;
+  createSchema(schema: { id: string; version: string; schema: Record<string, unknown> | boolean }): Promise<unknown>;
+  getSchema(id: string): Promise<unknown>;
+  removeSchema(id: string): Promise<unknown>;
+  exportRegistry(): Promise<unknown>;
   list(): Promise<unknown>;
   register(hub: HubDefinition): Promise<unknown>;
   get(id: string): Promise<unknown>;
