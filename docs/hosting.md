@@ -16,7 +16,7 @@ Limits are configurable through `HubConfig` when embedding the router. The stand
 | --- | --- |
 | `LIVEENGINE_MAX_HUBS` | 256 |
 | `LIVEENGINE_MAX_DEPTH` | 8 (maximum 16) |
-| `LIVEENGINE_INSTANCE_ID` | generated and persisted |
+| `LIVEENGINE_INSTANCE_ID` | generated and persisted; in memory with a warning if the default location is not writable |
 | `LIVEENGINE_STATE_FILE` | unset (in-memory registry) |
 | `LIVEENGINE_MAX_BODY_BYTES` | 1048576 |
 | `LIVEENGINE_MAX_RESPONSE_BYTES` | 4194304 |

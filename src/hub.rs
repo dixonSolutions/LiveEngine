@@ -309,28 +309,49 @@ fn instance_id_from_env() -> Result<String, String> {
         return Ok(id);
     }
     use std::hash::{Hash, Hasher};
-    let path = if let Ok(file) = std::env::var("LIVEENGINE_INSTANCE_ID_FILE") {
-        std::path::PathBuf::from(file)
+    // Without a configured location nothing else persists, so a read-only
+    // filesystem such as the container image must not stop the service.
+    let ephemeral = |reason: &str| {
+        eprintln!("liveengine-hub: instance id is not persisted: {reason}");
+        format!("{:032x}", rand::random::<u128>())
+    };
+    let (path, configured) = if let Ok(file) = std::env::var("LIVEENGINE_INSTANCE_ID_FILE") {
+        (std::path::PathBuf::from(file), true)
     } else if let Ok(file) = std::env::var("LIVEENGINE_STATE_FILE") {
-        std::path::PathBuf::from(format!("{file}.instance-id"))
+        (
+            std::path::PathBuf::from(format!("{file}.instance-id")),
+            true,
+        )
     } else {
         let root = std::env::var_os("XDG_STATE_HOME")
             .map(std::path::PathBuf::from)
             .or_else(|| {
                 std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
-            })
-            .ok_or("cannot locate instance id storage; set LIVEENGINE_INSTANCE_ID")?;
+            });
+        let Some(root) = root else {
+            return Ok(ephemeral("no state directory"));
+        };
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         std::env::var("LIVEENGINE_BIND")
             .unwrap_or_else(|_| "127.0.0.1:8787".into())
             .hash(&mut hash);
-        root.join("liveengine")
-            .join(format!("instance-{:016x}", hash.finish()))
+        let path = root
+            .join("liveengine")
+            .join(format!("instance-{:016x}", hash.finish()));
+        (path, false)
     };
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).map_err(|_| "cannot create instance id directory")?;
+    let persisted = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or(Ok(()), |parent| {
+            std::fs::create_dir_all(parent)
+                .map_err(|_| String::from("cannot create instance id directory"))
+        })
+        .and_then(|()| instance_id_at(&path));
+    match persisted {
+        Err(reason) if !configured => Ok(ephemeral(&reason)),
+        result => result,
     }
-    instance_id_at(&path)
 }
 
 fn instance_id_at(path: &std::path::Path) -> Result<String, String> {

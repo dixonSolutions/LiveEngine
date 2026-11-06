@@ -1498,3 +1498,36 @@ fn malformed_live_limits_fail_at_startup() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn hub_starts_without_a_writable_home_unless_persistence_was_requested() {
+    let hub = |extra: Option<(&str, &str)>| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_liveengine-hub"));
+        command
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("LIVEENGINE_INSTANCE_ID")
+            .env_remove("LIVEENGINE_INSTANCE_ID_FILE")
+            .env_remove("LIVEENGINE_STATE_FILE")
+            .env("HOME", "/proc/liveengine-no-such-home")
+            .env("LIVEENGINE_TOKEN", "unwritable-home-token-of-enough-length")
+            .env("LIVEENGINE_BIND", "127.0.0.1:0")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some((key, value)) = extra {
+            command.env(key, value);
+        }
+        command.spawn().unwrap()
+    };
+    let mut running = hub(None);
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let early_exit = running.try_wait().unwrap();
+    running.kill().ok();
+    running.wait().ok();
+    assert!(early_exit.is_none(), "hub exited: {early_exit:?}");
+    let mut refused = hub(Some((
+        "LIVEENGINE_INSTANCE_ID_FILE",
+        "/proc/liveengine-no-such-home/id",
+    )));
+    assert!(!refused.wait().unwrap().success());
+}
