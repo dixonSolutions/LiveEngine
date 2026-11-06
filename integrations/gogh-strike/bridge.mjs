@@ -48,8 +48,7 @@ const api = createHubApi({
   // What a request says about the player, as the scopes the hub matches on.
   subject: input => ({game: 'gogh-strike', mode: 'tdm', team: input.team === 1 ? 1 : 0, artist: typeof input.role === 'string' ? input.role.slice(0, 40) : 'vanguard'}),
   join: {server: {id: process.env.GOGH_MATCH_SERVER_ID || 'gogh-strike-local', capacity: Number(process.env.GOGH_MATCH_CAPACITY || 12), minMembers: 2,
-    scopes: {game: 'gogh-strike', mode: 'tdm', map: 'van-goghs-town', region: 'local'}}, extra: {localSimulation: true}},
-  statusExtra: {localSimulation: true},
+    scopes: {game: 'gogh-strike', mode: 'tdm', map: 'van-goghs-town', region: 'local'}}},
   // Where the browser opens the live registry; the hub's own address unless it is reached another way.
   watchUrl: process.env.LIVEENGINE_WATCH_URL || undefined,
 });

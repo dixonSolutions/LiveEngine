@@ -100,7 +100,7 @@ test('bridge serves the game and keeps the service bearer token server-side', as
   assert.equal(page.status, 200);
   assert.match(await page.text(), /Gogh Strike/i);
   const status = await (await fetch(`${base}/api/liveengine/status`)).json();
-  assert.deepEqual(status, {configured: true, hubId: 'gogh-test', mode: 'internal', externalConfigured: false, localSimulation: true});
+  assert.deepEqual(status, {configured: true, hubId: 'gogh-test', mode: 'internal', externalConfigured: false});
   assert.equal((await fetch(`${base}/api/liveengine/status`)).headers.get('authorization'), null);
 
   const joined = await fetch(`${base}/api/liveengine/join`, {
@@ -108,7 +108,7 @@ test('bridge serves the game and keeps the service bearer token server-side', as
     body: JSON.stringify({userId: 'player-1', team: 1, role: 'vanguard'}),
   });
   assert.equal(joined.status, 200);
-  assert.deepEqual(await joined.json(), {ok: true, userId: 'player-1', serverId: 'gogh-room', localSimulation: true});
+  assert.deepEqual(await joined.json(), {ok: true, userId: 'player-1', serverId: 'gogh-room'});
   assert.equal(calls[0].register.id, 'gogh-test');
   assert.equal(calls.at(-1).method, 'autoJoin');
   assert.equal(calls.some(call => call.method === 'upsertServer' && call.args[0].scopes.game === 'gogh-strike'), true);

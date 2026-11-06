@@ -1,5 +1,5 @@
 diff --git a/index.html b/index.html
-index 3d9d4e7..021ca42 100644
+index 3d9d4e7..6dfa559 100644
 --- a/index.html
 +++ b/index.html
 @@ -31,7 +31,17 @@
@@ -7,7 +7,7 @@ index 3d9d4e7..021ca42 100644
            <div class="art-kit"><span class="eyebrow">YOUR ART TAG</span><img id="selected-art-tag" alt="" width="68" height="68"><b id="selected-tag-name"></b><span><kbd>T</kbd> Spray a wall</span></div>
          </div>
 -        <div class="kit-play"><div class="selected-artist"><span class="eyebrow">YOU’RE PLAYING</span><strong id="selected-artist-name">Van Gogh</strong><button id="inspect-artist" class="inspect-artist" type="button"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8" cy="8" r="5"/><path d="m12 12 5 5M8 5v6M5 8h6"/></svg>Inspect artist</button><span class="kit-taunt"><kbd>J</kbd><span id="selected-taunt-name">Sunflower spin</span></span></div><button id="deploy-button" class="primary-button" disabled>Play <span aria-hidden="true">↗</span></button></div>
-+        <div class="kit-play"><div class="selected-artist"><span class="eyebrow">YOU’RE PLAYING</span><strong id="selected-artist-name">Van Gogh</strong><button id="inspect-artist" class="inspect-artist" type="button"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8" cy="8" r="5"/><path d="m12 12 5 5M8 5v6M5 8h6"/></svg>Inspect artist</button><span class="kit-taunt"><kbd>J</kbd><span id="selected-taunt-name">Sunflower spin</span></span><label class="liveengine-toggle"><input id="liveengine-matchmaking" type="checkbox"><span>Find a LiveEngine match</span><small>Matchmaking only · local simulation</small></label></div><button id="deploy-button" class="primary-button" disabled>Play <span aria-hidden="true">↗</span></button></div>
++        <div class="kit-play"><div class="selected-artist"><span class="eyebrow">YOU’RE PLAYING</span><strong id="selected-artist-name">Van Gogh</strong><button id="inspect-artist" class="inspect-artist" type="button"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8" cy="8" r="5"/><path d="m12 12 5 5M8 5v6M5 8h6"/></svg>Inspect artist</button><span class="kit-taunt"><kbd>J</kbd><span id="selected-taunt-name">Sunflower spin</span></span><label class="liveengine-toggle"><input id="liveengine-matchmaking" type="checkbox"><span>Join the hub on Play</span><small>Quick match with this server</small></label></div><button id="deploy-button" class="primary-button" disabled>Play <span aria-hidden="true">↗</span></button></div>
 +      </section>
 +      <section id="online-panel" class="online-panel" aria-label="Play online">
 +        <div class="online-head"><div><span class="eyebrow">PLAY ONLINE</span><strong>Match with other players</strong></div><span id="online-state" class="online-state" data-phase="idle">Not connected</span></div>
@@ -645,7 +645,7 @@ index b41b102..fa96e41 100644
 +.online-match-text{margin:0 0 9px;font-size:12px;line-height:1.45;color:#d4dfd1}.online-actions{display:flex;align-items:center;gap:8px}.online-actions .quiet-button{margin:0;font-size:12px}
 +@media(max-width:700px){.online-form{grid-template-columns:minmax(0,1fr) auto}.online-form label{grid-column:1/-1}.online-body{grid-template-columns:1fr;gap:10px}}
 diff --git a/src/ui.js b/src/ui.js
-index cf1f87b..59a2a01 100644
+index cf1f87b..b147684 100644
 --- a/src/ui.js
 +++ b/src/ui.js
 @@ -48,7 +48,7 @@ export class GameUI{
@@ -681,7 +681,7 @@ index cf1f87b..59a2a01 100644
 +  const error=$('online-error');error.hidden=!s.error;text('online-error',s.error);
 +  $('online-body').hidden=!live;$('online-connect').disabled=busy;$('online-address').disabled=s.phase==='searching'||s.phase==='matched';
 +  $('online-find').disabled=s.phase!=='connected';$('online-find').textContent=s.phase==='searching'?'Searching…':'Find match';$('online-cancel').hidden=s.phase!=='searching';
-+  const hubs=$('online-hubs');hubs.replaceChildren(...(s.hubs.length?s.hubs.map(hub=>{const item=node('li','online-hub');item.append(node('b','',hub.id),node('span','',`${hub.status==='ok'?'':`${hub.status} · `}${hub.memberCount} ${hub.memberCount===1?'player':'players'}`));return item;}):[node('li','online-hub empty',s.hubsLive?'No hubs listed.':'Hub list unavailable.')]));
++  const hubs=$('online-hubs');hubs.replaceChildren(...(s.hubs.length?s.hubs.map(hub=>{const item=node('li','online-hub');item.append(node('b','',hub.id),node('span','',`${hub.status==='ok'?'':`${hub.status} · `}${hub.memberCount} playing`));return item;}):[node('li','online-hub empty',s.hubsLive?'No hubs listed.':'Hub list unavailable.')]));
 +  const match=s.match;let note='Find match pairs you with another player.';
 +  if(s.phase==='searching')note='Waiting for another player… press Cancel to stop.';
 +  else if(match)note=match.connection==='waiting'?'Matched. Opening the connection…':match.connection==='direct'?`Matched with ${match.peers.join(', ')}. Direct connection (peer to peer). Press Play.`:match.connection==='relay'?`Matched with ${match.peers.join(', ')}. Relay connection through the hub, direct is not available. Press Play.`:`Matched with ${match.peers.join(', ')}. Some connections are direct, some relayed. Press Play.`;
