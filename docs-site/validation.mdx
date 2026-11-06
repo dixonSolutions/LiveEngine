@@ -1,7 +1,21 @@
 ---
 title: "Validation record"
-description: "What was actually observed for 0.2.4, and what remains unverified."
+description: "What was actually observed for each release, and what remains unverified."
 ---
+
+## 0.3.0
+
+Observed on 2026-11-06:
+
+- `cargo test --locked`, `npm test` and the release packaging ran on Linux x64 and arm64, macOS x64 and arm64, and Windows x64 through the release workflow.
+- `npm run test:e2e` passed 14 of 14 scenarios from a fresh upstream clone: real hub processes, the real bridge and real Chromium. It covers WebRTC data channels, forced relay fallback, peer-hub, hub-hub across two services, reconnect, the live hub list, schema rejection, and four simultaneous users through the front screen.
+- One scenario ran over a LAN address on a single machine. `scripts/test-containers.sh` passed on Podman.
+
+Not verified for 0.3.0:
+
+- Two physical devices on a real network, NAT traversal and TURN.
+- Rooms of more than four real browsers, and machines without a GPU.
+- `npm run test:e2e` under heavy machine load.
 
 Validation performed on **2026-11-04**. This is a record of observed checks, not a guarantee for other environments. Registry publication and trust configuration are separate account operations.
 

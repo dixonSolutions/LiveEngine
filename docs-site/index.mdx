@@ -8,7 +8,7 @@ LiveEngine solves two related problems:
 1. **Pairing users with capacity-limited servers.** A deterministic, in-process engine holds users and servers, evaluates requirements in both directions, and pairs users into rooms.
 2. **Routing matchmaking calls across processes.** A hosted registry lets one service own internal engines and attach independently hosted hubs through a uniform, authenticated HTTP contract.
 
-The same runtime can be embedded in a Node.js service, embedded in a Rust/Axum API, or run standalone as the `liveengine-hub` executable. Current release: **0.2.4**.
+The same runtime can be embedded in a Node.js service, embedded in a Rust/Axum API, or run standalone as the `liveengine-hub` executable. Current release: **0.3.0**.
 
 ## What is in the box
 
@@ -64,7 +64,7 @@ const { HubClient } = require('@dixonsolutions/liveengine/hubs');
 
 See [Installation](/node/installation) for the platform matrix and source fallback.
 
-## Honest scope for 0.2.4
+## Honest scope for 0.3.0
 
 LiveEngine is deliberately small and explicit about what it does not do:
 
