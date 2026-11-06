@@ -135,8 +135,19 @@ interface HubDefinition {
   remoteHubId?: string;
   remoteToken?: string;
   scopes?: Record<string, unknown>;
-  scopeSchema?: Record<string, unknown>;
+  scopeSchema?: Record<string, unknown> | boolean;
   ttlSeconds?: number;
+  // Nesting, schemas, live and auth fields. See the guides linked below.
+  template?: string;
+  ifAbsent?: boolean;
+  schemaRef?: string;
+  userSchema?: Record<string, unknown> | boolean;
+  serverSchema?: Record<string, unknown> | boolean;
+  channels?: Record<string, { schemaRef?: string; delivery: 'reliable' | 'lossy'; maxRate?: number }>;
+  auth?: HubAuth;                 // token, hmac, jwt, webhook or custom
+  hosting?: 'provider';           // central hubs only
+  maxHubs?: number;               // central hubs only
+  liveDepth?: number;             // central hubs only
 }
 ```
 
@@ -206,6 +217,20 @@ await client.importRegistry({
   prefix: 'partner-',
 });
 ```
+
+## Live, discovery and pairing methods
+
+| Method | Purpose | Guide |
+| --- | --- | --- |
+| `ticket(id, { userId, serverId, role = 'peer', credential, path = [] })` | Single-use room ticket: `{ ticket, url, expiresAt }`. A non-empty `path` uses the `ticket` route operation | [Live rooms](/guides/live-rooms) |
+| `watchTicket({ path = [], depth = 1 })` | Read-only registry watch ticket: `{ ticket, expiresAt }` | [Live registry](/guides/live-registry) |
+| `watchRegistry({ path = [], depth = 1, ticket, WebSocket, timeoutMs })` | Subscribe to the live registry; resolves with a `RegistryWatch` after the first snapshot | [Live registry](/guides/live-registry) |
+| `discover({ kind = 'any', path = [], depth, requirements })` | `{ candidates }` of hubs and peers | [Find and pair](/guides/find-and-pair) |
+| `pair({ subject, target = { kind: 'any' }, path = [], credential, waitMs })` | A descriptor `{ userId, link, room, ticket, url, transports }` for `LiveClient`; `waitMs` extends the request timeout | [Find and pair](/guides/find-and-pair) |
+| `renewal(request)` | A `renew` function for `LiveClient` that pairs again | [Find and pair](/guides/find-and-pair) |
+| `request(route, { method, body, signal, timeoutMs })` | Any authenticated route, for example `/v1/links` | [Hub links](/guides/hub-links) |
+
+Hub-scoped provider credentials work with `route()` only; see [provider hosting](/guides/provider-hosting). `LiveClient` and `connectLive` are exported by `@dixonsolutions/liveengine/live-client`.
 
 ## Properties
 

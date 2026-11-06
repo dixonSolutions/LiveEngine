@@ -18,9 +18,11 @@ Do not treat every non-OK application result as an exception, and do not treat e
 | `201` | Created | Hub registration |
 | `204` | No Content | Hub deletion |
 | `400` | Bad Request | Invalid JSON/DTO, ID, scopes, schema, TTL, address, prefix, method, hop, or handler call error |
-| `401` | Unauthorized | Missing or invalid bearer token |
+| `401` | Unauthorized | Missing or invalid bearer token, or a link or provider credential used outside its one route |
+| `403` | Forbidden | A user is not paired in the room, a hub `auth` refused a credential (`credential refused`), or a provider credential asked for something outside its scope |
 | `404` | Not Found | Unknown hub, expired hub, or unknown route |
-| `409` | Conflict | Duplicate hub ID, busy internal handler, import ID mapped elsewhere |
+| `408` | Request Timeout | A waiting `pair` ended with no partner |
+| `409` | Conflict | Duplicate hub ID, busy internal handler, import ID mapped elsewhere, pairing conflicts |
 | `413` | Payload Too Large | Request/response size, argument count, generate count, entity or event budget |
 | `429` | Too Many Requests | Peer request budget exhausted |
 | `500` | Internal Server Error | Handler task failed, or embedded schema could not be loaded |
@@ -39,8 +41,8 @@ A preflight entity/event budget violation is `413`, even though it happens befor
 
 ### 409 vs 503
 
-- `409` means the specific hub handler could not be locked because another call is using it.
-- `503` means the global in-flight semaphore is full or the handler lock is poisoned.
+- `409` means the hub's turn did not come within `LIVEENGINE_CALL_QUEUE_MS`: calls to one hub queue in arrival order, and this one waited too long behind a running call.
+- `503` means no worker slot was free within the queue time, the queue (`LIVEENGINE_MAX_QUEUED_CALLS`) is full, or the handler lock is poisoned.
 
 Both are retryable in principle, but reconcile state first if a previous mutation may have started.
 

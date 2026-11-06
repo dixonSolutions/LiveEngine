@@ -3,12 +3,13 @@ title: "Security model and limits"
 description: "Administrative authentication, peer rate budgets, remote-host allowlists, request budgets, and the boundaries of 0.2.4."
 ---
 
-LiveEngine 0.2.4 provides **administrative** security. It does not provide player accounts, per-player authorization, tenant isolation, or durable storage. Treat the hub token as a server-side secret and put application authentication in front of player-facing routes.
+LiveEngine 0.2.4 secures the **service** with an administrative token, and gives browsers narrow, short-lived tickets for live sockets. A hub can also verify a credential that your application relays before it issues a ticket ([custom auth](/guides/custom-auth)). It does not provide player accounts or sign-in, per-player authorization policy, tenant isolation, or durable rooms. Treat the hub token as a server-side secret and put application authentication in front of player-facing routes. The model for the live features is in [live architecture](/concepts/live-architecture).
 
 ## Token authentication
 
 - `LIVEENGINE_TOKEN` is required and must contain at least 24 bytes.
-- Data endpoints require `Authorization: Bearer <token>`.
+- Data endpoints require `Authorization: Bearer <token>`. Two narrower bearer credentials exist, each accepted on one route only: a hub link credential on `POST /v1/hubs/{id}/tickets` for role `service` ([hub links](/guides/hub-links)), and a provider-hosting credential on `POST /v1/route` inside its own subtree ([provider hosting](/guides/provider-hosting)).
+- The live sockets `/v1/live` and `/v1/live/registry` do not use the bearer header. They authenticate in their first frame with a single-use ticket (or, for the registry, the administrator token) and check the browser `Origin` against `LIVEENGINE_LIVE_ALLOWED_ORIGINS`.
 - `GET /health` and `GET /v1/ping` are intentionally unauthenticated. Neither exposes state; ping returns timing metadata only.
 - Token comparison is constant-time over the supplied and expected bytes and also checks length.
 - Failure returns `401` with `{"error":"unauthorized"}` and does not echo the token.
@@ -21,7 +22,7 @@ liveengine-hub: LIVEENGINE_TOKEN must be at least 24 bytes
 
 ## Peer rate budgets
 
-Every request other than `/health` and `/v1/ping` consumes a rate slot **before** authentication, keyed by the actual socket peer IP:
+Every HTTP request other than `/health` and `/v1/ping` consumes a rate slot **before** authentication, keyed by the actual socket peer IP. The two WebSocket upgrades do not use this budget; they have their own connection limits ([live rooms](/guides/live-rooms)):
 
 - `LIVEENGINE_RATE_LIMIT_REQUESTS` (default `120`) per window.
 - `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` (default `60`).
@@ -82,7 +83,7 @@ Internal handlers run on blocking workers. The route applies `request_timeout`:
 - It continues to hold its global in-flight permit and the engine lock until it finishes.
 - Retrying a mutation while the first attempt is still running can produce conflicting state. Reconcile before retrying.
 
-A concurrent call to a busy handler returns `409`; a poisoned handler lock returns `503`.
+Calls to a hub queue in arrival order for up to `LIVEENGINE_CALL_QUEUE_MS` (1000 by default). A call that cannot get the hub's turn in that time returns `409`; one that cannot get a worker slot returns `503`; a poisoned handler lock returns `503`.
 
 ## Scope validation is not a validator
 
@@ -90,9 +91,8 @@ A concurrent call to a busy handler returns `409`; a poisoned handler lock retur
 
 ## Explicit non-goals in 0.2.4
 
-- No player authentication or authorization.
+- No player accounts, sign-in or authorization policy. Hub `auth` verifies a credential for a user id, and your application decides everything else.
 - No tenant isolation policy.
-- No persistence or restart recovery.
+- No persistence of rooms, members or messages. `LIVEENGINE_STATE_FILE` persists registry definitions, schemas, templates, links and credentials.
 - No built-in TLS termination; use an ingress or reverse proxy.
 - No automatic discovery beyond registry listing and explicit imports.
-- No multiplayer state replication in the Gogh Strike integration.

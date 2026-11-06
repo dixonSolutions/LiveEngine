@@ -126,8 +126,19 @@ impl HubService {
     ) -> Result<HubInfo, String>
     where
         H: HubHandler + 'static;
+    pub async fn register(&self, spec: HubSpec) -> Result<HubInfo, String>;
+    pub async fn register_hosted(&self, spec: HubSpec) -> Result<HostedHub, String>;
+    pub fn register_verifier<V: AuthVerifier>(&self, name: &str, verifier: V) -> Result<(), String>;
+    pub fn verify_ticket(&self, ticket: &str, hub_path: &[String], room: &str) -> Result<TicketClaims, &'static str>;
+    pub async fn initialize_state(&self) -> Result<(), String>;
 }
 ```
+
+- `register` registers a hub with the same validation as the HTTP API, from a `HubSpec` (which can carry `channels`, `auth`, `schema_ref`, `max_hubs`, `live_depth`, `template`). It refuses a spec with `hosting`.
+- `register_hosted` creates a provider-hosted central and returns the hub-scoped credential once. See [provider hosting](/guides/provider-hosting).
+- `register_verifier` registers a compiled `liveengine::auth::AuthVerifier` that hubs name with `{ "kind": "custom", "name": "..." }`. See [custom auth](/guides/custom-auth).
+- `verify_ticket` verifies and consumes a room ticket.
+- `initialize_state` creates or verifies the durable snapshot before the service accepts requests.
 
 `HubService` is cloneable and cheap to share. `HubService::new` validates the config, builds the outbound client with redirects disabled, and creates the in-flight semaphore.
 
@@ -208,4 +219,4 @@ liveengine-hub: could not bind 127.0.0.1:8787: ...
 
 ## HTTP client
 
-`liveengine::hub::HubClient::new(address, token)` provides `route`, `tree`, `export_registry`, and `request` for every protocol endpoint. Requests use a five-second timeout, no redirects, and a 4 MiB response limit.
+`liveengine::hub::HubClient::new(address, token)` provides `route`, `tree`, `ticket`, `watch_ticket`, `watch`, `export_registry`, and `request` for every protocol endpoint. There are no `discover` or `pair` methods: use `request` with `/v1/discover` and `/v1/pair`, or `route` with the `discover` and `pair` operations. Errors are `String`s such as `remote: remote returned HTTP 403`. Requests use a five-second timeout, no redirects, and a 4 MiB response limit.

@@ -1,7 +1,276 @@
 ---
-title: "Custom auth and provider hosting"
+title: "Custom auth"
+description: "Verify a user's credential before a ticket is issued, with token, HMAC, JWT, webhook or compiled verifiers, and carry the verified identity and claims into the room."
 ---
 
-Register a hub with `auth` to verify a presented credential before issuing a ticket. Built-in kinds are `token`, `hmac`, `jwt` and `webhook`; the schema reference describes their fields. JWT uses a configured `HS256` or `EdDSA` algorithm, never an algorithm selected by the token. Webhook hosts must be allowlisted and failures are closed. The verifier resolves identity and user-defined claims; identity must match the requested user ID. Embedded Rust services can register a compiled verifier through `HubService::register_verifier` and use `{ "kind": "custom", "name": "..." }`.
+A hub can carry an `auth` definition. Before the hub issues a ticket or pairs a subject, it checks the credential the user presented and resolves it to an **identity** plus **claims**. The identity must equal the user id the ticket is for, so a credential can never mint a ticket for someone else. Core never interprets claims: they are your data, signed into the ticket and shown to the room.
 
-A central registration with `hosting: "provider"` creates the hub on the same service and returns a scoped `credential` once. It is used as bearer on `/v1/route` for that hub and its subtree, not its parent or siblings. Store it securely. The state snapshot contains secrets and must be mode 0600. See [hosting](https://github.com/dixonSolutions/LiveEngine/blob/main/docs/hosting.md) for verifier formats and scoped operations.
+Your own login is still yours. `auth` does not sign users in. It lets the hub confirm that the credential your application (or your identity provider) issued is valid for exactly this user, at the point where the hub grants a seat.
+
+## When to use this
+
+Use hub `auth` when the hub should not simply trust the user id your application server sends it: for example, when several services can request tickets, when the application relays a user's own token, or when you want the verified identity and claims visible to the other peers. If your application server alone decides who gets a ticket, you do not need it.
+
+## The flow
+
+<Steps>
+  <Step title="Register a hub with auth">
+    Add `auth` to the hub definition. Secrets are write-only: they are stored but never returned.
+  </Step>
+  <Step title="The player presents a credential to your server">
+    The browser sends the credential to your application route. It never calls the hub: tickets and pairing need the administrator token.
+  </Step>
+  <Step title="Your server passes it to the hub">
+    Add `credential` to the ticket request or to `pair`. The hub verifies it, and refuses with `403 credential refused` if anything is wrong.
+  </Step>
+  <Step title="The room sees the identity">
+    The `welcome` frame carries your own `identity` and the `peerIdentities` of the peers; a `presence` join carries the joiner's `identity`.
+  </Step>
+</Steps>
+
+## Verifier kinds
+
+| `kind` | Definition | Credential |
+| --- | --- | --- |
+| `token` | `tokens`: 1 to 256 entries of `{ token, identity?, claims? }`; each `token` is 24 to 512 bytes | The token itself, compared in constant time |
+| `hmac` | `secret` (32 to 512 bytes), `leewaySeconds?` (0 to 300) | `base64url(payload JSON).base64url(HMAC-SHA256(secret, first segment))`. The payload holds `sub`, a required `exp` in Unix seconds, and any claims |
+| `jwt` | `alg`: `HS256` with `secret` (32 to 512 bytes) or `EdDSA` with `publicKey` (32 raw bytes as unpadded base64url); `issuer?`, `audience?`, `identityClaim?` (default `sub`), `leewaySeconds?` (0 to 300) | A compact JWT with a required `exp` |
+| `webhook` | `url`, `secret?` (1 to 512 bytes, sent as a bearer token), `timeoutMs?` (100 to 10000, default 3000) | Opaque; forwarded to your endpoint |
+| `custom` | `name` of a verifier registered in Rust | Opaque; given to the verifier |
+
+All base64url is unpadded. Unknown fields in an `auth` definition are refused.
+
+### Identity and claims
+
+- For `token`, an entry without `identity` resolves to the requested user id: whoever holds that token may take any user id. Set `identity` on each entry to bind a token to one user.
+- For `hmac` and `jwt`, the identity is `sub` (or the JWT's `identityClaim`) and must be a non-empty string. `exp` is required. `nbf` is honoured. With `issuer` or `audience` configured the token must match; `aud` may be a string or an array. `exp`, `nbf` and `iat` and the identity claim itself are removed from the claims; everything else, including `iss` and `aud`, becomes a claim.
+- A `webhook` answer may set `identity` (non-empty string) and `claims` (object); a missing identity means the requested user id.
+- After verification the identity must equal the requested `userId`, or the credential is refused. An empty identity is replaced by `userId`.
+
+### JWT specifics
+
+The algorithm comes only from the hub definition. A token whose `alg` header differs, including `none`, is refused, as is a token with a `crit` header. No other algorithm can be configured: there is no RS256, ES256 or JWKS support.
+
+## JavaScript
+
+### Register the hub
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+const hub = new HubClient(process.env.HUB_URL, { token: process.env.LIVEENGINE_TOKEN });
+
+await hub.register({
+  id: 'hub-a',
+  mode: 'internal',
+  auth: { kind: 'hmac', secret: process.env.HUB_AUTH_SECRET, leewaySeconds: 5 }, // 32 bytes or more
+});
+```
+
+`GET /v1/hubs/hub-a` now shows `"auth": { "kind": "hmac" }` and nothing else.
+
+### Mint and present a credential (HMAC)
+
+```js
+const { createHmac } = require('node:crypto');
+
+// Run this where the secret lives: your identity service, not the browser.
+function mintCredential(secret, userId, claims = {}, ttlSeconds = 60) {
+  const payload = Buffer.from(JSON.stringify({
+    sub: userId,
+    exp: Math.floor(Date.now() / 1000) + ttlSeconds,
+    ...claims,
+  })).toString('base64url');
+  const mac = createHmac('sha256', secret).update(payload).digest('base64url');
+  return `${payload}.${mac}`;
+}
+
+app.post('/api/pair', async (req, res) => {
+  try {
+    const descriptor = await hub.pair({
+      subject: { id: req.body.userId, scopes: {} },
+      target: { kind: 'hub', id: 'hub-a' },
+      credential: req.body.credential,
+    });
+    res.json(descriptor);
+  } catch (error) {
+    res.status(error.status === 403 ? 403 : 502).json({ error: 'refused' });
+  }
+});
+```
+
+The route can pass the user id the client claims: the hub confirms that the credential belongs to that id. For direct tickets use `hub.ticket('hub-a', { userId, serverId, credential })`.
+
+### JWT with a shared secret
+
+```js
+const b64 = value => Buffer.from(JSON.stringify(value)).toString('base64url');
+function signJwt(secret, claims) {
+  const input = `${b64({ alg: 'HS256', typ: 'JWT' })}.${b64(claims)}`;
+  return `${input}.${createHmac('sha256', secret).update(input).digest('base64url')}`;
+}
+
+await hub.register({
+  id: 'hub-b', mode: 'internal',
+  auth: { kind: 'jwt', alg: 'HS256', secret: process.env.HUB_AUTH_SECRET, issuer: 'https://id.example.net', audience: 'hub-b' },
+});
+
+const credential = signJwt(process.env.HUB_AUTH_SECRET, {
+  sub: 'user-a', iss: 'https://id.example.net', aud: 'hub-b',
+  exp: Math.floor(Date.now() / 1000) + 60, tier: 'standard',
+});
+```
+
+For `EdDSA`, register `{ kind: 'jwt', alg: 'EdDSA', publicKey }` with the 32-byte Ed25519 public key as unpadded base64url. In Node that is `crypto.generateKeyPairSync('ed25519').publicKey.export({ format: 'jwk' }).x`.
+
+### Static tokens
+
+```js
+await hub.register({
+  id: 'hub-c', mode: 'internal',
+  auth: { kind: 'token', tokens: [{ token: 'a-token-of-at-least-24-bytes-0001', identity: 'user-a', claims: { tier: 'standard' } }] },
+});
+```
+
+### Webhook
+
+```js
+await hub.register({
+  id: 'hub-d', mode: 'internal',
+  auth: { kind: 'webhook', url: 'https://auth.example.net/verify', secret: process.env.WEBHOOK_SECRET, timeoutMs: 2000 },
+});
+```
+
+The host of `url` must be in `LIVEENGINE_ALLOWED_REMOTE_HOSTS`, including `localhost` or a private address; it is checked again on every call. The hub POSTs:
+
+```json
+{ "hub": "hub-d", "path": [], "userId": "user-a", "serverId": "room-1", "role": "peer", "credential": "..." }
+```
+
+with `Authorization: Bearer <secret>` when a `secret` is set. Answer `200` with:
+
+```json
+{ "allow": true, "identity": "user-a", "claims": { "tier": "standard" } }
+```
+
+Any other status, a body that is not a JSON object, `allow` other than `true`, an oversized body (over 64 KiB), a timeout or a network error refuses the ticket. Redirects are not followed. `path` is the central path of the hub, without the hub id.
+
+### Read the identity in the room
+
+```js
+client.on('welcome', ({ identity }) => console.log('I am', identity)); // { identity, claims }
+client.on('presence', ({ event, peer, identity }) => event === 'join' && console.log(peer, identity));
+console.log(client.identity, client.identityOf('user-b'));
+```
+
+`LiveClient` also accepts a `credential` option (a string or a function) that it hands to `renew({ credential, previous })`. `connectLive` posts it as `credential` in the body of `pairUrl` and `renewUrl`.
+
+## Rust: a compiled verifier
+
+An embedded service can verify with its own code, such as a database lookup. Register the verifier before the hubs that name it.
+
+```rust
+use liveengine::auth::{AuthError, AuthRequest, AuthVerifier, Identity};
+use liveengine::hub::{HubConfig, HubService, HubSpec};
+use serde_json::{json, Map};
+use std::{future::Future, pin::Pin};
+
+struct Directory;
+
+impl AuthVerifier for Directory {
+    fn verify<'a>(
+        &'a self,
+        request: &'a AuthRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<Identity, AuthError>> + Send + 'a>> {
+        Box::pin(async move {
+            // request.hub_path, hub, room, user, role, credential
+            if request.credential != "expected" {
+                return Err(AuthError);
+            }
+            let mut claims = Map::new();
+            claims.insert("tier".into(), json!("standard"));
+            Ok(Identity { identity: request.user.to_string(), claims })
+        })
+    }
+}
+
+let service = HubService::new(HubConfig { token: token.into(), ..HubConfig::default() })?;
+service.register_verifier("directory", Directory)?;
+service.register(HubSpec {
+    id: "hub-a".into(),
+    auth: Some(json!({ "kind": "custom", "name": "directory" })),
+    ..HubSpec::default()
+}).await?;
+```
+
+`register_verifier` takes a name of 1 to 64 characters of `A-Z a-z 0-9 . _ -`. A name registered twice, or an unknown name in a hub definition, is an error (`auth verifier is not registered`). Nested centrals share the registry. Verifiers live in memory: register them again on every start.
+
+A hub added with `register_internal` has no `auth` field: it accepts tickets without a credential. Set `auth` only through `HubSpec` (`register`) or the HTTP API.
+
+For `HubClient` in Rust, pass the credential as the last argument: `hub.ticket(&[], "hub-a", "user-a", "room-1", "peer", Some(&credential))`. The CLI reads it from `--credential` or `LIVEENGINE_CREDENTIAL`.
+
+## Wire format
+
+The credential is a member of the ticket request:
+
+```json
+{ "userId": "user-a", "serverId": "room-1", "role": "peer", "credential": "..." }
+```
+
+and of the pair subject: `{ "kind": "peer", "id": "user-a", "scopes": {}, "credential": "..." }`. After a successful check the hub clears the credential from the request; it is never stored.
+
+`pair` checks the credential once. Internally it calls the `authorize` route operation, which returns a short-lived receipt (30 seconds), single-use and bound to hub, room, user and role, and the ticket step accepts that receipt instead of the credential. A single-use credential therefore works with `pair`. `authorize` returns `{ "ok": true }` for a hub without `auth`, and `{ "ok": true, "receipt": "..." }` otherwise. Receipts are an implementation detail of pairing and are not in the published contract schema.
+
+The room sees identities in these places only: `welcome.identity`, `welcome.peerIdentities` (keyed by peer id) and `presence.identity`:
+
+```json
+{ "type": "welcome", "peers": ["user-b"], "iceServers": [], "identity": { "identity": "user-a", "claims": { "tier": "standard" } },
+  "peerIdentities": { "user-b": { "identity": "user-b", "claims": {} } } }
+```
+
+## Limits
+
+| Item | Limit |
+| --- | --- |
+| Credential | 8192 bytes, non-empty |
+| `token` entries | 1 to 256; each 24 to 512 bytes |
+| `hmac` or `jwt` HS256 secret | 32 to 512 bytes |
+| `leewaySeconds` | 0 to 300 |
+| Webhook `timeoutMs` | 100 to 10000; default 3000 |
+| Webhook answer | 64 KiB |
+| Claims at verification | 16 KiB serialized |
+| Claims and identity in a ticket | claims 2048 bytes serialized, identity 256 bytes. Over it the request is `413 identity claims exceed the live limit` |
+| Ticket | 16384 bytes |
+
+## Errors
+
+| Status | Message | Cause |
+| --- | --- | --- |
+| `403` | `credential refused` | Every verification failure looks the same: missing or oversized credential, bad signature or token, expired or not yet valid, wrong issuer or audience, wrong algorithm, identity not equal to `userId`, webhook refusal or failure, unknown custom verifier |
+| `413` | `identity claims exceed the live limit` | Verified claims are too large for a ticket |
+| `400` | `invalid auth` | Unknown `kind` or field, or a malformed definition |
+| `400` | `central hubs cannot set auth` | `auth` on a central |
+| `400` | `auth tokens must hold 1 to 256 entries`, `auth tokens must be 24 to 512 bytes`, `auth identity must not be empty`, `auth claims exceed size limit` | `token` definition |
+| `400` | `auth secret must be 32 to 512 bytes`, `HS256 requires a secret of 32 to 512 bytes and no publicKey`, `EdDSA requires a 32 byte base64url publicKey and no secret`, `auth leewaySeconds must be at most 300`, `auth identityClaim must not be empty` | `hmac` and `jwt` definitions |
+| `400` | `auth secret must be 1 to 512 bytes`, `auth timeoutMs must be 100 to 10000`, `remote host is not in LIVEENGINE_ALLOWED_REMOTE_HOSTS` | `webhook` definition |
+| `400` | `auth name must be 1 to 64 ASCII letters, digits, '.', '_' or '-'`, `auth verifier is not registered` | `custom` definition |
+
+The hub gives no reason in the `403` so a failed attempt reveals nothing. Debug on the credential side, or log inside your webhook or compiled verifier.
+
+## Security notes
+
+- The browser never calls the hub's ticket or pair routes, which need the administrator token. It sends its credential to your route and your route forwards it.
+- Keep credentials short-lived. `exp` is required for `hmac` and `jwt`, so there is no credential that never expires. The hub does not remember used credentials, so a captured credential works until it expires. Use a `custom` or `webhook` verifier to make credentials single-use, or rely on short lifetimes.
+- Secrets are stored in the state file (`LIVEENGINE_STATE_FILE`) next to remote tokens, and are never returned by any route, export or `GET /v1/hubs/{id}`. Protect the file (mode 0600) and its backups.
+- Token comparison is constant time. Every token entry is checked, with no early exit.
+- A webhook is called with the user's credential. Serve it over HTTPS, authenticate it with `secret`, and keep its host on a short allowlist.
+- Identity is not carried across [hub links](/guides/hub-links). A ticket for a hub that forwards to another service carries identity only when that service verified the credential.
+
+## What is not supported
+
+- No RS256, ES256, JWKS discovery or other algorithms, and no `none`.
+- No revocation list. Use short expiry, or a `custom` or `webhook` verifier.
+- No `auth` on central hubs, and none on hubs added with `register_internal`.
+- No interpretation of claims: policy decisions on claims are yours.
+- No credential refresh inside `LiveClient`; your `renew` route supplies a new descriptor and, if needed, a new credential.
+- No per-channel or per-frame authorization from claims.
+- No sign-in, sessions or user storage.

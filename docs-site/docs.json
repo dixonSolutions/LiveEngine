@@ -51,6 +51,7 @@
               "guides/find-and-pair",
               "guides/hub-links",
               "guides/custom-auth",
+              "guides/provider-hosting",
               "guides/import-registry",
               "guides/custom-handler",
               "guides/docker",
@@ -68,6 +69,7 @@
               "concepts/strategies",
               "concepts/events",
               "concepts/hubs-and-registry",
+              "concepts/live-architecture",
               "concepts/security"
             ]
           }

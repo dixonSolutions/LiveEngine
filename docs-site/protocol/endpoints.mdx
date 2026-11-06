@@ -352,7 +352,9 @@ Set `refreshSeconds` to periodically refresh; missing entries are marked stale.
 | --- | --- | --- |
 | `400` | Bad Request | Invalid DTO, ID, scopes, address, prefix, method, or hop |
 | `401` | Unauthorized | Missing or wrong bearer token |
+| `403` | Forbidden | User not paired in the room, `credential refused` by hub `auth`, or a provider credential outside its scope |
 | `404` | Not Found | Unknown route or hub |
+| `408` | Request Timeout | A waiting `pair` ended with no partner |
 | `409` | Conflict | Duplicate ID, busy handler, import mapping conflict |
 | `413` | Payload Too Large | Body/response size, args, generate count, entity/event budget |
 | `429` | Too Many Requests | Peer rate budget exhausted |

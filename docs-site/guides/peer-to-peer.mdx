@@ -1,16 +1,211 @@
 ---
 title: "Peer-to-peer"
+description: "Pair peers with each other, let LiveClient open WebRTC data channels with the hub as signalling and fallback, and configure STUN and TURN."
 ---
 
-`LiveClient` uses the room socket for `signal.offer`, `signal.answer` and `signal.ice`, then negotiates a WebRTC data channel. A peer-targeted `send` uses the direct channel when open and automatically falls back to the hub relay. Broadcast defaults to the relay. The hub does not terminate WebRTC or carry media.
+Peer-to-peer lets two clients exchange frames directly over a WebRTC data channel instead of through the hub. The hub still does the work around it: it pairs the peers, issues their tickets, carries the signalling frames that set the channel up, and relays frames whenever the direct channel is not available. The hub does not terminate WebRTC and never carries media.
+
+## When to use this
+
+Use it when latency or hub load matters and the peers are usually able to reach each other: state streams, cursors, voice-chat metadata, small real-time updates. Keep the hub relay for anything that must reach every peer, must be schema-checked, or must work when WebRTC cannot connect.
+
+Direct frames never touch the hub, so its channel schemas, `maxRate` limits and frame rate budgets do not apply to them. Validate direct payloads in the receiving application.
+
+## The flow
+
+<Steps>
+  <Step title="Register a peer as a candidate">
+    A peer that wants a partner must already be a user of an internal hub, so other peers can discover it. Register it with the same `scopes` you will pass as `subject.scopes`.
+  </Step>
+  <Step title="Pair">
+    Your server calls `pair` with a peer subject and a `peer` or `any` target. With `waitMs` the call is held until a partner arrives. Both peers get a descriptor whose `link` is `peer-peer`.
+  </Step>
+  <Step title="Connect to the room socket">
+    Each client gives its descriptor to `LiveClient`. The room socket is used for presence and for signalling.
+  </Step>
+  <Step title="Negotiate">
+    `LiveClient` exchanges `signal.offer`, `signal.answer` and `signal.ice` frames through the hub and opens a data channel.
+  </Step>
+  <Step title="Send">
+    A frame addressed to one peer goes over the data channel when it is open and through the hub otherwise. Switching is automatic.
+  </Step>
+</Steps>
+
+## Pairing two peers
+
+### JavaScript (server)
 
 ```js
-import { LiveClient } from '@dixonsolutions/liveengine/live-client';
-const client = new LiveClient(descriptor, { renew: getFreshDescriptor });
-client.on('message', frame => console.log(frame.from, frame.via, frame.payload));
-await client.connect();
-client.connectPeer('bob');
-client.send({ text: 'hello' }, { to: 'bob' });
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+const hub = new HubClient(process.env.HUB_URL, { token: process.env.LIVEENGINE_TOKEN });
+
+await hub.register({ id: 'hub-a', mode: 'internal', ifAbsent: true });
+
+async function pairPeer(userId) {
+  const scopes = { pool: 'pool-1' };
+  // Register as a candidate with exactly the scopes used in the pair request.
+  await hub.call('hub-a', 'upsertUser', [{ id: userId, scopes }]);
+  return hub.pair({
+    subject: { id: userId, scopes },
+    target: { kind: 'peer', requirements: { pool: 'pool-1' } },
+    waitMs: 20000,
+  });
+}
+
+// Descriptor for the browser: { link: 'peer-peer', room, userId, ticket, url, transports }
+const descriptor = await pairPeer('user-a');
 ```
 
-`descriptor` is the result of `HubClient.pair`, obtained from your own authenticated application backend; `getFreshDescriptor` is your renewal function. Set `LIVEENGINE_ICE_SERVERS` to a JSON array of ICE server objects. For coturn REST credentials configure `LIVEENGINE_TURN_SECRET` on the hub and TURN URLs in that array. Browsers behind strict NAT need a reachable TURN server.
+The first caller waits. When `user-b` calls `pairPeer`, both calls complete: the second at once, and the first because the second wakes it. Nothing polls. If nobody arrives within `waitMs` (at most `LIVEENGINE_MAX_PAIR_WAIT_MS`), the call fails with status `408`.
+
+`hub.pair` fills in `kind: 'peer'` and `scopes: {}` for the subject, returns `{ userId, ...descriptor }` and gives the request its own `waitMs` on top of the client timeout.
+
+For the browser, expose your own route that runs this for the logged-in user, and give `connectLive` a `renewUrl` that returns a fresh descriptor. `HubClient.renewal(request)` builds a `renew` function that pairs again with the same request:
+
+```js
+app.post('/api/pair', async (req, res) => res.json(await pairPeer(req.session.userId)));
+```
+
+```js
+import { connectLive } from '/live-client.mjs';
+const client = await connectLive({ pairUrl: '/api/pair', renewUrl: '/api/ticket' });
+```
+
+Here `/api/ticket` is a route of yours that re-issues a ticket for a user who is already paired (`hub.ticket('hub-a', { userId, serverId })`, as in [live rooms](/guides/live-rooms)). Do not point `renewUrl` at the waiting pair route: it would queue the user again.
+
+### Rust (server)
+
+The Rust `HubClient` has no `pair` method. Use `request` against `POST /v1/pair`, or `route` with the `pair` operation. The request is the same JSON:
+
+```rust
+use liveengine::hub::HubClient;
+use reqwest::Method;
+use serde_json::json;
+
+let hub = HubClient::new("http://127.0.0.1:8787", token)?;
+let scopes = json!({ "pool": "pool-1" });
+hub.request(Method::POST, "/v1/hubs/hub-a/call",
+    Some(json!({ "method": "upsertUser", "args": [{ "id": "user-a", "scopes": scopes }] }))).await?;
+let descriptor = hub.request(Method::POST, "/v1/pair", Some(json!({
+    "subject": { "kind": "peer", "id": "user-a", "scopes": scopes },
+    "target": { "kind": "peer", "requirements": { "pool": "pool-1" } },
+    "waitMs": 20000
+}))).await?;
+```
+
+A waiting `pair` can take up to the request timeout plus `waitMs`. The Rust client has a fixed five-second timeout, so a waiting pair from Rust times out on the client before the hub answers. Run the waiting call with a client you control (for example `reqwest` with a longer timeout) or keep `waitMs` under about four seconds.
+
+There is no Rust `LiveClient`: the direct channel is created by the JavaScript client in a browser or in a Node runtime with a WebRTC implementation.
+
+## Connecting and negotiating
+
+```js
+import { LiveClient } from '/live-client.mjs';
+
+const client = new LiveClient(descriptor, { renew: getFreshDescriptor });
+
+client.on('message', frame => console.log(frame.from, frame.via, frame.payload));
+client.on('transport', ({ peer, transport, reason }) => console.log(peer, transport, reason));
+client.on('direct-failed', ({ peer, reason }) => console.warn('relay only for', peer, reason));
+
+await client.connect();
+client.send({ text: 'hello' }, { to: 'user-b' });
+console.log(client.transportOf('user-b')); // 'direct' or 'relay'
+```
+
+`LiveClient` starts direct links on its own when the descriptor's `link` is `peer-peer`. Options:
+
+- `direct`: `"auto"` (default) connects directly only for `peer-peer` descriptors; `true` forces it for any descriptor; `false` disables it.
+- `directBroadcast` (default `false`): a broadcast normally goes through the hub. With `true` it goes over every open data channel and the hub gets a targeted copy only for peers that have none, so nobody hears a frame twice.
+- `directTimeoutMs` (default 10000): how long to wait for the channel to open before falling back.
+- `RTCPeerConnection`: a constructor, for runtimes without a global one.
+- `maxFrameBytes` (default 65536) applies to frames received over a data channel too.
+
+How the client behaves:
+
+- The peer with the larger id sends the offer; the other waits. Both sides create the same negotiated data channel (id 0, label `liveengine`, ordered), so neither waits for `ondatachannel`. If both offer at once, the smaller id yields (perfect negotiation).
+- Frames to one peer move to the data channel once it opens. A frame sent just before the switch can arrive after one sent just after it.
+- If the channel does not open in time, or ICE fails before it opened, the link is dropped and `direct-failed` is emitted. If ICE fails on an open channel, `LiveClient` restarts ICE once, then falls back. After a fallback the peer stays on the relay until a new link is started: by `connectPeer(peerId)`, by a reconnect (the next `welcome` starts links again), or by an offer from the peer.
+- `client.connectPeer(peerId)` starts a link by hand and returns a `PeerLink` with `transport`, `ready` (resolves `direct` or `relay`) and `close()`.
+- A frame received over a data channel must have `v` (number), `type` and `channel` (strings) and `payload`; reserved types are ignored; `from` is always set to the channel's peer, whatever the frame says.
+- In a runtime without `RTCPeerConnection`, everything goes through the relay and no error is raised.
+
+## Wire format
+
+Signalling frames are ordinary envelopes on the channel `signal`, sent as targeted frames to a peer in the same room:
+
+```json
+{ "v": 1, "type": "signal.offer", "channel": "signal", "to": "user-b", "seq": 3,
+  "payload": { "description": { "type": "offer", "sdp": "v=0..." } } }
+```
+
+```json
+{ "v": 1, "type": "signal.ice", "channel": "signal", "to": "user-b", "seq": 4,
+  "payload": { "candidate": { "candidate": "candidate:...", "sdpMid": "0" } } }
+```
+
+The hub forwards them as reliable frames that bypass channel schemas but count toward the connection's message and byte budgets. A signalling frame with no `to`, a `to` equal to the sender, a frame over `LIVEENGINE_SIGNAL_MAX_BYTES` (16384), or a `to` that is not in the room (or known through a link) closes the sender's connection. Payloads are opaque to the hub.
+
+Frames over the data channel are the same envelope as relayed frames (`v`, `type`, `channel`, optional `to`, `seq`, `payload`), JSON text.
+
+## STUN and TURN
+
+Two peers behind NAT usually connect with STUN alone. Peers behind strict or symmetric NAT or a restrictive firewall cannot, and need a TURN server to relay the data channel. A browser in that situation, with no reachable TURN server, falls back to the hub relay, at the latest after `directTimeoutMs`. That still works, but it is not direct.
+
+Set the ICE servers the hub hands to every connecting client in its `welcome` frame:
+
+```sh
+export LIVEENGINE_ICE_SERVERS='[{"urls":"stun:stun.example.org:3478"},{"urls":"turn:turn.example.org:3478"}]'
+export LIVEENGINE_TURN_SECRET="$(openssl rand -hex 32)"
+```
+
+- `LIVEENGINE_ICE_SERVERS` is a JSON array of browser ICE server objects. Each needs `urls` as a non-empty string or a non-empty array of at most 32 non-empty strings. At most 32 entries and 16384 bytes in total. An invalid value stops the host from starting.
+- With `LIVEENGINE_TURN_SECRET` (1 to 4096 bytes), every entry that has a `turn:` or `turns:` URL gets per-connection credentials: a `username` of `<unix expiry one hour ahead>:<userId>:<random number>` and a `credential` that is the base64 HMAC-SHA1 of the username with the secret. Any static `credentialType`, `username` and `credential` on those entries is replaced. STUN-only entries are unchanged.
+- Configure your TURN server with the same shared secret. coturn supports this scheme through its shared-secret mode (`use-auth-secret` and `static-auth-secret`). Keep the secret private; it is never sent to clients.
+- Without `LIVEENGINE_TURN_SECRET`, put static TURN `username` and `credential` in `LIVEENGINE_ICE_SERVERS` yourself. They are then visible to every client, so prefer short-lived credentials.
+- The hub does not run STUN or TURN. You provide the servers and open their ports.
+
+`LiveClient` uses the `iceServers` from `welcome` automatically; you can read them with `client.iceServers`.
+
+## Limits
+
+| Setting | Default |
+| --- | --- |
+| `LIVEENGINE_MAX_PAIR_WAIT_MS` | 30000; `0` turns waiting off |
+| `LIVEENGINE_MAX_PENDING_PAIRS` | 1024 waiting peers per namespace |
+| `LIVEENGINE_SIGNAL_MAX_BYTES` | 16384 |
+| `directTimeoutMs` (client) | 10000 |
+| `maxFrameBytes` (client) | 65536 |
+| Room capacity of a pair room | 64 |
+
+Other room and rate limits are in [live rooms](/guides/live-rooms). Details of `pair` and `waitMs` are in [find and pair](/guides/find-and-pair).
+
+## Errors
+
+| Where | Result | Meaning |
+| --- | --- | --- |
+| `pair` | `408 no matching peer arrived in time` | `waitMs` elapsed with no partner |
+| `pair` | `404 no matching candidate` | No partner exists and no wait was requested (`waitMs` omitted or `0`, or `LIVEENGINE_MAX_PAIR_WAIT_MS=0`) |
+| `pair` | `409 peer is already waiting to pair` | The same id with the same scopes is already queued |
+| `pair` | `409 peer already paired` | The candidate was paired by someone else first |
+| `pair` | `503 pairing queue is full` | `LIVEENGINE_MAX_PENDING_PAIRS` reached |
+| `pair` | `400 waitMs needs a peer subject and a peer or any target` | `waitMs` used with a hub subject or hub target |
+| `pair` | `400 invalid waitMs` | Not a non-negative integer |
+| client | `direct-failed` event | The channel did not open; the peer stays on the relay |
+| client | `The hub refused the ticket or closed the connection` | The ticket was refused or spent; see [live rooms](/guides/live-rooms) |
+
+## Security notes
+
+- Both peers are authenticated only by tickets your server chose to issue. Pair on your server, after you authenticated the player.
+- A direct channel exposes each peer's network addresses to the other, as WebRTC does. If that matters, force relay with `direct: false`. `LiveClient` has no relay-only ICE policy option.
+- Direct frames bypass hub schemas and rate limits. A malicious peer can send anything its partner will parse.
+- Keep `LIVEENGINE_TURN_SECRET` out of client code and logs.
+
+## What is not supported
+
+- No media. Data channel and relay frames only.
+- No group mesh management: `LiveClient` opens a link to each peer in the room, and the larger id offers; there is no selective connection policy beyond `direct` and `connectPeer`.
+- No Rust `LiveClient` and no built-in WebRTC in Node. Supply `RTCPeerConnection`.
+- No built-in STUN or TURN server.
+- No ICE transport policy option, such as relay-only.
+- No retry of a failed direct link other than a reconnect, a new offer from the peer, or calling `connectPeer` again.

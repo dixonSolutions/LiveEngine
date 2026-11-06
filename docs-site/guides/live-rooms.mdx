@@ -1,9 +1,358 @@
 ---
 title: "Live rooms"
+description: "Issue single-use tickets, connect browsers to a room over WebSocket, relay frames on declared channels, and understand the frame format, limits and failure modes."
 ---
 
-An administrator pairs a user into a room, then requests `POST /v1/hubs/{id}/tickets` with `{ "userId": "alice", "serverId": "room-1", "role": "peer" }`. For nested hubs use the `ticket` operation on `/v1/route` with the hub ID in `body`. A hub with auth also needs `credential`. The response contains `ticket`, `url` and `expiresAt`; the service that holds the room supplies the URL. Set `LIVEENGINE_PUBLIC_URL` to its reachable WebSocket endpoint, for example `ws://127.0.0.1:9000/v1/live`.
+A live room is the real-time side of a hub room. The engine decides who is a member of a room. The live relay lets those members exchange frames: presence, broadcasts and targeted messages. The browser never holds the administrator token. It holds one short-lived, single-use **ticket** that your application server obtained for a user who is already paired in the room.
 
-The browser sends `{ "type": "auth", "ticket": "..." }` as its first WebSocket frame within five seconds. Tickets are single-use and short-lived; a reconnect needs a fresh one. Set `LIVEENGINE_LIVE_ALLOWED_ORIGINS` to exact comma-separated browser origins. Keep administrator tokens on the application server. The [user hub example](/guides/user-hub) demonstrates this flow.
+Core is plumbing. It does not know what your frames mean. Channel names, frame types and payloads are yours; core carries them, checks them against the schema you declared, and enforces limits.
 
-Application frames use `v`, `type`, `channel`, optional `to`, `seq` and `payload`. The server stamps `from`; it rejects spoofing. `presence`, `welcome`, `error`, `auth`, `link.*` and `signal.*` are reserved for the protocol. Declare custom channels and optional payload schema references on the hub. Reliable queues disconnect slow consumers; lossy queues may drop frames. See [limits](/reference/limits).
+## When to use this
+
+Use live rooms when members of a hub room need low-latency messages through the hub: chat, presence, notifications, state streams, commands. If peers should talk directly to each other where possible, add [peer-to-peer](/guides/peer-to-peer) on top: it uses the same room socket for signalling and as the fallback relay.
+
+Do not use live rooms as a database or a queue. Rooms and presence live in memory and are lost on restart.
+
+## The flow
+
+<Steps>
+  <Step title="Configure the hub service">
+    Set `LIVEENGINE_PUBLIC_URL` to the WebSocket URL browsers will use, and `LIVEENGINE_LIVE_ALLOWED_ORIGINS` to the exact browser origins.
+  </Step>
+  <Step title="Register the hub, channels and room">
+    Register an internal hub, optionally declare its channels and payload schemas, create the room and put the user in it.
+  </Step>
+  <Step title="Issue a ticket from your server">
+    Your authenticated application route calls `POST /v1/hubs/{id}/tickets` (or `HubClient.ticket`). The response is `{ ticket, url, expiresAt }`.
+  </Step>
+  <Step title="Connect the browser">
+    The browser opens `url` and sends `{ "type": "auth", "ticket": "..." }` as its first frame within five seconds. The hub answers with a `welcome` frame.
+  </Step>
+  <Step title="Exchange frames">
+    Peers send envelopes. The hub stamps `from` and delivers them. A reconnect needs a new ticket.
+  </Step>
+</Steps>
+
+## Server configuration
+
+```sh
+export LIVEENGINE_TOKEN="$(openssl rand -hex 32)"
+export LIVEENGINE_PUBLIC_URL=wss://hub.example.net/v1/live
+export LIVEENGINE_LIVE_ALLOWED_ORIGINS=https://app.example.net
+liveengine-hub
+```
+
+- `LIVEENGINE_PUBLIC_URL` is returned verbatim as `url` in every ticket. Without it, ticket requests fail with `503 public URL is not configured`. It must be reachable by the browser; it is not derived from `LIVEENGINE_BIND`.
+- `LIVEENGINE_LIVE_ALLOWED_ORIGINS` is a comma-separated list of exact origins such as `https://app.example.net`. A WebSocket upgrade that carries an `Origin` header not on the list, or more than one `Origin` header, is refused with `403`. An upgrade with no `Origin` header (a server-side client) is accepted, so the ticket remains the credential. An empty list therefore refuses every browser.
+- `LIVEENGINE_TICKET_TTL_SECONDS` sets ticket lifetime. The default is 60. A value that is not a positive integer stops the host from starting.
+
+For a service that fronts the hub with a reverse proxy, terminate TLS there and proxy `/v1/live` as a WebSocket. See [deployment](/guides/deployment).
+
+## Register a hub with channels
+
+Channels are optional. Declare them to get server-side schema validation, delivery semantics and rate limits per channel.
+
+<Note>
+  If a hub declares channels, a frame on any channel that is not declared closes the sender's connection. `LiveClient.send` uses the channel `default` unless you pass `channel`, so always pass one when channels are declared.
+</Note>
+
+### JavaScript (server)
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+
+const hub = new HubClient(process.env.HUB_URL, { token: process.env.LIVEENGINE_TOKEN });
+
+// A schema for the payloads of one channel. Shape and names are yours.
+await hub.createSchema({
+  id: 'notice',
+  version: '1',
+  schema: {
+    type: 'object',
+    required: ['text'],
+    properties: { text: { type: 'string', maxLength: 500 } },
+    additionalProperties: false,
+  },
+});
+
+await hub.register({
+  id: 'hub-a',
+  mode: 'internal',
+  channels: {
+    control: { schemaRef: 'notice@1', delivery: 'reliable', maxRate: 20 },
+    feed: { delivery: 'lossy', maxRate: 30 },
+  },
+});
+
+// Membership is decided by the engine. A ticket is only issued for a paired user.
+await hub.call('hub-a', 'upsertServer', [{ id: 'room-1', capacity: 8 }]);
+await hub.call('hub-a', 'upsertUser', [{ id: 'user-a' }]);
+await hub.call('hub-a', 'join', ['user-a', 'room-1']);
+```
+
+### Rust (server)
+
+The Rust `HubClient` has `request`, `route`, `ticket`, `watch_ticket`, `watch`, `tree` and `export_registry`. Everything else goes through `request`. Add `liveengine`, `reqwest`, `serde_json` and `tokio` to `Cargo.toml`.
+
+```rust
+use liveengine::hub::HubClient;
+use reqwest::Method;
+use serde_json::json;
+
+#[tokio::main]
+async fn main() -> Result<(), String> {
+    let hub = HubClient::new("http://127.0.0.1:8787", std::env::var("LIVEENGINE_TOKEN").unwrap())?;
+
+    hub.request(Method::POST, "/v1/schemas", Some(json!({
+        "id": "notice", "version": "1",
+        "schema": { "type": "object", "required": ["text"], "properties": { "text": { "type": "string" } } }
+    }))).await?;
+
+    hub.request(Method::POST, "/v1/hubs", Some(json!({
+        "id": "hub-a", "mode": "internal",
+        "channels": {
+            "control": { "schemaRef": "notice@1", "delivery": "reliable", "maxRate": 20 },
+            "feed": { "delivery": "lossy", "maxRate": 30 }
+        }
+    }))).await?;
+
+    for (method, args) in [
+        ("upsertServer", json!([{ "id": "room-1", "capacity": 8 }])),
+        ("upsertUser", json!([{ "id": "user-a" }])),
+        ("join", json!(["user-a", "room-1"])),
+    ] {
+        hub.request(Method::POST, "/v1/hubs/hub-a/call", Some(json!({ "method": method, "args": args }))).await?;
+    }
+    Ok(())
+}
+```
+
+An error from the Rust client is a `String` such as `remote: remote returned HTTP 403`; it does not carry the response body. Use the CLI or `curl` to read the server's `error` message while debugging.
+
+## Issue a ticket
+
+`POST /v1/hubs/{id}/tickets` with the administrator token:
+
+```json
+{ "userId": "user-a", "serverId": "room-1", "role": "peer" }
+```
+
+```json
+{ "ticket": "eyJ...", "url": "wss://hub.example.net/v1/live", "expiresAt": 1793782217 }
+```
+
+| Field | Rules |
+| --- | --- |
+| `userId` | Required, non-empty. Must already be paired in `serverId`. This is the user's id inside the room. |
+| `serverId` | Required, non-empty. The room. |
+| `role` | `peer` (default) or `service`. `service` is for link and hub-to-hub sockets; see [hub links](/guides/hub-links). |
+| `credential` | The user's credential, only for hubs that set `auth`. See [custom auth](/guides/custom-auth). |
+
+`expiresAt` is Unix seconds. Unknown fields are rejected. A ticket is bound to the hub path and the room; it is signed with a key that stays on the service, and each ticket can be used once. Used-ticket tracking is in memory, so it resets on restart, while the signing key persists only if `LIVEENGINE_STATE_FILE` is set.
+
+For a hub inside a central namespace, use the `ticket` operation of `POST /v1/route` with the hub id in `body.id`, or `HubClient.ticket(id, { path })`. A hub that forwards to another service (an `external` hub) has its ticket issued by the service that owns the room, which supplies its own URL.
+
+### JavaScript
+
+```js
+// Your own authenticated route. `userId` comes from your session, never from the request body.
+app.post('/api/room-ticket', async (req, res) => {
+  const userId = req.session.userId;
+  const issued = await hub.ticket('hub-a', { userId, serverId: 'room-1' });
+  res.json({ ...issued, userId, room: 'room-1' });
+});
+```
+
+`HubClient.ticket(id, { userId, serverId, role = 'peer', credential, path = [] })` returns `{ ticket, url, expiresAt }`. `LiveClient` needs `ticket`, `url` and `userId`, so the route above adds `userId`.
+
+### Rust
+
+```rust
+let issued = hub.ticket(&[], "hub-a", "user-a", "room-1", "peer", None).await?;
+println!("{}", issued["url"]);
+```
+
+The signature is `ticket(path, hub_id, user_id, server_id, role, credential)`. An empty `path` uses `POST /v1/hubs/{id}/tickets`; a non-empty path uses the `ticket` route operation.
+
+### CLI
+
+```sh
+LIVEENGINE_TOKEN=... liveengine-hub ticket http://127.0.0.1:8787 hub-a user-a room-1 --role peer
+```
+
+`--path a/b` selects a central namespace and `--credential` (or `LIVEENGINE_CREDENTIAL`) supplies a user credential.
+
+## Connect from the browser
+
+The browser needs the client file. The package exports it as `@dixonsolutions/liveengine/live-client` (the file is `lib/live-client.mjs`). A bundler resolves the export; otherwise serve the file yourself as the [user hub example](/guides/user-hub) does.
+
+```js
+import { connectLive } from '/live-client.mjs';
+
+const client = await connectLive({
+  pairUrl: '/api/room-ticket',
+  body: {},
+});
+
+client.on('message', frame => console.log(frame.from, frame.channel, frame.payload));
+client.on('presence', event => console.log(event.event, event.peer));
+
+client.send({ text: 'hello' }, { channel: 'control' });          // broadcast
+client.send({ text: 'hi' }, { channel: 'control', to: 'user-b' }); // targeted
+client.send({ pos: [1, 2] }, { channel: 'feed' });
+```
+
+`connectLive` posts `body` to `pairUrl`, builds a `LiveClient` from the descriptor and connects. When the connection drops it posts the same body to `renewUrl` (default `pairUrl`) for a fresh single-use ticket, so the route must be safe to call repeatedly. A `4xx` answer other than `408` or `429` stops the retries. To use the lower-level class:
+
+```js
+import { LiveClient } from '/live-client.mjs';
+
+const client = new LiveClient(descriptor, { renew: async () => (await fetch('/api/room-ticket', { method: 'POST' })).json() });
+await client.connect();
+```
+
+Without `renew`, a reconnect fails with `The ticket was already used and no renew function was given to get a new one`.
+
+### `LiveClient` essentials
+
+| Member | Meaning |
+| --- | --- |
+| `new LiveClient(descriptor, options)` | `descriptor` needs `ticket`, `url` (`ws`, `wss`, `http` or `https`) and `userId`. |
+| `connect()` | Resolves after `welcome`. Retries up to `retries` (5) times with jittered backoff from `retryBaseMs` (250) to `retryMaxMs` (8000). |
+| `send(payload, { to, channel = 'default', type = 'message' })` | Returns `true` when sent or queued during a reconnect, `false` if dropped. Throws for a reserved type or a frame over `maxFrameBytes` (65536). |
+| `peers()`, `id`, `room`, `state` | Current peers, own id, room, and `idle`, `connecting`, `open`, `reconnecting` or `closed`. |
+| `close()` | Closes the socket; no reconnect follows. |
+
+Events: `open`, `welcome`, `message`, `presence`, `reconnecting`, `disconnected`, `close`, `error`, and, for direct links, `transport` and `direct-failed`. A `message` event carries the frame plus `via`: `relay` or `direct`. Frames sent while reconnecting are queued, up to `queueLimit` (64).
+
+### Node and other runtimes
+
+`LiveClient` is dependency-free ESM for browsers and Node 22 or newer. Pass `WebSocket` if the runtime has no global one.
+
+## Wire format
+
+You can speak the protocol without `LiveClient`. All frames are JSON text frames; binary frames close the connection.
+
+### Authenticate
+
+The first frame, sent within five seconds of the upgrade, has exactly two members. Any extra member closes the connection.
+
+```json
+{ "type": "auth", "ticket": "eyJ..." }
+```
+
+Never put the ticket in the URL.
+
+### Welcome
+
+```json
+{
+  "type": "welcome",
+  "peers": ["user-b"],
+  "iceServers": [{ "urls": "stun:stun.example.org" }]
+}
+```
+
+`peers` lists the other members, including peers known through [links](/guides/hub-links) and peers that disconnected within the resume window. `iceServers` is the configured array (empty by default). For hubs that set `auth` it also carries `identity` (`{ identity, claims }`) for you and `peerIdentities` keyed by peer id.
+
+### Presence
+
+```json
+{ "type": "presence", "event": "join", "peer": "user-b" }
+```
+
+`event` is `join`, `leave`, or `unreachable` (a peer known only through a link that dropped). A `join` carries `identity` for hubs that set `auth`. A peer that reconnects within `LIVEENGINE_LIVE_RESUME_MILLIS` (500) produces no `leave` and `join`.
+
+### Application frames
+
+```json
+{ "v": 1, "type": "message", "channel": "control", "to": "user-b", "seq": 0, "payload": { "text": "hi" } }
+```
+
+| Field | Rules |
+| --- | --- |
+| `v` | Required number. `LiveClient` sends `1`. |
+| `type` | Required string. Yours, except the reserved types below. |
+| `channel` | Required string. |
+| `to` | Optional string: a peer id for a targeted frame. Omit it to broadcast to everyone else in the room. |
+| `seq` | Required non-negative integer. The hub does not interpret it. |
+| `payload` | Required, any JSON value, including `null`. |
+| `from` | Set by the hub on delivery. If a sender includes `from` and it is not the sender's own id, the connection is closed. |
+
+A sender does not receive its own broadcast. A targeted frame to a peer that is not in the room is dropped silently.
+
+Reserved types: `presence`, `welcome`, `error`, `auth`, anything starting with `link.`, and anything starting with `signal.` except the three signalling types `signal.offer`, `signal.answer` and `signal.ice`, which are allowed as targeted frames. See [peer-to-peer](/guides/peer-to-peer). The server does not currently send `error` frames; it closes the connection.
+
+### Channels and delivery
+
+With no declared channels, any channel name is accepted and no schema applies. With declared channels:
+
+- A frame on an undeclared channel closes the sender.
+- `maxRate` is a per-peer, per-channel budget in messages per second. Exceeding it closes the sender.
+- A `schemaRef` payload that fails validation closes the sender.
+- `delivery: "reliable"` disconnects a recipient whose send queue is full. `lossy` drops the frame for that recipient instead.
+- A hub uses its own channels if it declares any, otherwise the channels of its nearest central ancestor.
+
+Channel names are 1 to 128 characters of `A-Z a-z 0-9 . _ -`. `maxRate` is at least 1. `schemaRef` must name an existing schema at registration time.
+
+## Limits and environment variables
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `LIVEENGINE_PUBLIC_URL` | unset | URL placed in tickets |
+| `LIVEENGINE_LIVE_ALLOWED_ORIGINS` | empty | Exact browser origins |
+| `LIVEENGINE_TICKET_TTL_SECONDS` | 60 | Ticket lifetime |
+| `LIVEENGINE_LIVE_MAX_FRAME_BYTES` | 65536 | Largest WebSocket message |
+| `LIVEENGINE_LIVE_MESSAGES_PER_SECOND` | 100 | Per connection; exceeding closes it |
+| `LIVEENGINE_LIVE_BYTES_PER_SECOND` | 1048576 | Per connection; exceeding closes it |
+| `LIVEENGINE_LIVE_SEND_QUEUE` | 64 | Outbound messages queued per connection |
+| `LIVEENGINE_LIVE_MAX_CONNECTIONS` | 4096 | Sockets across the service |
+| `LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM` | 256 | Authenticated sockets per room |
+| `LIVEENGINE_LIVE_PING_SECONDS` | 20 | Server ping interval |
+| `LIVEENGINE_LIVE_IDLE_SECONDS` | 60 | Close after this long with no inbound frame or pong |
+| `LIVEENGINE_LIVE_RESUME_MILLIS` | 500 | Presence hold after a disconnect |
+| `LIVEENGINE_SIGNAL_MAX_BYTES` | 16384 | Largest signalling frame |
+
+The `LIVEENGINE_LIVE_*` and `LIVEENGINE_SIGNAL_MAX_BYTES` values that are not positive integers fall back to the default silently, and every one is capped at 16777216. Other limits that matter here: a ticket may not exceed 16384 bytes; only one connection per user per room is accepted; the connection is closed if the user leaves the room or the hub is removed or replaced (checked every 250 ms).
+
+## Errors
+
+### Issuing a ticket
+
+| Status | Message | Cause |
+| --- | --- | --- |
+| `400` | `invalid ticket request` | Malformed body, unknown field, empty `userId` or `serverId`, or a role other than `peer` or `service` |
+| `400` | `invalid channel policy` | A channel's `schemaRef` no longer resolves |
+| `401` | `unauthorized` | Missing or wrong bearer token |
+| `403` | `user is not paired in room` | The engine does not show the user as a member of the room |
+| `403` | `credential refused` | Hub `auth` rejected the credential (every failure looks the same) |
+| `403` | `link credentials may only request service tickets` | A link credential asked for a `peer` ticket |
+| `404` | `hub not found` | Unknown or expired hub |
+| `413` | `identity claims exceed the live limit` | Verified claims are over 2048 bytes serialized |
+| `429` | `rate limit exceeded` | The caller's peer budget is spent. Your application server is one peer for every player it serves; size `LIVEENGINE_RATE_LIMIT_REQUESTS` for that. |
+| `503` | `public URL is not configured` | `LIVEENGINE_PUBLIC_URL` is unset |
+| `503` | `membership unavailable` | The hub handler was busy or unavailable while checking membership |
+| `503` | `hub handler is unavailable` | The hub is a central, or a custom hub whose handler is not attached |
+| `508` | `forwarding depth exceeded` | Too many hops to the owning service |
+
+### On the socket
+
+The server closes the connection without a message for: a missing, late, malformed or extra-field first frame; an invalid, expired, reused or wrong-role ticket; a user who is not paired; a second connection for the same user in the same room; a violation of the frame rules, channel rules, rate budget or schema; and a binary frame. Before the upgrade completes, a disallowed origin returns `403 origin not allowed` and a full service returns `503 live connection capacity reached`. `LiveClient` reports a closed socket as `The hub refused the ticket or closed the connection` while it is connecting, and as `disconnected` afterwards.
+
+## Security notes
+
+- Keep the administrator token on your server. A browser holds a ticket only. A ticket is bound to one hub path and room, expires in `LIVEENGINE_TICKET_TTL_SECONDS` and works once, so a leaked ticket is useful for seconds and for one connection.
+- Your route decides who may get a ticket. The hub checks that the user is paired in the room; it does not know who is on the other end of your HTTP route. Authenticate the player, take `userId` from the session, and decide the room yourself. To have the hub verify a credential too, set hub `auth`.
+- Origin checks protect browsers from cross-site use of a ticket page. They do not authenticate a non-browser client, which can omit `Origin`.
+- Treat payloads as untrusted input. The hub validates only what a channel `schemaRef` describes. Frames sent over a direct WebRTC channel never reach the hub, so its schemas and rate limits do not apply to them.
+- Serve `wss://`. The ticket is sent in the first frame, so a plain `ws://` URL exposes it to the network.
+
+## What is not supported
+
+- No persistence of rooms, presence or messages; no message history or replay.
+- No delivery acknowledgements or ordering guarantees across reconnects.
+- No per-frame authorization beyond channel declarations. There are no per-peer channel permissions.
+- No `error` frames from the server; protocol violations close the socket.
+- No multiple concurrent connections for one user in one room.
+- No binary frames.
+- The ticket cannot be sent in the URL or a header.

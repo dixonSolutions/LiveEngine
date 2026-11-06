@@ -69,7 +69,7 @@ See [Installation](/node/installation) for the platform matrix and source fallba
 LiveEngine is deliberately small and explicit about what it does not do:
 
 - **Live matchmaking state is in memory.** A state file can persist registry definitions, but users, rooms, memberships and events are lost on restart.
-- **Authentication is administrative.** The host verifies one bearer token. There is no per-player authentication, authorization policy, or tenant isolation. Keep tokens in server code and expose application-specific routes to clients.
+- **Authentication is administrative.** The host verifies one bearer token, and issues single-use tickets for live sockets. A hub can verify a credential your application relays ([custom auth](/guides/custom-auth)), but there are no player accounts, authorization policy or tenant isolation. Keep tokens in server code and expose application-specific routes to clients.
 - **Request timeouts do not roll back work.** An internal handler that already started continues on a blocking worker. Capacity stays occupied until it finishes. Reconcile state before retrying a mutation.
 - **Schemas use JSON Schema 2020-12.** References must be local JSON pointers and are bounded.
 - **Remote imports can refresh.** Set `refreshSeconds` to discover changes and mark missing entries stale.

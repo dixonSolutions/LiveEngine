@@ -185,7 +185,7 @@ The Rust API exposes the same measurement as `liveengine::hub::ping_hub`. The br
 | `POST /v1/hubs/{id}/call` | Exchange `{ method, args }` / `{ result }` |
 | `POST /v1/registries/import` | Discover and attach a remote registry |
 
-Send `Authorization: Bearer <token>` for data endpoints. `scopeSchema` supports object properties with primitive types and enums, required properties and `additionalProperties: false`; it is not a complete JSON Schema validator. Define application DTOs freely within the JSON protocol, and validate application-specific operations in your custom handler.
+Send `Authorization: Bearer <token>` for data endpoints. `scopeSchema` and `schemaRef` use JSON Schema draft 2020-12 with bounded size and complexity: only local JSON-pointer references are allowed, and remote references, schema IDs, anchors and cycles are refused. Define application DTOs freely within the JSON protocol, and validate application-specific operations in your custom handler.
 
 ## Embed in an existing Rust API
 
@@ -244,7 +244,7 @@ Hosts require a token of at least 24 bytes. Keep administrative tokens in server
 
 Defaults include a remote hostname allowlist, disabled HTTP redirects, outbound timeouts, bounded HTTP bodies/responses, bounded hub/entity/event counts and a peer request budget. Exact allowlist entries authorize the destination host, including private addresses when explicitly listed; only list hosts you control. Behind a shared reverse proxy, the socket peer budget is shared by its clients. TTL registrations expire in memory and can be re-registered after expiry.
 
-See [hosting configuration](docs/hosting.md) for environment settings and deployment details. Authentication is administrative for this initial protocol: there is no per-player authorization, tenant isolation policy or durable storage layer supplied by the host.
+See [hosting configuration](docs/hosting.md) for environment settings and deployment details. Authentication is administrative: one bearer token for the HTTP API, single-use tickets for live sockets, and an optional per-hub `auth` that verifies a credential your application relays. There are no player accounts, per-player authorization policy or tenant isolation policy, and live rooms and members are not durable; `LIVEENGINE_STATE_FILE` persists registry definitions only.
 
 ## Gogh Strike integration
 

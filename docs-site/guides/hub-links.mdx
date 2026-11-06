@@ -1,7 +1,198 @@
 ---
 title: "Hub links"
+description: "Connect two LiveEngine services with a persistent, ticket-authenticated link and bridge a room across them with merged presence."
 ---
 
-A remote administrator issues a link credential with `POST /v1/hubs/{id}/link-credentials`. Save the returned `token` securely: it is returned once and can request only service-role tickets on that hub. `DELETE` on the same route revokes all its link credentials.
+A hub link is a persistent outbound connection from one LiveEngine service to a room on another. With a local room attached, the link bridges the two rooms: peers on either side see each other in presence and receive each other's frames, as if they were in one room. This is the hub-to-hub transport.
 
-Create a link using `POST /v1/links` with `id`, remote `address`, `remoteToken` (the link credential), remote `hubId`, `userId` and `serverId`. The service user must be paired in the remote room. To bridge a local room, also set both `localHubId` and `localRoom`. Remote hosts must pass `LIVEENGINE_ALLOWED_REMOTE_HOSTS`; use HTTPS. Links reconnect, propagate presence and room frames, and enforce channel schemas at both ends. `GET /v1/links` and `GET /v1/links/{id}` report status without secrets; delete by ID or `DELETE /v1/links?id=...`. Definitions persist in the private state file. See [hosting](https://github.com/dixonSolutions/LiveEngine/blob/main/docs/hosting.md) for budgets and details.
+The link authenticates the same way a browser does, with a ticket. The remote administrator never hands out an administrator token: they issue a **link credential**, which can request only `service` tickets for one hub.
+
+## When to use this
+
+Use a link when two services, each with its own users, should share a room: regional services that join one event, or a partner service that joins yours. If you only need one service to route calls into another, use an [external or central hub](/guides/remote-hubs) instead. Links carry live frames; they do not forward engine calls.
+
+## The flow
+
+<Steps>
+  <Step title="Remote: prepare a room and a service user">
+    On the remote service create the hub, the room, and a user for the link, and join that user to the room. The ticket is only issued to a paired user.
+  </Step>
+  <Step title="Remote: issue a link credential">
+    `POST /v1/hubs/{id}/link-credentials` returns `{ "token": "..." }` once. Give it to the local administrator over a secure channel.
+  </Step>
+  <Step title="Local: create the link">
+    `POST /v1/links` with the remote address, the credential, the remote hub, user and room. Add `localHubId` and `localRoom` to bridge a local room.
+  </Step>
+  <Step title="The link connects and retries">
+    For every connection the local service requests a new service-role ticket over HTTP, opens the remote `/v1/live` socket and sends only that ticket in the first frame. It reconnects with backoff.
+  </Step>
+</Steps>
+
+## Prepare the remote service
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+
+const remote = new HubClient('https://b.example.net', { token: process.env.REMOTE_ADMIN_TOKEN });
+
+await remote.register({ id: 'hub-a', mode: 'internal', ifAbsent: true });
+await remote.call('hub-a', 'upsertServer', [{ id: 'room-1', capacity: 64 }]);
+await remote.call('hub-a', 'upsertUser', [{ id: 'link-to-a' }]);
+await remote.call('hub-a', 'join', ['link-to-a', 'room-1']);
+
+// Returned once. Only a SHA-256 digest is kept on the remote.
+const { token: linkToken } = await remote.request('/v1/hubs/hub-a/link-credentials', { method: 'POST' });
+```
+
+The remote must have `LIVEENGINE_PUBLIC_URL` set. The link does not use the URL in the ticket response: it connects to `<address>/v1/live`. But the remote refuses to issue a ticket without a public URL.
+
+A link credential is 64 hex characters. A hub can hold 16 of them (`409 link credential limit reached`). `DELETE /v1/hubs/{id}/link-credentials` revokes every credential of the hub (`204`). Revoking stops new connections; it does not close one that is already open.
+
+The credential is accepted for exactly one request: `POST /v1/hubs/{id}/tickets` on its own hub, and only with `role: "service"`. A request for role `peer` is `403 link credentials may only request service tickets`. Every other route needs the administrator token.
+
+## Create the link
+
+```js
+const local = new HubClient('https://a.example.net', { token: process.env.LOCAL_ADMIN_TOKEN });
+
+await local.request('/v1/links', {
+  method: 'POST',
+  body: {
+    id: 'to-b',
+    address: 'https://b.example.net',
+    remoteToken: linkToken,
+    hubId: 'hub-a',
+    userId: 'link-to-a',
+    serverId: 'room-1',
+    localHubId: 'hub-a',
+    localRoom: 'room-1',
+  },
+});
+
+console.log(await local.request('/v1/links'));
+```
+
+The local service must list `b.example.net` in `LIVEENGINE_ALLOWED_REMOTE_HOSTS`. Use HTTPS.
+
+| Field | Rules |
+| --- | --- |
+| `id` | 1 to 128 characters of `A-Z a-z 0-9 . _ -`, not `.` or `..` |
+| `address` | Base URL of the remote service. Same rules as a remote hub address: absolute `http` or `https`, no credentials, query or fragment, host on the allowlist |
+| `remoteToken` | The link credential, 24 to 4096 bytes. Not the remote administrator token |
+| `hubId` | The remote hub, same character rules as `id` |
+| `userId`, `serverId` | The remote user and room, 1 to 256 characters. The user must be paired in the room |
+| `localHubId`, `localRoom` | Both or neither. `localHubId` follows the `id` rules, `localRoom` is 1 to 256 characters |
+
+### Rust
+
+```rust
+use liveengine::hub::HubClient;
+use reqwest::Method;
+use serde_json::json;
+
+let remote = HubClient::new("https://b.example.net", remote_token)?;
+let credential = remote.request(Method::POST, "/v1/hubs/hub-a/link-credentials", None).await?;
+let link_token = credential["token"].as_str().unwrap();
+
+let local = HubClient::new("https://a.example.net", local_token)?;
+local.request(Method::POST, "/v1/links", Some(json!({
+    "id": "to-b", "address": "https://b.example.net", "remoteToken": link_token,
+    "hubId": "hub-a", "userId": "link-to-a", "serverId": "room-1",
+    "localHubId": "hub-a", "localRoom": "room-1"
+}))).await?;
+```
+
+### Inspect and remove
+
+| Route | Result |
+| --- | --- |
+| `GET /v1/links` | `{ "links": [...], "frames": { "dropped": 0, "rejected": 0 } }` |
+| `GET /v1/links/{id}` | One link, or `404 link not found` |
+| `DELETE /v1/links/{id}` or `DELETE /v1/links?id=to-b` | `204`, or `404` |
+
+A link entry shows `id`, `hubId`, `userId`, `serverId`, `status` and, when bridging, `localHubId` and `localRoom`. It never shows the address or the credential. `status` is `connecting` until the first connection, `connected` while the socket is up, and `unreachable` after a failure. `frames.dropped` counts linked frames dropped as loops, duplicates or over budget; `frames.rejected` counts frames refused for wire, channel or schema rules, on every link of the service.
+
+Creating a link does not contact the remote. A wrong credential, a missing user or an unreachable host shows up as `unreachable`, with no further detail. Check the remote's log and its ticket route.
+
+## What a bridged link does
+
+- Frames from peers on either side reach the other side. A targeted frame, including `signal.*`, goes to the named peer.
+- Presence is merged. A linked peer appears as a `presence` join and in the `welcome` peer list; when the link drops, peers known through it get a `presence` event `unreachable`, local peers keep working, and presence is announced again on reconnect.
+- Each side enforces its own channel and schema rules, so a frame that one side accepts can be refused by the other. A ring of links delivers each frame once.
+- The link's own service user is not announced as a peer and receives no room frames.
+- Verified identities are not carried across links.
+- Definitions, including the credential, persist in the private state file (`LIVEENGINE_STATE_FILE`). Status is rebuilt on startup.
+
+A link without `localHubId` and `localRoom` is a plain connection: it authenticates and stays connected, but carries no room frames.
+
+The hub addressed by `hubId` is a hub at the remote service root (the ticket route is `POST /v1/hubs/{hubId}/tickets`), and `localHubId` is a hub at the local root. Hubs inside a central namespace are not link endpoints.
+
+## Wire format
+
+Linked traffic uses two frame types on the link socket. Both are reserved: only a `service` socket may send them, and a `peer` socket that sends one is closed.
+
+```json
+{ "type": "link.presence", "trace": ["a-instance-id"], "event": "join", "peer": "user-a" }
+```
+
+```json
+{ "type": "link.frame", "id": "a-instance-id-17", "trace": ["a-instance-id"],
+  "frame": { "v": 1, "type": "message", "channel": "control", "from": "user-a", "seq": 3, "payload": {} } }
+```
+
+| Member | Rules |
+| --- | --- |
+| `link.presence` `event` | `join`, `leave` or `unreachable`. A `join` with no `peer` announces the link and asks the other side for its current presence |
+| `peer` | Non-empty string, at most 256 bytes |
+| `trace` | Instance ids that have handled the frame, at most 32, each 1 to 64 characters of `A-Z a-z 0-9 . _ -`. A frame whose trace holds the receiving service's instance id is dropped |
+| `id` | On `link.frame`: unique per frame, 1 to 128 printable ASCII characters, stamped by the service the frame entered. Forwarders keep it and drop repeats seen in the last 10 seconds (at most 4096 remembered) |
+| `frame` | An ordinary room envelope with `from`. `from` must be a peer announced on this link. Reserved types are refused, and `signal.*` needs a `to` different from `from` |
+
+A link frame over 65536 bytes is rejected. At most 1024 remote peers are tracked per room.
+
+## Limits and environment variables
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `LIVEENGINE_ALLOWED_REMOTE_HOSTS` | empty | Hosts a link may connect to |
+| `LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND` | 2000 | Per link socket. Over it, lossy frames are dropped and the link stays up |
+| `LIVEENGINE_LINK_MAX_BYTES_PER_SECOND` | 16777216 | Per link socket. Over it, the link is closed and reconnects |
+| `LIVEENGINE_MAX_HUBS` | 256 | Also the maximum number of links (`503 link capacity reached`) |
+| `LIVEENGINE_INSTANCE_ID` | generated, persisted | The id used in `trace`. Give each service a unique stable one |
+| `LIVEENGINE_TICKET_TTL_SECONDS` | 60 | Lifetime of each service ticket |
+
+Reconnects wait 250 ms, doubling up to 10 seconds, and the wait resets after a successful connection. A link closes if the remote sends nothing for 60 seconds (the remote pings every 20 seconds). Each connection requests a new ticket.
+
+## Errors
+
+| Status | Message | Cause |
+| --- | --- | --- |
+| `400` | `invalid link definition` | Any invalid field: bad id, address not allowlisted or not a plain HTTP(S) URL, `remoteToken` outside 24 to 4096 bytes, or only one of `localHubId` and `localRoom` |
+| `409` | `link already exists` | Duplicate `id` |
+| `503` | `link capacity reached` | `LIVEENGINE_MAX_HUBS` links exist |
+| `404` | `link not found` | Unknown link on `GET` or `DELETE` |
+| `404` | `hub not found` | Credential route on an unknown hub |
+| `409` | `link credential limit reached` | The hub already has 16 |
+| `403` | `link credentials may only request service tickets` | A link credential asked for a `peer` ticket |
+| `403` | `user is not paired in room` | The link's remote user is not a member of the remote room |
+| `401` | `unauthorized` | A wrong or revoked link credential, or a link credential used on another route |
+
+The last three are what the remote answers to the link's ticket request; the link itself reports only `unreachable`.
+
+## Security notes
+
+- A link credential is deliberately weak: it requests service-role tickets for one hub and nothing else. Prefer it over an administrator token for every link. Revoke it with `DELETE` when the link is retired.
+- Use HTTPS for the remote address; the credential and ticket travel in clear over HTTP.
+- The state file holds link credentials in plaintext. It is created mode 0600 and refused at startup if group or world accessible. Protect its backups.
+- The remote can announce any peer id that is not already a local connection, and its peers are trusted only as far as your channel schemas check their payloads. Declare channels and schemas on the local hub for bridged rooms.
+- Keep `LIVEENGINE_ALLOWED_REMOTE_HOSTS` to hosts you control. Listing a private address authorizes connecting to it.
+- A service user holds a room seat. Give it its own id (such as `link-to-a`) so it cannot be confused with a real user.
+
+## What is not supported
+
+- No forwarding of engine calls or matchmaking over a link: use external and central hubs.
+- No bridging of hubs inside a central namespace.
+- No identities across links, and no `auth` check by the receiving side beyond the service ticket.
+- No history or replay; frames sent while a link is down are lost for the other side.
+- No per-link channel mapping: both rooms use the same channel names, each under its own rules.
+- No automatic creation of the remote user, room or membership.

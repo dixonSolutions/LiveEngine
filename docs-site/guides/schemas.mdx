@@ -1,17 +1,179 @@
 ---
 title: "Hub schemas"
-description: "Publish versioned JSON Schemas and bind them to hub scopes."
+description: "Publish immutable JSON Schema definitions, bind them to hub scopes, user and server upserts and live channel payloads, and understand inheritance and limits."
 ---
 
-Publish an immutable schema version, then bind a hub to it:
+Core does not know what your users, rooms or messages contain. **Schemas** are how you tell it. You publish JSON Schema 2020-12 definitions, give them a name and a version, and bind them to a hub. The hub then validates the data you send it, before the engine or the relay sees it.
+
+Schemas are your DTOs. All field names, types and meanings in the examples here are placeholders.
+
+## When to use this
+
+Use schemas when more than one service or developer writes to a hub, when scopes decide who may match, or when frames on a live channel must have a known shape. A hub with no schema accepts any JSON object as scopes and any payload on any channel.
+
+## What a schema can validate
+
+| Binding | Validates | Failure |
+| --- | --- | --- |
+| `scopeSchema` or `schemaRef` on a hub | The hub's own `scopes` at registration, and, unless overridden, the `scopes` of every user and server upsert | `400 scopes do not match schema` |
+| `userSchema` | `scopes` of `upsertUser`, `upsertUsers` and the users of `pairPeers` | `400 scopes do not match schema` |
+| `serverSchema` | `scopes` of `upsertServer` and `upsertServers` | `400 scopes do not match schema` |
+| `schemaRef` on a channel | The `payload` of relayed live frames on that channel | The sender's connection is closed |
+
+Only those calls are validated. A call to any other method is not inspected, and a missing `scopes` member is treated as `{}`. `scopeSchema` and `schemaRef` are mutually exclusive (`400 scopeSchema and schemaRef are mutually exclusive`).
+
+## Publish and bind
+
+### JavaScript
 
 ```js
-await hub.createSchema({ id: 'game', version: '1', schema: {
-  type: 'object', required: ['region'], properties: { region: { enum: ['au', 'nz'] } }
-} });
-await hub.register({ id: 'match', mode: 'internal', schemaRef: 'game@1', scopes: { region: 'au' } });
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+const hub = new HubClient(process.env.HUB_URL, { token: process.env.LIVEENGINE_TOKEN });
+
+await hub.createSchema({
+  id: 'profile',
+  version: '1',
+  schema: {
+    type: 'object',
+    required: ['zone'],
+    properties: {
+      zone: { enum: ['a', 'b', 'c'] },
+      level: { type: 'integer', minimum: 0 },
+    },
+    additionalProperties: false,
+  },
+});
+
+await hub.register({ id: 'hub-a', mode: 'internal', schemaRef: 'profile@1', scopes: { zone: 'a' } });
+
+await hub.call('hub-a', 'upsertUser', [{ id: 'user-a', scopes: { zone: 'b', level: 3 } }]); // accepted
+await hub.call('hub-a', 'upsertUser', [{ id: 'user-b', scopes: { zone: 'z' } }]);            // 400: scopes do not match schema
 ```
 
-`listSchemas`, `getSchema('game@1')` and `removeSchema('game@1')` manage definitions. Deleting an in-use schema returns 409; `liveengine.default@1` is built in. Instead of `schemaRef`, use an inline `scopeSchema`. `userSchema` and `serverSchema` override validation for their respective upserts. Children inherit the nearest central schema unless overridden. Schema-bound hubs reject `generateUsers`; generate locally and upsert validated users.
+`createSchema`, `listSchemas`, `getSchema('profile@1')` and `removeSchema('profile@1')` manage definitions. A schema is referenced by `id@version`. Versions are immutable: publish a change as a new `version`. The built-in `liveengine.default@1` (`{ "type": "object" }`) cannot be deleted.
 
-Schemas follow JSON Schema draft 2020-12. Only local JSON pointer references are allowed; remote references, schema IDs, anchors and cycles are refused. Schema size and complexity are bounded. Imports transfer definitions and reject conflicting versions. Export omits credentials. A configured state file persists schema definitions.
+Instead of `schemaRef` you can give the hub an inline `scopeSchema` (an object, or a boolean schema). Use `userSchema` and `serverSchema` to override the shared schema for users or servers:
+
+```js
+await hub.register({
+  id: 'hub-b',
+  mode: 'internal',
+  scopeSchema: { type: 'object', required: ['zone'] },
+  userSchema: { type: 'object', required: ['zone', 'level'] },
+  scopes: { zone: 'a' },
+});
+```
+
+### Rust
+
+```rust
+use liveengine::hub::HubClient;
+use reqwest::Method;
+use serde_json::json;
+
+let hub = HubClient::new("http://127.0.0.1:8787", token)?;
+hub.request(Method::POST, "/v1/schemas", Some(json!({
+    "id": "profile", "version": "1",
+    "schema": { "type": "object", "required": ["zone"], "properties": { "zone": { "enum": ["a", "b", "c"] } } }
+}))).await?;
+hub.request(Method::POST, "/v1/hubs", Some(json!({
+    "id": "hub-a", "mode": "internal", "schemaRef": "profile@1", "scopes": { "zone": "a" }
+}))).await?;
+```
+
+## Schema registry routes
+
+| Method | Route | Result |
+| --- | --- | --- |
+| `POST` | `/v1/schemas` | `201` with `{ "id", "version", "ref", "schema" }` |
+| `GET` | `/v1/schemas` | `{ "schemas": [{ "ref", "schema" }] }`, sorted by `ref` |
+| `GET` | `/v1/schemas/{id@version}` | `{ "ref", "schema" }` |
+| `DELETE` | `/v1/schemas/{id@version}` | `204` |
+
+`id` and `version` are 1 to 128 characters of `A-Z a-z 0-9 . _ -` each. The registry holds at most `LIVEENGINE_MAX_HUBS` schemas. Schemas are service-wide, not per namespace, and they need the administrator token. A hub-scoped provider credential can reference existing schemas but not publish them.
+
+## Inheritance
+
+Every hub works with three effective schemas, resolved when a call or registration arrives:
+
+1. **Base** (hub `scopes`): the hub's own `schemaRef` or `scopeSchema`; otherwise the base of the nearest central above it.
+2. **User**: the hub's `userSchema`; otherwise its own `schemaRef` or `scopeSchema`; otherwise the user schema inherited from the nearest central; otherwise the base.
+3. **Server**: the same, with `serverSchema`.
+
+A central's resolved schemas become the defaults for everything under it, including a remote central: routing carries them to the destination. A child overrides any of them by setting its own. See [nested hubs](/guides/nesting).
+
+`generateUsers` is rejected (`400 generateUsers requires an unbound hub`) on any hub with an effective schema, because generated users are not validated. Generate locally and upsert the validated users instead.
+
+## Channel payload schemas
+
+Channels declared on a hub can name a schema for their payloads, and the hub validates every relayed frame on them. Direct WebRTC frames are not validated by the hub.
+
+```js
+await hub.register({
+  id: 'hub-c',
+  mode: 'internal',
+  channels: { control: { schemaRef: 'notice@1', delivery: 'reliable', maxRate: 20 } },
+});
+```
+
+The schema must exist when the hub is registered (`400 channel schema not found`) and cannot be deleted while a channel or hub uses it (`409 schema is in use`, which also covers hubs in nested namespaces). Details of channels are in [live rooms](/guides/live-rooms).
+
+## What schemas may contain
+
+Schemas use JSON Schema draft 2020-12. The host refuses anything it cannot bound:
+
+| Rule | Limit |
+| --- | --- |
+| Serialized size | 64 KiB |
+| Nesting depth | 32 levels |
+| JSON nodes | 2048 |
+| `pattern` length | 512 characters |
+| References | `$ref`, `$dynamicRef` and `$recursiveRef` must be local JSON pointers: `#` or `#/...`. Remote references, anchor references (`#name`) and unresolvable pointers are refused |
+| `$id` | Refused anywhere |
+| Cycles and expansion | A reference cycle, or more than 8192 reference expansions, is refused |
+
+```json
+{ "type": "object", "properties": { "pos": { "$ref": "#/$defs/vec" } },
+  "$defs": { "vec": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 } } }
+```
+
+Large or complex validation belongs in your application, not in a schema.
+
+## Persistence, export and import
+
+- With `LIVEENGINE_STATE_FILE` set, schema definitions persist with the registry. Without it they are in memory and `liveengine.default@1` is the only one after a restart.
+- `GET /v1/registry/export` returns `{ "protocol", "hubs", "schemas" }`, schema definitions included, without credentials.
+- A registry import transfers definitions and rejects a conflicting version of the same `ref`. See [import a registry](/guides/import-registry).
+- Hub definitions show their `schemaRef`, `scopeSchema`, `userSchema` and `serverSchema` to anyone who can read them. Schemas are not secret; do not put secrets in them.
+
+## Errors
+
+| Status | Message | Cause |
+| --- | --- | --- |
+| `400` | `invalid schema registration` | Malformed body or unknown field |
+| `400` | `invalid schema id or version` | Empty, too long, or characters outside `A-Z a-z 0-9 . _ -` |
+| `400` | `schema exceeds size or depth limit`, `schema contains forbidden references or exceeds complexity limits`, `schema references are cyclic, unsupported, or too complex`, `invalid JSON schema` | The schema breaks a rule above |
+| `409` | `schema already exists` | That `id@version` was published |
+| `507` | `schema registry is full` | `LIVEENGINE_MAX_HUBS` schemas exist |
+| `404` | `schema not found` | Unknown `ref` on `GET` or `DELETE` |
+| `409` | `schema is in use`, `built-in schema cannot be deleted` | Delete refused |
+| `400` | `schema not found` | A hub's `schemaRef` names no schema |
+| `400` | `invalid schemaRef` | `schemaRef` is not a string |
+| `400` | `scopes do not match schema` | Registration scopes or an upsert fail validation |
+| `400` | `generateUsers requires an unbound hub` | `generateUsers` on a hub with a schema |
+
+## Security notes
+
+- A schema is a validation aid and an interface contract. It is not an authorization policy: it checks shape, not who may send the data.
+- Validation runs on the hub, before the engine. Keep validating payloads you receive over direct WebRTC channels in the receiving application.
+- Bounded complexity (size, depth, references, pattern length) protects the host from expensive schemas. Do not rely on a schema to protect your own code from large inputs: set `LIVEENGINE_MAX_BODY_BYTES` and `maxLength` or `maxItems` in the schema.
+- Do not embed secrets or personal data in schemas or in `scopes` that you validate: both are visible in hub listings.
+
+## What is not supported
+
+- No remote references, schema IDs, anchors or cycles.
+- No changing or replacing a published version.
+- No per-namespace schema registries; the registry is service-wide.
+- No validation of methods other than the upserts and `pairPeers`.
+- No validation of frames sent over a direct WebRTC channel.
+- No schema migration or compatibility checks between versions.

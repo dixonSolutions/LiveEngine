@@ -137,7 +137,7 @@ A handler timed out but is still running and holding its permit/lock. Wait for i
 
 ### State disappeared after restart
 
-Expected. Registry, TTL, users, servers, memberships, and events are in memory. Re-register hubs and rebuild application state from your own persistence.
+Expected for users, servers, memberships, events and live rooms: they are in memory. Registry definitions survive a restart only when `LIVEENGINE_STATE_FILE` is set; otherwise re-register hubs too. Rebuild application state from your own persistence.
 
 ### `LIVEENGINE_BIND` fails to parse
 
@@ -227,7 +227,7 @@ The repository does not include a docs deployment workflow. Connect `docs-site/`
 
 **Can I use only the HTTP client?** Yes. Import `@dixonsolutions/liveengine/hubs`.
 
-**Does the host authenticate players?** No. It authenticates one administrative bearer token. Add player auth in your application or bridge.
+**Does the host authenticate players?** It authenticates one administrative bearer token and issues single-use tickets for live sockets. A hub can verify a credential that your application relays and resolve it to an identity ([custom auth](/guides/custom-auth)), but sign-in and authorization policy belong in your application or bridge.
 
 **Can a remote hub be another vendor's service?** Yes, if it implements `liveengine.hub/v1`, including health, contract, hub presence, call, and error behavior.
 

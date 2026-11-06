@@ -39,9 +39,9 @@ Clients should verify `protocol` before using the service. LiveEngine's `HubClie
 ## Authentication
 
 - `GET /health` and `GET /v1/ping` are unauthenticated.
-- Every other endpoint requires `Authorization: Bearer <token>`.
+- Every other HTTP endpoint requires `Authorization: Bearer <token>`. The WebSocket endpoints `/v1/live` and `/v1/live/registry` authenticate in their first frame instead.
 - The token is the host's `LIVEENGINE_TOKEN` and must be at least 24 bytes at startup.
-- Authentication is administrative, not per-player.
+- Authentication is administrative, not per-player. Browsers connect to the live sockets with single-use tickets that your server obtains, and a hub's `auth` can verify a user credential before a ticket is issued. Two narrower bearer credentials exist, each for one route: a hub link credential and a hub-scoped provider credential.
 - Requests without a valid token return `401` with `{"error":"unauthorized"}`.
 
 Requests other than `/health` and `/v1/ping` are rate-limited by socket peer **before** checking the token. An unauthenticated request to those routes still consumes a rate slot.

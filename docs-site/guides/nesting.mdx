@@ -1,20 +1,148 @@
 ---
 title: "Nested hubs"
-description: "Create central namespaces and route operations through them."
+description: "Create central namespaces, route operations through a path of hubs, forward to other services, and understand depth, loops, inheritance and quotas."
 ---
 
-A `central` hub holds children locally, or forwards to another LiveEngine service when `address` and `remoteToken` are set. Every remote hostname must be in the originating service's `LIVEENGINE_ALLOWED_REMOTE_HOSTS`; use a separate credential per service.
+A **central** hub is a namespace that holds other hubs. It is either local (it holds its children inside this service) or remote (it forwards to another LiveEngine service). A path of central ids, such as `["eu", "games"]`, selects a namespace, and `POST /v1/route` runs an operation inside it. With nesting you organise hubs into a tree, delegate part of the tree to another service, and give each branch its own schemas, channels and quotas.
+
+## When to use this
+
+Use nesting to group hubs by region, product or tenant, to spread hubs over several services behind one entry point, or to hand a branch to a customer ([provider hosting](/guides/provider-hosting)). A flat registry of internal hubs needs none of it.
+
+Core is plumbing: a central has no behaviour of its own besides holding, routing, inheriting and counting.
+
+## Create a nest
+
+A local central is registered like any hub:
 
 ```js
 const { HubClient } = require('@dixonsolutions/liveengine/hubs');
 const hub = new HubClient(process.env.HUB_URL, { token: process.env.LIVEENGINE_TOKEN });
+
 await hub.register({ id: 'eu', mode: 'central', maxHubs: 32 });
 await hub.route(['eu'], 'register', { id: 'games', mode: 'central' });
-await hub.route(['eu', 'games'], 'register', { id: 'chess', mode: 'internal', ifAbsent: true });
-await hub.route(['eu', 'games'], 'call', { id: 'chess', method: 'stats', args: [] });
+await hub.route(['eu', 'games'], 'register', { id: 'hub-a', mode: 'internal', ifAbsent: true });
+await hub.route(['eu', 'games'], 'call', { id: 'hub-a', method: 'stats', args: [] });
 console.log(await hub.tree(3));
 ```
 
-`route` supports `list`, `get`, `register`, `delete`, `call`, `tree`, `ticket`, `watchTicket`, `authorize`, `discover`, and `pair`; an empty path selects the current service. `get`, `delete`, and `call` identify the target in `body.id`. Tree branches report `ok` or `error` independently. Discovery and forwarding are bounded. `LIVEENGINE_MAX_DEPTH` defaults to 8, maximum 16. Forwarding uses a trace of service instance IDs to detect loops; repeated IDs return 508. Set `LIVEENGINE_INSTANCE_ID` to a unique stable value per service or use the persisted generated identity.
+A central that forwards to another service has an `address` and a `remoteToken` and no `remoteHubId`:
 
-Flat routes still address immediate children. Templates, schema inheritance, `ifAbsent`, TTL expiry and central `maxHubs` quotas also apply to nested registration. See [schemas](/guides/schemas) and [remote hubs](/guides/remote-hubs).
+```js
+await hub.register({
+  id: 'asia',
+  mode: 'central',
+  address: 'https://b.example.net',
+  remoteToken: process.env.ASIA_HUB_TOKEN, // the remote service's token, at least 24 bytes
+});
+```
+
+Registration checks the remote first: `GET /health` and `GET /v1/contract` must answer with the protocol `liveengine.hub/v1`. The host must be in `LIVEENGINE_ALLOWED_REMOTE_HOSTS`. Use a different credential for every service, and never reuse the local token. A failed handshake is `502`; an invalid or disallowed address is `400`. After that, operations whose path goes through `asia` are forwarded to the remote with the remaining path.
+
+### Rust
+
+```rust
+use liveengine::hub::HubClient;
+use reqwest::Method;
+use serde_json::json;
+
+let hub = HubClient::new("http://127.0.0.1:8787", token)?;
+hub.request(Method::POST, "/v1/hubs", Some(json!({ "id": "eu", "mode": "central", "maxHubs": 32 }))).await?;
+hub.route(&["eu".to_string()], "register", json!({ "id": "games", "mode": "central" })).await?;
+hub.route(&["eu".to_string(), "games".to_string()], "register",
+    json!({ "id": "hub-a", "mode": "internal", "ifAbsent": true })).await?;
+let tree = hub.tree(3).await?;
+```
+
+## Route operations
+
+`POST /v1/route` takes `{ "path": [...], "op": "...", "body": {...} }`. An empty `path` selects the service root. Each path element must be a central.
+
+| `op` | `body` | Answers |
+| --- | --- | --- |
+| `register` | A hub definition, including `template`, `ifAbsent`, `channels`, `auth`, `hosting`, `maxHubs`, `liveDepth` | `201` with the hub (or `200` and the existing hub with `ifAbsent`) |
+| `list` | none | `{ "hubs": [...] }` of the namespace |
+| `get`, `delete` | `{ "id": "hub-a" }` | The hub, or `204` |
+| `call` | `{ "id": "hub-a", "method": "...", "args": [...] }` | `{ "result": ... }` |
+| `tree` | `{ "depth": 2, "maxNodes": 100 }` (both optional) | `{ "status": "ok", "hubs": [...] }` |
+| `ticket` | `{ "id": "hub-a", "userId": "...", "serverId": "...", "role"?, "credential"? }` | `{ ticket, url, expiresAt }`, see [live rooms](/guides/live-rooms) |
+| `watchTicket` | `{ "path": [], "depth": 2 }`, relative to the namespace | `{ ticket, expiresAt }`, see [live registry](/guides/live-registry) |
+| `authorize` | As `ticket` | `{ "ok": true }`, or with a `receipt` for a hub with `auth`, see [custom auth](/guides/custom-auth) |
+| `discover`, `pair` | The bodies of [find and pair](/guides/find-and-pair), without `path` | Candidates, or a descriptor |
+
+Any other `op` is `400 invalid route operation`. The same operations are available as `hub.route(path, op, body)`. Flat routes (`/v1/hubs`, `/v1/hubs/{id}/call`) still address the immediate children of the service root. `HubClient.ticket`, `discover` and `pair` take a `path` option for the namespace.
+
+## The tree
+
+`GET /v1/tree?depth=3` (or `HubClient.tree(3)`, or the `tree` operation inside a namespace) lists branches recursively:
+
+```json
+{ "status": "ok", "hubs": [
+  { "hub": { "id": "eu", "mode": "central", "remoteHubId": "eu", "scopes": {} }, "status": "ok", "hubs": [
+    { "hub": { "id": "games", "mode": "central", "remoteHubId": "games", "scopes": {} }, "status": "ok" }
+  ] },
+  { "hub": { "id": "asia", "mode": "central", "address": "https://b.example.net", "remoteHubId": "asia", "scopes": {} }, "status": "error" }
+] }
+```
+
+A branch is `ok` or `error` on its own: an unreachable remote does not fail the listing. A depth above `LIVEENGINE_MAX_DEPTH`, or one that would exceed it together with the levels already traversed, is `400 tree depth exceeded`. The listing is bounded to the smaller of `LIVEENGINE_MAX_HUBS` and 1024 nodes, and to half the request timeout in total for remote branches. A response above `LIVEENGINE_MAX_RESPONSE_BYTES` is `413`. For a stream of changes instead of a one-off listing, use the [live registry](/guides/live-registry).
+
+## Forwarding, depth and loops
+
+When a path crosses a remote central, the service forwards the rest of the request to it with `Authorization: Bearer <remoteToken>`, an `x-liveengine-trace` header that lists the service instance ids visited so far, and an `x-liveengine-depth` header.
+
+- Every path segment adds one to the depth. Beyond `LIVEENGINE_MAX_DEPTH` (8 by default, 16 at most) the answer is `508 route depth exceeded`.
+- A request whose trace already contains the receiving service's own instance id is `508`. Repeated ids in the trace are `508`; an invalid header is `400`.
+- Give every service a unique, stable `LIVEENGINE_INSTANCE_ID` (1 to 64 characters of `A-Z a-z 0-9 . _ -`). If you do not, the standalone host generates one and persists it: next to `LIVEENGINE_STATE_FILE` as `<file>.instance-id` when there is a state file, at `LIVEENGINE_INSTANCE_ID_FILE` if set, or under the XDG state directory, keyed by the bind address. Embedded services set `HubConfig.instance_id`.
+- A forwarded failure keeps the remote's HTTP status but its message becomes `remote route failed`. If the remote cannot be reached, the answer is `502`.
+
+## What a branch inherits
+
+- **Schemas.** A hub without its own schema uses the nearest central's `scopeSchema` or `schemaRef`; `userSchema` and `serverSchema` fall back to it too. Remote routing carries inherited schemas to the destination. See [schemas](/guides/schemas).
+- **Channels.** A central's `channels` apply to the hubs below it that declare none, including through remote centrals when a ticket is issued. A hub's own channels override.
+- **Templates.** Templates are service-wide. `register` with `template` creates a child from one, inside any local namespace.
+- **Quotas.** `maxHubs` on a local central limits its immediate children, including on-demand ones (`507 hub registry is full`). `LIVEENGINE_MAX_HUBS` is the service-wide budget and counts every central and descendant (`507 global hub budget is full`).
+- **TTL.** `ttlSeconds` on a central expires the central and everything under it.
+- **Live depth.** A central's `liveDepth` (1 up to `LIVEENGINE_MAX_DEPTH`) sets how deep the live registry reaches below it.
+- **Tickets.** A ticket is bound to the full path of its hub and to the room, so one room name can exist in several branches.
+
+## Limits
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `LIVEENGINE_MAX_DEPTH` | 8 | Hard maximum 16 |
+| `LIVEENGINE_MAX_HUBS` | 256 | Service-wide, all branches |
+| `maxHubs` | none | Per local central, immediate children |
+| Tree and discovery nodes | smaller of `LIVEENGINE_MAX_HUBS` and 1024 | |
+| `LIVEENGINE_INSTANCE_ID` | generated | Unique per service |
+| `LIVEENGINE_ALLOWED_REMOTE_HOSTS` | empty | Required for any remote central |
+
+## Errors
+
+| Status | Message | Cause |
+| --- | --- | --- |
+| `400` | `invalid route request`, `invalid route operation`, `missing hub id`, `invalid call` | Malformed route body |
+| `400` | `local central cannot set remote credentials or id`, `remote central requires remoteToken and no remoteHubId` | Wrong combination of central fields |
+| `400` | `invalid maxHubs`, `invalid liveDepth` | `maxHubs` or `liveDepth` on a non-central, or out of range |
+| `400` | `tree depth exceeded` | Too deep |
+| `404` | `central hub not found` | A path segment is missing or is not a central |
+| `409` | `hub id already registered` | Duplicate id in the namespace |
+| `502` | `remote health protocol mismatch`, `remote contract protocol mismatch`, `remote request failed`, `invalid remote response`, `central address missing` | Remote or handshake problems |
+| `503` | `hub call capacity is busy` | Forwarding could not get a worker slot within `LIVEENGINE_CALL_QUEUE_MS` |
+| `507` | `hub registry is full`, `global hub budget is full` | A quota is used up |
+| `508` | `route depth exceeded`, `forwarding depth exceeded`, `invalid or repeated forwarding trace` | Depth or loop |
+
+## Security notes
+
+- Each hop uses its own credential. A remote token lets this service act as an administrator of the remote, so give it only to services you trust, and keep it out of logs. It is never returned by any list or get.
+- The remote host allowlist is the boundary for outbound connections. Only list hosts you control.
+- A path is matched exactly against hub ids. A request cannot escape a namespace with `.` or `..`, because those ids are refused.
+- A central with `hosting: "provider"` gives its holder a credential limited to its own subtree: [provider hosting](/guides/provider-hosting).
+
+## What is not supported
+
+- No cross-service transactions: a failed forward does not undo earlier steps.
+- No moving a hub between namespaces; delete and register it again.
+- No automatic discovery of services. A remote central is registered explicitly, or imported (see [import a registry](/guides/import-registry)).
+- No replication or leader election between services.
+- No live-room bridging between services by nesting; use [hub links](/guides/hub-links).

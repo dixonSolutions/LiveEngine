@@ -1271,7 +1271,20 @@ async fn a_busy_room_over_one_hundred_frames_a_second_keeps_the_link_up() {
 
 #[tokio::test]
 async fn over_the_link_budget_lossy_frames_are_dropped_and_the_link_stays_up() {
-    std::env::set_var("LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND", "50");
+    // A lower budget must not reach the other tests in this process.
+    if std::env::var("LIVEENGINE_TEST_LINK_BUDGET").is_err() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "over_the_link_budget_lossy_frames_are_dropped_and_the_link_stays_up",
+            ])
+            .env("LIVEENGINE_TEST_LINK_BUDGET", "1")
+            .env("LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND", "50")
+            .status()
+            .unwrap();
+        assert!(status.success(), "link budget test failed");
+        return;
+    }
     let channels = json!({"updates":{"delivery":"lossy"}});
     let (a, b, senders, mut bob) = busy_nodes(Some(channels)).await;
     let mut tasks = vec![];
@@ -1284,7 +1297,6 @@ async fn over_the_link_budget_lossy_frames_are_dropped_and_the_link_stays_up() {
         }));
     }
     let (frames, lost) = drain(&mut bob, 1500).await;
-    std::env::remove_var("LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND");
     assert!(!lost, "the link was dropped");
     assert!(frames > 0 && frames < 240, "{frames}");
     assert!(counters(&a).await.0 + counters(&b).await.0 > 0);

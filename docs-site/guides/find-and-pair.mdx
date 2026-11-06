@@ -1,11 +1,237 @@
 ---
 title: "Find and pair"
+description: "Search nested hubs for hubs and peers that match requirements, pair a subject with one, and receive a descriptor that LiveClient connects with."
 ---
 
-Use `POST /v1/discover` with `{ "path": [], "depth": 2, "kind": "hub", "requirements": {} }` to search bounded nested hubs. `kind` can be `hub`, `peer` or `any`. Discovery returns candidates without credentials or private addresses.
+Discovery answers "what could I connect to?". Pairing answers "connect me to it". `POST /v1/discover` lists hubs and peers that match your requirements. `POST /v1/pair` picks one, puts the subject into a room with it, issues the ticket and returns a **descriptor**: everything `LiveClient` needs to connect.
 
-`POST /v1/pair` accepts `path`, a `subject` with `kind`, `id` and user-defined `scopes`, and a `target` with `kind`, optional `id` and `requirements`. The descriptor contains `link`, `room`, `userId`, `ticket`, `url` and `transports`. Pass it to `LiveClient`. The same operations are available through `/v1/route` and `HubClient.discover` / `HubClient.pair`.
+## When to use this
 
-For a peer subject targeting `peer` or `any`, `waitMs` waits for a matching peer without polling. It is capped by `LIVEENGINE_MAX_PAIR_WAIT_MS` (30000 by default); expiry returns 408. `LIVEENGINE_MAX_PENDING_PAIRS` bounds waiting peers. Calls themselves queue for up to `LIVEENGINE_CALL_QUEUE_MS` (1000 by default), with at most `LIVEENGINE_MAX_QUEUED_CALLS` (1024) waiting.
+Use find and pair when the application should not choose the hub or the room itself: match a user to any suitable hub in a tree, or to another user who wants a partner. If you already know the hub and room, register membership yourself and issue a ticket as shown in [live rooms](/guides/live-rooms).
 
-A waiting peer must already be registered as a user of a hub so other peers can discover it.
+Both routes need the administrator token. Call them from your server, never from the browser.
+
+## Discover
+
+`POST /v1/discover`
+
+```json
+{ "path": [], "depth": 2, "kind": "hub", "requirements": { "zone": "a" } }
+```
+
+| Field | Rules |
+| --- | --- |
+| `kind` | Required: `hub`, `peer` or `any` |
+| `path` | Central hub ids that select the namespace to search. Default: the service root |
+| `depth` | How many levels to search. Default 1; at most `LIVEENGINE_MAX_DEPTH` including the levels already used by forwarding |
+| `requirements` | Optional. Same forms as [requirements](/concepts/requirements): shorthand object, rule array or `{ rules, match }`. Evaluated against the scopes of each hub or peer |
+
+```json
+{ "candidates": [
+  { "kind": "hub", "id": "hub-a", "path": ["eu", "hub-a"] },
+  { "kind": "peer", "id": "user-a", "path": ["eu", "hub-a"] }
+] }
+```
+
+- A `hub` candidate's `path` ends with the hub's id. A `peer` candidate is a user of an internal hub (or of an external hub, read through its remote), and its `path` leads to the hub that holds the user.
+- Candidates come back in hub-id order within each namespace, a hub before its peers. Central hubs are searched into while depth remains and can themselves appear as `hub` candidates; pairing skips them.
+- The response carries no scopes, credentials or addresses.
+- The search is bounded to the smaller of `LIVEENGINE_MAX_HUBS` and 1024 nodes, counting hubs and users. A response over `LIVEENGINE_MAX_RESPONSE_BYTES` returns `413`.
+- Remote centrals are searched through forwarding; only `kind`, `id`, `path` and (internally) scopes are taken from their answers.
+
+## Pair
+
+`POST /v1/pair`
+
+```json
+{
+  "path": [],
+  "subject": { "kind": "peer", "id": "user-a", "scopes": { "zone": "a" }, "credential": "optional" },
+  "target": { "kind": "hub", "id": "hub-a", "requirements": { "zone": "a" } },
+  "waitMs": 0
+}
+```
+
+| Field | Rules |
+| --- | --- |
+| `subject.kind` | `peer` or `hub` |
+| `subject.id` | Non-empty. The subject's id inside the room |
+| `subject.scopes` | Required object. User-defined; checked against the hub's schemas |
+| `subject.credential` | The subject's credential, for a hub that sets `auth`. It is verified once, before membership changes |
+| `target.kind` | `peer`, `hub` or `any` |
+| `target.id` | Optional. Only the hub or peer with this id can match, so two hubs that share scopes stay distinct. A non-string or empty value is `400`; an id that matches nothing is `404` |
+| `target.requirements` | Optional. Matched against each candidate's scopes |
+| `path` | The namespace to search and pair in. Default: the service root |
+| `waitMs` | Optional non-negative integer; see below |
+
+The descriptor:
+
+```json
+{
+  "link": "peer-hub",
+  "room": "pair:hub:hub-a",
+  "userId": "user-a",
+  "ticket": "eyJ...",
+  "url": "wss://hub.example.net/v1/live",
+  "transports": ["webrtc", "websocket"]
+}
+```
+
+`transports` is the same list every time; it names what a client may try. Whether a direct channel is used is decided by `link`: `LiveClient` connects directly by default only for `peer-peer`.
+
+### How a subject and target combine
+
+| Subject | Target | `link` | Ticket role | What happens |
+| --- | --- | --- | --- | --- |
+| peer | peer | `peer-peer` | `peer` | Both peers are placed in a system room of the target's hub, named `pair:<target id>`, or in the target's current room if it is an open system room. Capacity 64 |
+| peer | hub | `peer-hub` | `peer` | The subject is added as a user of the hub, with `target.requirements` as its requirements, and joins the hub's room `pair:hub:<hub id>`, which is created with the hub's scopes and capacity 64 |
+| hub | hub | `hub-hub` | `service` | As peer to hub, with a service-role ticket |
+| hub | peer | `peer-hub` | `service` | As peer to peer, with a service-role ticket |
+| any | `any` | the matching row | | The first qualifying candidate in discovery order |
+
+A hub target never matches a central. A peer target must not be `idle`, its own `requirements` must accept the subject's scopes, and if it is already in a room that room must be an open system room, so a peer in an ordinary room is not pairable. The subject itself is never its own candidate.
+
+Pairing is a sequence of ordinary engine calls (`pairPeers`, `upsertServer`, `upsertUser`, `join`) and one ticket request, through `POST /v1/route` internally. The schemas, channels and `auth` of the target hub apply as they do for those calls.
+
+### Waiting for a partner
+
+For a peer subject with a `peer` or `any` target, `waitMs` holds the request until a partner arrives.
+
+- A peer with no candidate yet stays queued. The next peer that pairs with it wakes it with its own ticket; nothing polls.
+- The wait ends with `408` after `waitMs`, capped by `LIVEENGINE_MAX_PAIR_WAIT_MS` (30000 by default). `0` there turns waiting off: with no candidate the request fails at once with `404`.
+- A request its caller drops leaves the queue at once, and a match removes both peers from the queue in one step.
+- A peer is queued once per id and scopes: a second request answers `409`. At most `LIVEENGINE_MAX_PENDING_PAIRS` (1024) peers wait at a time per namespace: `503` beyond that.
+- The waiting peer must already be a user of an internal hub, so other peers can discover it, and its registered scopes must equal the `subject.scopes` it passes to `pair`.
+- A waiting `pair` is allowed the request timeout plus its own wait, also when forwarded through a nest. Every other route keeps the plain request timeout.
+- With waiting enabled, a positive `waitMs` with a hub subject or a hub target is `400`. With `LIVEENGINE_MAX_PAIR_WAIT_MS=0` it is ignored.
+
+## Examples
+
+### JavaScript
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+const hub = new HubClient(process.env.HUB_URL, { token: process.env.LIVEENGINE_TOKEN });
+
+await hub.register({ id: 'hub-a', mode: 'internal', scopes: { zone: 'a' }, ifAbsent: true });
+
+// Find hubs.
+const { candidates } = await hub.discover({ kind: 'hub', depth: 2, requirements: { zone: 'a' } });
+
+// Pair a subject with one hub and get a descriptor for LiveClient.
+const descriptor = await hub.pair({
+  subject: { id: 'user-a', scopes: { zone: 'a' } },
+  target: { kind: 'hub', id: 'hub-a', requirements: { zone: 'a' } },
+});
+// { userId, link: 'peer-hub', room: 'pair:hub:hub-a', ticket, url, transports }
+```
+
+`HubClient.discover({ kind = 'any', path = [], depth, requirements })` and `HubClient.pair({ subject, target = { kind: 'any' }, path = [], credential, waitMs })` return the JSON above. `pair` defaults the subject's `kind` to `peer` and `scopes` to `{}`, adds `userId`, and extends its own timeout by `waitMs`. For a user credential, pass `credential` or `subject.credential`.
+
+Give the descriptor to the browser through your own authenticated route, and let `connectLive` renew it:
+
+```js
+app.post('/api/pair', async (req, res) => {
+  res.json(await hub.pair({
+    subject: { id: req.session.userId, scopes: { zone: 'a' } },
+    target: { kind: 'hub', id: 'hub-a', requirements: { zone: 'a' } },
+  }));
+});
+```
+
+```js
+import { connectLive } from '/live-client.mjs';
+const client = await connectLive({ pairUrl: '/api/pair' });
+```
+
+On reconnect `connectLive` posts to `pairUrl` (or `renewUrl`) again, which pairs again and returns a fresh single-use ticket. Pairing a user already in the room is repeatable: a subject already in the target room is not moved. To build the renewal in Node, `hub.renewal(request)` returns a function that pairs with `request` again.
+
+### Inside a central namespace
+
+```js
+const descriptor = await hub.pair({
+  path: ['eu'],
+  subject: { id: 'user-a', scopes: { zone: 'a' } },
+  target: { kind: 'hub', id: 'hub-a' },
+});
+```
+
+`path: ['eu']` searches and pairs inside the central `eu`; candidate paths are relative to it. The same operations exist as `discover` and `pair` on `POST /v1/route` with the discover or pair body in `body`; leave `path` out of that body.
+
+### Rust
+
+The Rust `HubClient` has no `discover` or `pair` method. Use `request` for the endpoints, or `route` for a namespace:
+
+```rust
+use liveengine::hub::HubClient;
+use reqwest::Method;
+use serde_json::json;
+
+let hub = HubClient::new("http://127.0.0.1:8787", token)?;
+
+let found = hub.request(Method::POST, "/v1/discover", Some(json!({
+    "kind": "hub", "depth": 2, "requirements": { "zone": "a" }
+}))).await?;
+
+let descriptor = hub.route(&["eu".to_string()], "pair", json!({
+    "subject": { "kind": "peer", "id": "user-a", "scopes": { "zone": "a" } },
+    "target": { "kind": "hub", "id": "hub-a" }
+})).await?;
+```
+
+The Rust client times out after five seconds, so it cannot wait for a partner for longer than that; see [peer-to-peer](/guides/peer-to-peer).
+
+## Limits and environment variables
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `LIVEENGINE_MAX_DEPTH` | 8 (at most 16) | Search and routing depth |
+| `LIVEENGINE_MAX_HUBS` | 256 | Bounds the discovery budget together with 1024 |
+| `LIVEENGINE_MAX_PAIR_WAIT_MS` | 30000 | Longest `waitMs`; `0` turns waiting off |
+| `LIVEENGINE_MAX_PENDING_PAIRS` | 1024 | Waiting peers at once, per namespace |
+| `LIVEENGINE_CALL_QUEUE_MS` | 1000 | A call to a hub queues in arrival order for up to this long |
+| `LIVEENGINE_MAX_QUEUED_CALLS` | 1024 | Calls queued at once; beyond that a call is refused (`409` handler busy, `503` capacity busy) |
+| `LIVEENGINE_MAX_INFLIGHT_CALLS` | 16 | Concurrent hub calls |
+| `LIVEENGINE_TICKET_TTL_SECONDS` | 60 | Lifetime of the ticket in the descriptor |
+| Pair room capacity | 64 | Members of a `pair:` room |
+
+## Errors
+
+| Status | Message | Cause |
+| --- | --- | --- |
+| `400` | `invalid discovery request`, `invalid pairing request`, `invalid subject`, `invalid target`, `invalid path` | Malformed body, unknown field, bad `kind`, empty id, missing `scopes` object, or a `path` that is not an array of strings |
+| `400` | `invalid requirements` | Requirements are not an object, array or null, or use an unknown operator |
+| `400` | `discovery depth exceeded` | `depth` is more than the remaining routing depth |
+| `400` | `invalid waitMs`, `waitMs needs a peer subject and a peer or any target` | See above |
+| `400` | `scopes do not match schema` (`pairing refused` for a waiting request) | The subject's scopes fail the hub's user schema |
+| `401` | `unauthorized` | Missing or wrong bearer token |
+| `403` | `credential refused` | Hub `auth` rejected `subject.credential` |
+| `404` | `no matching candidate` | Nothing matched and no wait was requested |
+| `404` | `central hub not found` | `path` names a hub that is missing or not a central |
+| `408` | `no matching peer arrived in time` | `waitMs` elapsed |
+| `409` | `candidate requirements do not match` | The chosen peer's own requirements reject the subject |
+| `409` | `subject could not join` | The room is full or closed |
+| `409` | `peer already paired`, `peer is already waiting to pair` | Lost a race, or queued twice |
+| `413` | `discovery response exceeds size limit`, `identity claims exceed the live limit` | Result or claims too large |
+| `429` | `rate limit exceeded` | Peer budget spent |
+| `502` | `invalid candidate`, `invalid pairing response` | A forwarded branch answered with something unusable |
+| `503` | `pairing queue is full`, `public URL is not configured` | See above |
+| `508` | `route depth exceeded` | Too many levels |
+
+`HubClient` throws an `Error` with the server's message and a numeric `status`. A request that comes back from a forwarded remote reports the remote's status with the message `remote route failed`.
+
+## Security notes
+
+- Discovery reveals hub ids, peer ids and paths to whoever calls it. Treat the result as internal data and return only what a player needs.
+- Scope your requirements. A `peer` or `any` search covers every user of every internal hub within `depth`, including those of unrelated hubs. Put a scope such as an application or arena key into `scopes` and `requirements` so that peers of one product are never candidates for another.
+- The pair route changes membership. Authenticate the player and take `subject.id` from the session. A hub with `auth` verifies a credential for that id; without `auth` the hub trusts the id you supply.
+- The descriptor contains a live ticket. Send it only to the player it was issued for, over HTTPS.
+- Calls through your server share one peer budget at the hub (`LIVEENGINE_RATE_LIMIT_REQUESTS`, 120 per minute by default). A busy pairing route needs it raised.
+
+## What is not supported
+
+- No ranking or scoring of candidates: the first qualifying candidate in discovery order wins. Use `target.id` or tight requirements to be specific, or implement selection yourself with `discover` and `target.id`.
+- No wait for a hub target; only peers wait.
+- No pairing into a central hub, or into an ordinary room of a peer.
+- No reservation or release of the pairing: leaving a room is an engine call (`leave`).
+- No credential for discovery; it is administrator-only.

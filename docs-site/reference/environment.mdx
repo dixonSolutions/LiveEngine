@@ -23,7 +23,7 @@ These variables are read by `liveengine-hub` or `HubConfig::from_env()`.
 | `LIVEENGINE_CALL_QUEUE_MS` | integer | `1000` | How long a hub call queues for its turn and a worker before it is refused as busy |
 | `LIVEENGINE_MAX_QUEUED_CALLS` | positive integer | `1024` | Hub calls queued at once |
 | `LIVEENGINE_MAX_PAIR_WAIT_MS` | integer | `30000` | Longest a `pair` request may wait for a partner; `0` turns waiting off |
-| `LIVEENGINE_MAX_PENDING_PAIRS` | positive integer | `1024` | Peers waiting in `pair` requests at once, per hub |
+| `LIVEENGINE_MAX_PENDING_PAIRS` | positive integer | `1024` | Peers waiting in `pair` requests at once, per namespace (the service root, or the central a request addresses) |
 | `LIVEENGINE_RATE_LIMIT_REQUESTS` | positive integer | `120` | Requests per peer per window |
 | `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` | integer | `60` | Rate window in seconds |
 | `LIVEENGINE_RATE_LIMIT_PEERS` | positive integer | `4096` | Maximum tracked peers |
@@ -170,4 +170,6 @@ See [Gogh Strike integration](/guides/gogh-strike) for commands and behavior.
 | `LIVEENGINE_LINK_MAX_BYTES_PER_SECOND` | 16777216 | Link byte budget |
 | `LIVEENGINE_INSTANCE_ID_FILE` | derived | File for generated service instance ID when no explicit ID is set |
 
-Browsers behind strict NAT need a reachable TURN server. See [peer-to-peer](/guides/peer-to-peer).
+Live variables are parsed differently from the host limits. `LIVEENGINE_TICKET_TTL_SECONDS` and `LIVEENGINE_ICE_SERVERS` stop startup when invalid. The `LIVEENGINE_LIVE_*` limits, `LIVEENGINE_SIGNAL_MAX_BYTES` and `LIVEENGINE_LINK_*` budgets fall back to their default when the value is not a positive integer, and are capped at 16777216. `LIVEENGINE_CREDENTIAL` is read by the `liveengine-hub ticket` command when `--credential` is not given.
+
+Browsers behind strict NAT need a reachable TURN server. See [peer-to-peer](/guides/peer-to-peer) and [live architecture](/concepts/live-architecture).

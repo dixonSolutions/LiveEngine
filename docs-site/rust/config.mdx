@@ -29,6 +29,16 @@ pub struct HubConfig {
     pub rate_limit_peers: usize,
     pub max_ttl: Duration,
     pub seed: u64,
+    // Nesting, live and durability settings
+    pub max_depth: usize,
+    pub live_tree_depth: usize,
+    pub instance_id: Option<String>,
+    pub state_file: Option<std::path::PathBuf>,
+    pub ticket_ttl: Duration,
+    pub public_url: Option<String>,
+    pub live_allowed_origins: Vec<String>,
+    pub ice_servers: Vec<serde_json::Value>,
+    pub turn_secret: Option<String>,
 }
 ```
 
@@ -54,6 +64,17 @@ pub struct HubConfig {
 | `rate_limit_peers` | `usize` | `4096` |
 | `max_ttl` | `Duration` | 24 hours |
 | `seed` | `u64` | `0` |
+| `max_depth` | `usize` | `8` (1 to 16) |
+| `live_tree_depth` | `usize` | `3` |
+| `instance_id` | `Option<String>` | `None` (generated) |
+| `state_file` | `Option<PathBuf>` | `None` |
+| `ticket_ttl` | `Duration` | 60 seconds |
+| `public_url` | `Option<String>` | `None` |
+| `live_allowed_origins` | `Vec<String>` | empty |
+| `ice_servers` | `Vec<Value>` | empty |
+| `turn_secret` | `Option<String>` | `None` |
+
+The last nine fields map to `LIVEENGINE_MAX_DEPTH`, `LIVEENGINE_LIVE_TREE_DEPTH`, `LIVEENGINE_INSTANCE_ID`, `LIVEENGINE_STATE_FILE`, `LIVEENGINE_TICKET_TTL_SECONDS`, `LIVEENGINE_PUBLIC_URL`, `LIVEENGINE_LIVE_ALLOWED_ORIGINS`, `LIVEENGINE_ICE_SERVERS` and `LIVEENGINE_TURN_SECRET`. See [live rooms](/guides/live-rooms), [nested hubs](/guides/nesting) and [peer-to-peer](/guides/peer-to-peer).
 
 ## Build programmatically
 

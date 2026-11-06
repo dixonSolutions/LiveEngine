@@ -1,0 +1,137 @@
+---
+title: "Live architecture"
+description: "The whole chain from hosting to connection: registry, nesting, find and pair, then peer-peer, peer-hub and hub-hub, and which credential lives where."
+---
+
+This page follows one connection from the service that hosts it to the browser that uses it. Each stage has its own guide; here you see how they fit together and where each credential belongs.
+
+Core is plumbing. It hosts hubs, routes to them, pairs members, issues tickets and relays frames. It does not know your users, rooms or messages: schemas, channels and payloads are yours.
+
+## The chain
+
+```text
+ 1 Hosting         a service runs hubs: liveengine-hub, or HubService in your Rust app
+        │          optionally a central hosted for a customer (provider hosting)
+        ▼
+ 2 Registry        hubs and centrals registered; a live registry streams the tree
+        │
+        ▼
+ 3 Nesting         centrals form namespaces; a path of ids selects one;
+        │          remote centrals forward to other services
+        ▼
+ 4 Find and pair   discover candidates, pair a subject with one: room, ticket, descriptor
+        │
+        ▼
+ 5 Connection      the client opens a room socket with its ticket, then:
+                     peer-peer   direct data channel, hub relays signalling and fallback
+                     peer-hub    through the hub's room
+                     hub-hub     service to service, linked rooms
+```
+
+### 1. Hosting
+
+A service is one `liveengine-hub` process or one `HubService` embedded in your API. It owns the registry, the engines of its internal hubs, the ticket signing key and the live rooms. State is in memory; `LIVEENGINE_STATE_FILE` persists registry definitions (with their secrets), schemas, templates, links, hosted-credential digests and the ticket signing key, but never rooms or members.
+
+A service can also host a central for someone else: with `hosting: "provider"` it creates the central locally and returns one credential that manages only that subtree. See [provider hosting](/guides/provider-hosting).
+
+### 2. Registry
+
+Hubs are registered as `internal` (an engine inside this service), `external` (a route to a hub on another service) or `central` (a namespace). The registry lists them, can expire them, validates their scopes against [schemas](/guides/schemas), and streams its shape to browsers and services through the [live registry](/guides/live-registry), with ordered diffs and no addresses or credentials.
+
+### 3. Nesting
+
+Centrals contain hubs and other centrals. A path such as `["eu", "games"]` selects a namespace, and `POST /v1/route` runs `register`, `call`, `ticket`, `discover`, `pair` and the other operations there. A remote central forwards the rest of the path to another service with that service's own token, a trace of visited instance ids and a depth counter, so loops and over-deep trees are refused. Schemas and channels are inherited down the tree. See [nested hubs](/guides/nesting).
+
+### 4. Find and pair
+
+`discover` lists hubs and peers that match requirements inside a namespace. `pair` selects one candidate, puts the subject into a room with it through ordinary engine calls, and returns a descriptor `{ link, room, userId, ticket, url, transports }`. A peer with no partner can wait for one. See [find and pair](/guides/find-and-pair).
+
+If you already know the hub and the room, skip discovery: register membership yourself and ask for a ticket directly ([live rooms](/guides/live-rooms)).
+
+### 5. Connection
+
+The client gives the descriptor to `LiveClient`. It opens `url`, sends the ticket as its first frame and receives `welcome`, with the room's peers and the ICE servers. From then on frames flow in one of three ways, named by `link`:
+
+| `link` | Pairs | Room | Ticket role | Path of frames |
+| --- | --- | --- | --- | --- |
+| `peer-peer` | peer with peer | A system room in the target's hub, `pair:<target id>` | `peer` | Over a WebRTC data channel when it opens, otherwise through the hub. The hub carries `signal.offer`, `signal.answer` and `signal.ice` |
+| `peer-hub` | peer with hub | The hub's room, `pair:hub:<hub id>` | `peer` | Through the hub relay. `LiveClient` does not try WebRTC unless you set `direct: true` |
+| `hub-hub` | hub with hub | The same hub room | `service` | A service connection to the hub's room, with the hub's channels and schemas applied |
+
+Separately from pairing, a [hub link](/guides/hub-links) is a persistent service-to-service connection that bridges a local room and a remote room, so peers on both services see each other. The link requests its own service tickets with a link credential, and bridged frames travel as `link.frame` and `link.presence` messages.
+
+The [peer-to-peer guide](/guides/peer-to-peer) covers the direct channel; the hub relay in all three cases is the one described in [live rooms](/guides/live-rooms).
+
+## Who holds what
+
+```text
+ browser ── ticket, watch ticket, its own user credential ──► your application server
+                                                                    │ administrator token,
+                                                                    │ or a hub-scoped credential
+                                                                    ▼
+                                                              liveengine service ── remote tokens ──► other services
+```
+
+| Credential | Held by | Accepted for | Lifetime |
+| --- | --- | --- | --- |
+| Administrator token (`LIVEENGINE_TOKEN`) | The operator and your application server | Every HTTP route (only `/health` and `/v1/ping` are open) | Until you rotate it |
+| Room ticket | One browser or peer | The first frame of `/v1/live` | `LIVEENGINE_TICKET_TTL_SECONDS` (60), single use, bound to hub path and room |
+| Watch ticket | One browser or service | The first frame of `/v1/live/registry`, read-only, scoped to a path and depth | The same TTL, single use |
+| User credential | The player, to give to your server | Checked by the hub's `auth` before a ticket or pairing | Its own `exp` |
+| Hub-scoped credential (`lehub_...`) | A hosted customer's server | `POST /v1/route` inside its subtree only | Until its hub is deleted or expires |
+| Link credential | The service that dials a link | `POST /v1/hubs/{id}/tickets` for role `service` on one hub | Until revoked |
+| Remote token | A central or external registration, a link target | The remote service's routes | Until the remote rotates it |
+| TURN username and credential | A connecting client, from `welcome` | The TURN server | One hour |
+
+### A browser only ever holds tickets
+
+The browser never receives the administrator token, a remote token, a link credential or a hub-scoped credential. It receives:
+
+- a **room ticket**, from a route of yours, to open `/v1/live`;
+- a **watch ticket**, from a route of yours, to open `/v1/live/registry`;
+- optionally its own **user credential**, which it gives to your route, not to the hub;
+- ICE servers with short-lived TURN credentials, in the `welcome` frame.
+
+The sockets accept tickets rather than the administrator token, so a browser can connect without a secret that could do harm. A ticket works once, expires within a minute by default and is bound to one hub path and room. The HTTP routes that issue tickets, pair and discover need the administrator token and belong behind your own authenticated routes. See the [security model](/concepts/security).
+
+## NAT and TURN
+
+Peer-to-peer connections need ICE. The hub hands every client the servers in `LIVEENGINE_ICE_SERVERS`.
+
+- Most home and office NATs work with **STUN** alone.
+- **Strict NAT** (symmetric NAT, restrictive firewalls, some mobile networks) cannot form a direct channel and needs a reachable **TURN** server that relays the data channel. Without one, the client falls back to the hub relay: frames still arrive, but through the hub.
+- Set `LIVEENGINE_TURN_SECRET` and the hub gives each connection time-limited TURN credentials for every `turn:` or `turns:` entry. The TURN server uses the same shared secret.
+- The hub does not run STUN or TURN. You provide and expose them.
+
+See [peer-to-peer](/guides/peer-to-peer).
+
+## One request, end to end
+
+1. The player signs in to your application. Your server authenticates them.
+2. The browser asks your server for a connection. Your server calls `pair` (or registers membership and calls `ticket`) with the administrator token, passing the user's credential if the hub has `auth`.
+3. The hub verifies the credential, changes membership through engine calls and issues a ticket. Your server returns the descriptor.
+4. The browser opens `url`, sends `{ "type": "auth", "ticket": "..." }` and receives `welcome`.
+5. Frames flow: through the relay, over a direct channel for `peer-peer`, or across a link between services.
+6. When the socket drops, `LiveClient` asks your server for a fresh descriptor, because a ticket works once.
+
+## Where limits and failures live
+
+| Layer | Limits | Failure shows as |
+| --- | --- | --- |
+| HTTP routes | Body and response size, rate budget per socket peer, in-flight calls and queue, depth | HTTP status and `{ "error": "..." }` |
+| Pairing | Waiting peers, wait time, pair room capacity 64 | `404`, `408`, `409`, `503` |
+| Room socket | Frame size, messages and bytes per second, queue, connections per room and total, idle time | The socket closes, with no message |
+| Channels | Declared channels, `maxRate`, payload schema | The sender's socket closes |
+| Registry socket | Depth, 256 subscribers, ticket scope | The socket closes, or `503` at upgrade |
+| Links | Per-link message and byte budgets, trace length, frame ids | Dropped or rejected frame counters, `unreachable` status |
+| Direct channel | `maxFrameBytes` in the client | The frame is ignored |
+
+Limits and variables are listed in [limits](/reference/limits) and the [environment reference](/reference/environment).
+
+## What core does not do
+
+- It does not authenticate your players. Your application does, and the hub's `auth` confirms credentials you route to it ([custom auth](/guides/custom-auth)).
+- It does not persist rooms, members or messages.
+- It does not interpret schemas, claims or payloads: they are yours.
+- It does not carry media or run STUN or TURN.
+- It does not isolate tenants from each other's load. Quotas are `maxHubs` for immediate children and the service-wide limits.

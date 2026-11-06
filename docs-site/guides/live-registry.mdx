@@ -1,9 +1,229 @@
 ---
 title: "Live registry"
+description: "Stream a bounded, read-only view of the hub tree to browsers and services with snapshots, ordered diffs and watch tickets."
 ---
 
-An admin issues `POST /v1/tickets/watch` with `{ "path": [], "depth": 3 }`. Connect to `/v1/live/registry` and send `{ "type": "auth", "ticket": "...", "path": [], "depth": 3 }` as the first frame. Server clients may send `token` instead of `ticket`; browsers should never receive the admin token. Configure `LIVEENGINE_LIVE_ALLOWED_ORIGINS` for browser origins.
+The live registry streams the shape of the hub tree: which hubs exist, whether they are reachable, and how many rooms and members each one has. A client receives one snapshot and then ordered changes. It is read-only: it never exposes addresses, credentials, scopes or member names.
 
-The first frame is a snapshot with `seq`, `effectiveDepth` and `hubs`. Subsequent `added`, `removed`, `updated` and `status` frames have ordered sequence numbers. On a gap send `{ "type": "resnapshot" }`. Nodes below the live depth have `childrenLive: false` and remain available through `/v1/tree`. Depth is clamped by the central's `liveDepth` and `LIVEENGINE_MAX_DEPTH`; the default is `LIVEENGINE_LIVE_TREE_DEPTH=3`. Remote failures affect their branch. Watches omit addresses and credentials.
+## When to use this
 
-Node clients can use `hub.watchRegistry({path: [], depth: 3})`; its watch stores `snapshot`, emits diffs and requests a resnapshot on a gap. Call `close()` when finished.
+Use it to drive a dashboard, a hub picker or an operator view that must stay current without polling. For a one-off view of a branch use `GET /v1/tree`. For messages between room members use [live rooms](/guides/live-rooms).
+
+## The flow
+
+<Steps>
+  <Step title="Your server issues a watch ticket">
+    `POST /v1/tickets/watch` with `{ "path": [], "depth": 3 }`. The response is `{ ticket, expiresAt }`. A ticket is read-only, single-use, scoped to a path and depth, and lives for `LIVEENGINE_TICKET_TTL_SECONDS` (60 by default).
+  </Step>
+  <Step title="The client connects">
+    It opens `/v1/live/registry` and sends `{ "type": "auth", "ticket": "...", "path": [], "depth": 3 }` as its first frame, within five seconds.
+  </Step>
+  <Step title="Snapshot, then diffs">
+    The first message is a `snapshot` with `seq` 0. Later messages are `added`, `removed`, `updated` or `status`, each with `seq` increasing by exactly one.
+  </Step>
+  <Step title="Recover from a gap">
+    If a `seq` is not the previous one plus one, send `{ "type": "resnapshot" }` and replace local state with the snapshot that follows.
+  </Step>
+</Steps>
+
+Server-side clients may send `"token": "<administrator token>"` in place of `ticket`. A browser must never receive that token: it gets a ticket from your server.
+
+## Wire format
+
+### Authenticate
+
+```json
+{ "type": "auth", "ticket": "eyJ...", "path": [], "depth": 3 }
+```
+
+`path` and `depth` can also arrive in a second frame, `{ "path": [], "depth": 3 }`, if the first frame had no `path`. `depth` must be a positive integer. `path` is an array of central hub ids, starting at the service root, and its length must be less than `LIVEENGINE_MAX_DEPTH`. Never put the ticket in the URL. A refused or malformed first frame closes the socket without a message.
+
+### Snapshot
+
+```json
+{
+  "type": "snapshot",
+  "seq": 0,
+  "path": [],
+  "depth": 3,
+  "effectiveDepth": 3,
+  "hubs": [
+    { "id": "eu", "mode": "central", "status": "ok", "roomCount": 0, "memberCount": 0, "childrenLive": true,
+      "hubs": [
+        { "id": "hub-a", "mode": "internal", "status": "ok", "roomCount": 2, "memberCount": 5, "childrenLive": false }
+      ] }
+  ]
+}
+```
+
+| Node field | Meaning |
+| --- | --- |
+| `id`, `mode` | Hub id and `internal`, `external` or `central` |
+| `status` | `ok`, `stale` (imported hub no longer listed by its source) or `unreachable` (a remote branch cannot be read) |
+| `roomCount`, `memberCount` | Rooms and paired members of an internal hub; `0` for hubs without a local engine |
+| `childrenLive` | `true` when this node's children are included under `hubs`; `false` otherwise |
+| `hubs` | Child nodes, present only when `childrenLive` is `true` |
+
+`depth` and `effectiveDepth` in the snapshot are both the depth the hub actually applied. A node has `childrenLive: false` when it is not a central, or when it sits at the depth limit; fetch deeper branches with `GET /v1/tree`.
+
+### Diffs
+
+```json
+{ "type": "added", "seq": 1, "path": ["hub-b"], "hub": { "id": "hub-b", "mode": "internal", "status": "ok", "roomCount": 0, "memberCount": 0, "childrenLive": false } }
+{ "type": "updated", "seq": 2, "path": ["hub-a"], "hub": { "id": "hub-a", "mode": "internal", "status": "ok", "roomCount": 3, "memberCount": 5, "childrenLive": false } }
+{ "type": "status", "seq": 3, "path": ["eu"], "hub": { "id": "eu", "mode": "central", "status": "unreachable", "roomCount": 0, "memberCount": 0, "childrenLive": false } }
+{ "type": "removed", "seq": 4, "path": ["hub-b"] }
+```
+
+- `path` in a diff is the node's path relative to the subscribed `path`. The snapshot's own `path` is the subscribed path.
+- `hub` is the node without its `hubs` children; the children arrive as their own diffs.
+- A change of `status` is reported as `status`; any other change as `updated`.
+- The hub compares its view about every 100 ms. Changes inside one interval are merged into one diff.
+- `resnapshot` answers with a `snapshot` that repeats the current `seq`. It does not advance it.
+
+### Depth
+
+The hub applies the smallest of:
+
+1. the `depth` you requested;
+2. `LIVEENGINE_LIVE_TREE_DEPTH` (default 3, at most `LIVEENGINE_MAX_DEPTH`), or the `liveDepth` of the nearest central on the path that sets one;
+3. `LIVEENGINE_MAX_DEPTH` minus the length of `path`;
+4. for a ticket, the ticket's depth minus how far `path` is below the ticket's path.
+
+A central can set `liveDepth` (1 to `LIVEENGINE_MAX_DEPTH`) when it is registered.
+
+## Watch tickets
+
+`POST /v1/tickets/watch` needs the administrator token.
+
+```json
+{ "path": [], "depth": 3 }
+```
+
+`depth` is required and at least 1; `path` defaults to the root. The response is `{ "ticket": "...", "expiresAt": 1793782217 }`. A ticket lets a client subscribe to the ticket's path or any path below it, as deep as the ticket allows, once. A reconnect needs a new ticket. For a central namespace, the `watchTicket` route operation takes `body: { "path": [], "depth": 3 }` relative to that central; the ticket it returns carries the full path.
+
+Errors: `400 invalid watch request` for a malformed body, unknown field or missing `depth`; `400 invalid watch scope` for depth `0`, a `path` as long as `LIVEENGINE_MAX_DEPTH` or longer, or a path that is not a chain of central hubs; `401` without the token.
+
+## Examples
+
+### JavaScript (server)
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+const hub = new HubClient(process.env.HUB_URL, { token: process.env.LIVEENGINE_TOKEN });
+
+// Watching with the administrator token, inside your own process.
+const watch = await hub.watchRegistry({ path: [], depth: 3 });
+console.log(watch.snapshot.hubs);
+
+watch.on('added', message => console.log('added', message.path, message.hub));
+watch.on('removed', message => console.log('removed', message.path));
+watch.on('updated', message => console.log('updated', message.path, message.hub));
+watch.on('status', message => console.log('status', message.path, message.hub.status));
+watch.on('close', () => console.log('closed'));
+
+// ...later
+watch.close();
+```
+
+`watchRegistry` resolves after the first snapshot. `watch.snapshot` is the latest snapshot message; it is not updated by diffs, so apply `added`, `removed`, `updated` and `status` yourself. `watch.seq` is the last sequence number seen. On a gap the watch asks for a new snapshot on its own and emits `snapshot` again. The watch does not reconnect after `close`. Pass `ticket` (and no administrator token is sent) to watch with a ticket; the constructor still requires a token string.
+
+### Browser
+
+A browser cannot use `HubClient`. Your server hands it a ticket and the socket URL:
+
+```js
+// server: your authenticated route
+app.post('/api/registry-ticket', async (req, res) => {
+  const { ticket } = await hub.watchTicket({ path: [], depth: 3 });
+  res.json({ ticket, url: 'wss://hub.example.net/v1/live/registry' });
+});
+```
+
+```js
+// browser
+const { ticket, url } = await (await fetch('/api/registry-ticket', { method: 'POST' })).json();
+const socket = new WebSocket(url);
+let seq = -1;
+socket.onopen = () => socket.send(JSON.stringify({ type: 'auth', ticket, path: [], depth: 3 }));
+socket.onmessage = event => {
+  const message = JSON.parse(event.data);
+  if (message.type === 'snapshot') {
+    seq = message.seq;
+    render(message.hubs);
+  } else if (message.seq !== seq + 1) {
+    socket.send(JSON.stringify({ type: 'resnapshot' }));
+  } else {
+    seq = message.seq;
+    apply(message);
+  }
+};
+```
+
+`render` and `apply` are yours. Browsers must be allowed in `LIVEENGINE_LIVE_ALLOWED_ORIGINS`, exactly as for [live rooms](/guides/live-rooms).
+
+### Rust
+
+```rust
+use liveengine::hub::HubClient;
+
+let hub = HubClient::new("http://127.0.0.1:8787", token)?;
+
+// A ticket for a browser, from your server.
+let issued = hub.watch_ticket(&[], 3).await?; // { "ticket": ..., "expiresAt": ... }
+
+// Watch in-process with the client's own token. The callback gets the snapshot first, then diffs.
+// Return false to stop.
+let mut seen = 0;
+hub.watch(&[], 3, |message| {
+    println!("{message}");
+    seen += 1;
+    seen < 10
+}).await?;
+```
+
+`watch` returns when the callback returns `false` or the hub closes the stream. It does not request a resnapshot for you.
+
+### CLI
+
+```sh
+LIVEENGINE_TOKEN=... liveengine-hub watch-ticket http://127.0.0.1:8787 --depth 3
+LIVEENGINE_TOKEN=... liveengine-hub watch http://127.0.0.1:8787 --path eu --depth 2 --count 5
+```
+
+`watch` prints one JSON message per line, snapshot first, and stops after `--count` messages.
+
+## Remote branches
+
+A central that forwards to another service is part of the stream. The hub keeps one upstream subscription per remote address, credential and forwarding trace, and shares it between subscribers. The upstream asks the remote at the depth needed, reconnects with backoff (100 ms doubling to 5 s) and marks the branch `unreachable` while it has no data. The rest of the tree stays live. Only the public node fields cross from the remote: `id`, `mode`, `status`, `roomCount`, `memberCount`, `childrenLive` and children. Loops are rejected through the forwarding trace.
+
+## Limits
+
+| Setting | Value |
+| --- | --- |
+| `LIVEENGINE_LIVE_TREE_DEPTH` | 3 by default; capped by `LIVEENGINE_MAX_DEPTH` (8 by default, 16 at most) |
+| `LIVEENGINE_TICKET_TTL_SECONDS` | 60 by default; watch ticket lifetime |
+| `LIVEENGINE_LIVE_ALLOWED_ORIGINS` | exact browser origins; empty refuses browsers |
+| Concurrent registry sockets | 256 per process, fixed |
+| First frame | 5 seconds |
+| Slow reader | a client that cannot accept a message within 5 seconds is disconnected |
+| Largest message from a client | `LIVEENGINE_MAX_BODY_BYTES` |
+
+## Errors
+
+Before the upgrade: `403 origin not allowed`, `503 subscriber capacity reached`, and `400` or `508` with `invalid or repeated forwarding trace`. After it, the server closes the socket without a message for: a missing or late first frame, `type` other than `auth`, an unknown or reused ticket, a ticket that was not issued for the registry, a `path` or `depth` outside the ticket's scope, an invalid `depth`, or a path that does not lead to a central hub. `HubClient.watchRegistry` rejects with `Hub closed the registry watch (check the token or ticket, path and depth)` in that case, `Registry watch failed` on a socket error, and `Registry watch timed out` if no snapshot arrives in `timeoutMs`.
+
+## Security notes
+
+- A watch ticket is read-only and scoped. It cannot issue tickets, join rooms or read anything but the node fields above. Frames omit addresses, remote hub ids, tokens, scopes and member ids.
+- The registry socket itself does not require the administrator token: the ticket (or token) in the first frame is the credential. Browser `Origin` is checked, a non-browser client can omit it.
+- Hub ids, modes, counts and reachability are visible to every holder of a ticket for that branch. Scope the ticket's `path` to what that client should see.
+- Each subscriber costs a computed snapshot about ten times a second. Keep depth modest for large trees.
+
+## What is not supported
+
+- No per-room or per-member details: counts only.
+- No filtering or search; use `POST /v1/discover` for that.
+- No resume from a `seq`; recover with `resnapshot`.
+- No reconnect inside `RegistryWatch`; open a new watch with a new ticket.
+- No push of room messages; use [live rooms](/guides/live-rooms).

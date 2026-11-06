@@ -1,0 +1,173 @@
+---
+title: "Provider hosting"
+description: "Run a central hub for a customer on your own service and hand the customer one credential that can manage only that hub and its subtree."
+---
+
+Provider hosting lets the operator of a LiveEngine service run a **central hub on behalf of someone else**. The operator creates the hub with `hosting: "provider"`. The service creates it locally and returns a **hub-scoped credential**, once. The holder can create, call, pair and delete hubs inside that central, and nothing else. The administrator token stays with the operator.
+
+## When to use this
+
+Use it when you host LiveEngine as a platform and each customer, team or product needs its own namespace of hubs: they register hubs, create rooms, issue tickets and read their own tree through one credential, while you keep control of the service, its limits and its allowlist.
+
+If the customer should run their own service, register their service as a remote central instead (see [nested hubs](/guides/nesting) and [remote hubs](/guides/remote-hubs)). Provider hosting runs on your service; a remote central runs on theirs.
+
+## The flow
+
+<Steps>
+  <Step title="The operator creates the hosted hub">
+    `POST /v1/hubs` with `"mode": "central"` and `"hosting": "provider"`, using the administrator token. The `201` response includes `credential`.
+  </Step>
+  <Step title="The operator hands over the credential">
+    It is returned once and cannot be read again. Only its SHA-256 digest is stored.
+  </Step>
+  <Step title="The holder works inside the hub">
+    Every request is `POST /v1/route` with the credential as the bearer token and a `path` that starts with the hub's own path.
+  </Step>
+</Steps>
+
+## Create a hosted hub
+
+### JavaScript
+
+```js
+const { HubClient } = require('@dixonsolutions/liveengine/hubs');
+const admin = new HubClient(process.env.HUB_URL, { token: process.env.LIVEENGINE_TOKEN });
+
+const created = await admin.register({
+  id: 'tenant-a',
+  mode: 'central',
+  hosting: 'provider',
+  maxHubs: 16,          // optional: at most 16 immediate children
+  ttlSeconds: 86400,    // optional: the hub and its credential expire together
+});
+
+console.log(created.credential); // "lehub_..." shown once. Store it securely.
+```
+
+The response is the public hub record plus two members: `"hosting": "provider"` and `credential`. A credential is the prefix `lehub_` followed by 64 hexadecimal characters.
+
+### Rust
+
+```rust
+use liveengine::hub::{HubConfig, HubService, HubSpec};
+use serde_json::json;
+
+let service = HubService::new(HubConfig { token: token.into(), ..HubConfig::default() })?;
+let hosted = service.register_hosted(HubSpec {
+    id: "tenant-a".into(),
+    hosting: Some("provider".into()),
+    max_hubs: Some(16),
+    scopes: json!({}),
+    ..HubSpec::default()
+}).await?;
+println!("{}", hosted.credential); // returned once
+```
+
+`register_hosted` sets the mode to `central` if you leave it out and requires `hosting` to be `"provider"`. It fails if the hub already exists: with `if_absent` set the error is `hub already exists, so no credential was issued`; without it, `hub id already registered`. `HubService::register` refuses a spec that has `hosting`, so a credential cannot be dropped by accident. Over HTTP, a hosted hub must be a local central: `address`, `remoteToken` and `remoteHubId` are refused (`400 provider hosting requires a central hub without address or remote credentials`).
+
+## Use the credential
+
+The holder uses `HubClient.route`. Its other methods call routes the credential does not open, and answer `401`.
+
+```js
+const tenant = new HubClient(process.env.HUB_URL, { token: credential });
+
+await tenant.route(['tenant-a'], 'register', { id: 'hub-1', mode: 'internal', scopes: { zone: 'a' } });
+await tenant.route(['tenant-a'], 'call', { id: 'hub-1', method: 'upsertServer', args: [{ id: 'room-1', capacity: 8 }] });
+await tenant.route(['tenant-a'], 'call', { id: 'hub-1', method: 'upsertUser', args: [{ id: 'user-a' }] });
+await tenant.route(['tenant-a'], 'call', { id: 'hub-1', method: 'join', args: ['user-a', 'room-1'] });
+
+const issued = await tenant.route(['tenant-a'], 'ticket', { id: 'hub-1', userId: 'user-a', serverId: 'room-1' });
+const listing = await tenant.route(['tenant-a'], 'list');
+const tree = await tenant.route(['tenant-a'], 'tree', { depth: 2 });
+const watch = await tenant.route(['tenant-a'], 'watchTicket', { depth: 2 });
+await tenant.route(['tenant-a'], 'delete', { id: 'hub-1' });
+```
+
+`call` answers `{ "result": ... }`. Paths are exact segments of hub ids and are never normalised.
+
+A holder's `pair` and `discover` run inside the hosted hub. For example `tenant.route(['tenant-a'], 'pair', { subject, target })` pairs within `tenant-a`; see [find and pair](/guides/find-and-pair).
+
+### Rust
+
+```rust
+use liveengine::hub::HubClient;
+use serde_json::json;
+
+let tenant = HubClient::new("https://hub.example.net", credential)?;
+tenant.route(&["tenant-a".to_string()], "register",
+    json!({ "id": "hub-1", "mode": "internal" })).await?;
+let issued = tenant.route(&["tenant-a".to_string()], "ticket",
+    json!({ "id": "hub-1", "userId": "user-a", "serverId": "room-1" })).await?;
+```
+
+`HubClient::ticket` works with a non-empty path, because it then uses the `ticket` route operation. `watch_ticket` always uses `/v1/tickets/watch`, which a scoped credential cannot reach: use `route(path, "watchTicket", ...)` instead.
+
+### Wire format
+
+```http
+POST /v1/route
+Authorization: Bearer lehub_...
+Content-Type: application/json
+
+{ "path": ["tenant-a"], "op": "register", "body": { "id": "hub-1", "mode": "internal" } }
+```
+
+A watch ticket requested this way carries the full path. When the browser opens the registry socket it sends that full path, for example `{ "type": "auth", "ticket": "...", "path": ["tenant-a"], "depth": 2 }`. See [live registry](/guides/live-registry).
+
+## What the credential can do
+
+The credential is default deny.
+
+- It is accepted on `POST /v1/route` and nowhere else. Schemas, templates, links, export, import, `/v1/tree`, `/v1/hubs`, `/v1/hubs/{id}` and every other route answer `401`.
+- The request `path` must start with the owning hub's full path. A sibling, a parent and the service root are refused. The owner is found by walking local centrals only, so a credential is never forwarded to a remote central before it has matched inside the subtree.
+- Only these operations run: `discover`, `pair`, `tree`, `register`, `list`, `get`, `delete`, `watchTicket`, `ticket`, `authorize` and `call`.
+- A `register` that names a `template`, and the forwarding fields `inherited_schemas` and `inherited_channels`, answer `403`.
+- Digests are compared in constant time. Deleting the hub ends the credential: a hub created again under the same id gets a new credential, and the old one no longer matches.
+- A holder can create nested hosted hubs (`hosting: "provider"` in a `register`). Their credentials are narrower than the parent's.
+- A holder cannot delete or change the hub that owns the credential, since that requires a path outside it.
+
+There is no route to rotate or revoke a hosted credential other than deleting the hub, which also deletes everything below it.
+
+## Limits and quotas
+
+| Setting | Effect |
+| --- | --- |
+| `maxHubs` on the hosted hub | Maximum immediate children. It does not cap descendants: a holder can create a nested central with its own `maxHubs` |
+| `LIVEENGINE_MAX_HUBS` | Service-wide budget; counts every central and its descendants |
+| `LIVEENGINE_MAX_DEPTH` | Maximum depth, 8 by default and 16 at most; the hosted hub's own position counts |
+| `ttlSeconds` | Expires the hub and its credential. Never longer than the service maximum (24 hours by default in `HubConfig`) |
+| `LIVEENGINE_RATE_LIMIT_REQUESTS` | Per socket peer, so tenants behind one address share it. A request with any credential counts |
+| `LIVEENGINE_MAX_INFLIGHT_CALLS`, `LIVEENGINE_MAX_QUEUED_CALLS` | Shared by every tenant |
+
+There is no per-tenant CPU, memory or call isolation: a busy tenant uses shared capacity.
+
+## Errors
+
+| Status | Message | Cause |
+| --- | --- | --- |
+| `401` | `unauthorized` | Unknown or wrong credential, a `path` outside the owner's subtree, a hub deleted and recreated, or any route other than `POST /v1/route` |
+| `403` | `credential is not valid for this request` | An operation outside the allowed list, a `register` with a `template`, or forwarding fields in the request |
+| `400` | `provider hosting requires a central hub without address or remote credentials` | `hosting` on a hub that is not a local central |
+| `400` | `invalid hosting` | `hosting` is anything but `"provider"` |
+| `409` | `hub id already registered` | The id exists (without `ifAbsent`) |
+| `507` | `hub registry is full`, `global hub budget is full` | `maxHubs` or `LIVEENGINE_MAX_HUBS` reached |
+| `404` | `central hub not found` | A path segment under the owner is missing or is not a central |
+
+Other errors are the ones of the underlying operation (for example `404 hub not found` for a `call`).
+
+## Security notes
+
+- Treat the credential like an administrator token for that subtree. Anyone who holds it can create and delete hubs (with their own schemas, channels and `auth`), call them, and issue tickets for any room in the subtree.
+- A holder can register `external` hubs and remote centrals, and `webhook` auth, to any host in `LIVEENGINE_ALLOWED_REMOTE_HOSTS` with credentials of its choosing. Keep the allowlist to hosts you would let every tenant reach, or do not offer provider hosting to tenants you do not trust.
+- A holder can reference schemas that you published with `schemaRef`, and can use inline `scopeSchema`, `userSchema`, `serverSchema` and `channels`. It cannot publish schemas or templates.
+- Only a SHA-256 digest of the credential is stored (in the state file, when one is configured). The state file also holds other secrets; keep it mode 0600. Without a state file, hosted hubs and credentials disappear on restart.
+- The browser must never hold this credential. The tenant's server uses it and gives players tickets, as in [live rooms](/guides/live-rooms).
+
+## What is not supported
+
+- No credential rotation or separate revocation; delete and recreate the hub.
+- No per-tenant resource quotas beyond `maxHubs` for immediate children and the service-wide limits.
+- No access to schemas, templates, links, import, export or `/v1/tree` for a holder.
+- No hosting of remote centrals: provider hosting is for a local central only.
+- No change to the hosting of an existing hub.
