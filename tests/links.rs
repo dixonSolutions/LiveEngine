@@ -815,19 +815,28 @@ async fn wait_for(ws: &mut Ws, ms: u64, pred: impl Fn(&Value) -> bool) -> Option
         }
     }
 }
-/// Wait until `name` is known in the room, from the welcome list or a presence join.
-async fn sees(ws: &mut Ws, welcome: &[String], name: &str) {
-    if welcome.iter().any(|p| p == name) {
-        return;
+/// Wait until every one of `names` is known in the room, from the welcome list or a presence
+/// join. Joins from different links arrive in no particular order, so one wait covers them all.
+async fn sees(ws: &mut Ws, welcome: &[String], names: &[&str]) {
+    let mut missing: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| !welcome.iter().any(|p| p == name))
+        .collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !missing.is_empty() {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let joined = wait_for(ws, left.as_millis() as u64, |v| {
+            v["type"] == "presence"
+                && v["event"] == "join"
+                && missing.iter().any(|n| v["peer"] == *n)
+        })
+        .await;
+        let Some(joined) = joined else {
+            panic!("{missing:?} never appeared");
+        };
+        missing.retain(|n| joined["peer"] != *n);
     }
-    assert!(
-        wait_for(ws, 10_000, |v| v["type"] == "presence"
-            && v["event"] == "join"
-            && v["peer"] == name)
-        .await
-        .is_some(),
-        "{name} never appeared"
-    );
 }
 fn frame(seq: u64, payload: Value) -> Message {
     Message::Text(
@@ -865,8 +874,8 @@ async fn frames_cross_a_linked_room_in_both_directions() {
     let (a, b) = pair().await;
     let (mut alice, w1) = peer(&a, "alice").await;
     let (mut bob, w2) = peer(&b, "bob").await;
-    sees(&mut alice, &w1, "bob").await;
-    sees(&mut bob, &w2, "alice").await;
+    sees(&mut alice, &w1, &["bob"]).await;
+    sees(&mut bob, &w2, &["alice"]).await;
     say(&mut alice, frame(1, json!("from a"))).await;
     let got = wait_for(&mut bob, 5000, is_frame).await.unwrap();
     assert_eq!(
@@ -892,10 +901,9 @@ async fn targeted_and_signal_frames_cross_the_link_to_the_named_peer() {
     let (mut alice, w1) = peer(&a, "alice").await;
     let (mut carol, w3) = peer(&a, "carol").await;
     let (mut bob, w2) = peer(&b, "bob").await;
-    sees(&mut alice, &w1, "bob").await;
-    sees(&mut carol, &w3, "bob").await;
-    sees(&mut bob, &w2, "alice").await;
-    sees(&mut bob, &w2, "carol").await;
+    sees(&mut alice, &w1, &["bob"]).await;
+    sees(&mut carol, &w3, &["bob"]).await;
+    sees(&mut bob, &w2, &["alice", "carol"]).await;
     say(
         &mut alice,
         Message::Text(
@@ -931,8 +939,8 @@ async fn presence_is_merged_across_the_link_in_both_directions() {
     let (a, b) = pair().await;
     let (mut alice, w1) = peer(&a, "alice").await;
     let (mut bob, w2) = peer(&b, "bob").await;
-    sees(&mut alice, &w1, "bob").await;
-    sees(&mut bob, &w2, "alice").await;
+    sees(&mut alice, &w1, &["bob"]).await;
+    sees(&mut bob, &w2, &["alice"]).await;
     // A peer joining later is announced on the other side, and its leave follows.
     let (mut carol, _) = peer(&a, "carol").await;
     assert!(wait_for(&mut bob, 5000, |v| v["type"] == "presence"
@@ -972,9 +980,7 @@ async fn three_services_in_a_ring_deliver_once_and_do_not_loop() {
         (&mut bob, &w2, ["alice", "carol"]),
         (&mut carol, &w3, ["alice", "bob"]),
     ] {
-        for name in names {
-            sees(ws, w, name).await;
-        }
+        sees(ws, w, &names).await;
     }
     say(&mut alice, frame(1, json!("around"))).await;
     for ws in [&mut bob, &mut carol] {
@@ -1026,9 +1032,9 @@ async fn a_peer_sending_a_link_frame_is_refused() {
     let (mut alice, w1) = peer(&a, "alice").await;
     let (mut carol, w3) = peer(&a, "carol").await;
     let (mut bob, w2) = peer(&b, "bob").await;
-    sees(&mut alice, &w1, "bob").await;
-    sees(&mut carol, &w3, "bob").await;
-    sees(&mut bob, &w2, "alice").await;
+    sees(&mut alice, &w1, &["bob"]).await;
+    sees(&mut carol, &w3, &["bob"]).await;
+    sees(&mut bob, &w2, &["alice"]).await;
     let forged_frame = json!({"type":"link.frame","trace":["x"],"frame":{"from":"alice","v":1,"type":"message","channel":"updates","seq":1,"payload":"forged"}});
     let forged_presence =
         json!({"type":"link.presence","trace":["x"],"event":"join","peer":"ghost"});
@@ -1077,8 +1083,8 @@ async fn invalid_payloads_are_refused_at_ingress_and_again_on_a_stricter_far_sid
     link_status(&a, "ab", "connected").await;
     let (mut alice, w1) = peer(&a, "alice").await;
     let (mut bob, w2) = peer(&b, "bob").await;
-    sees(&mut alice, &w1, "bob").await;
-    sees(&mut bob, &w2, "alice").await;
+    sees(&mut alice, &w1, &["bob"]).await;
+    sees(&mut bob, &w2, &["alice"]).await;
     // Valid on both sides.
     say(&mut alice, frame(1, json!(5))).await;
     assert_eq!(
@@ -1120,10 +1126,9 @@ async fn killed_link() -> (Node, Node, Ws, Ws, Ws) {
     let (mut alice, w1) = peer(&a, "alice").await;
     let (mut carol, w3) = peer(&a, "carol").await;
     let (mut bob, w2) = peer(&b, "bob").await;
-    sees(&mut alice, &w1, "bob").await;
-    sees(&mut carol, &w3, "bob").await;
-    sees(&mut bob, &w2, "alice").await;
-    sees(&mut bob, &w2, "carol").await;
+    sees(&mut alice, &w1, &["bob"]).await;
+    sees(&mut carol, &w3, &["bob"]).await;
+    sees(&mut bob, &w2, &["alice", "carol"]).await;
     unlink(&a, "ab").await;
     for ws in [&mut alice, &mut carol] {
         assert!(wait_for(ws, 10_000, |v| v["type"] == "presence"
@@ -1191,8 +1196,8 @@ async fn identical_frames_from_one_peer_both_cross_the_link() {
     let (a, b) = pair().await;
     let (mut alice, w1) = peer(&a, "alice").await;
     let (mut bob, w2) = peer(&b, "bob").await;
-    sees(&mut alice, &w1, "bob").await;
-    sees(&mut bob, &w2, "alice").await;
+    sees(&mut alice, &w1, &["bob"]).await;
+    sees(&mut bob, &w2, &["alice"]).await;
     // seq is client-supplied, so a repeated byte-identical frame is still a new frame.
     let text =
         json!({"v":1,"type":"message","channel":"updates","seq":1,"payload":"same"}).to_string();
@@ -1218,10 +1223,10 @@ async fn busy_nodes(channels: Option<Value>) -> (Node, Node, Vec<Ws>, Ws) {
     let mut senders = vec![];
     for name in ["p1", "p2", "p3", "p4"] {
         let (mut ws, welcome) = peer(&a, name).await;
-        sees(&mut ws, &welcome, "bob").await;
+        sees(&mut ws, &welcome, &["bob"]).await;
         senders.push(ws);
     }
-    sees(&mut bob, &bob_welcome, "p4").await;
+    sees(&mut bob, &bob_welcome, &["p4"]).await;
     (a, b, senders, bob)
 }
 /// Frames received by `ws` until it is quiet for `quiet_ms`, and whether the link was lost.
@@ -1362,9 +1367,7 @@ async fn a_ring_survives_losing_one_link_and_recovers_it() {
         (&mut bob, &w2, ["alice", "carol"]),
         (&mut carol, &w3, ["alice", "bob"]),
     ] {
-        for name in names {
-            sees(ws, w, name).await;
-        }
+        sees(ws, w, &names).await;
     }
     // Kill one link: the other two still connect all three services.
     unlink(&a, "ab").await;
@@ -1398,6 +1401,62 @@ async fn a_ring_survives_losing_one_link_and_recovers_it() {
     for n in [a, b, c] {
         n.task.abort();
     }
+}
+
+/// Presence joins carried by different links, or by a snapshot after a late attach, reach a peer
+/// in no fixed order; waiting for one name must not lose the join of another.
+#[tokio::test]
+async fn joins_reach_a_peer_in_any_order() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    let n = node("order", &["observer", "svc-one"]).await;
+    let (mut observer, welcome) = peer(&n, "observer").await;
+    let issued: Value = post(
+        &n.base,
+        &n.token,
+        "/v1/hubs/game/tickets",
+        json!({"userId":"svc-one","serverId":"room","role":"service"}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let (mut service, _) = connect_async(format!(
+        "{}/v1/live",
+        n.base.replacen("http://", "ws://", 1)
+    ))
+    .await
+    .unwrap();
+    service
+        .send(Message::Text(
+            json!({"type":"auth","ticket":issued["ticket"]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert!(service
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap()
+        .contains("welcome"));
+    // The far side announces carol first, then bob; the observer asks for bob first.
+    for name in ["carol", "bob"] {
+        say(
+            &mut service,
+            Message::Text(
+                json!({"type":"link.presence","trace":["remote"],"event":"join","peer":name})
+                    .to_string()
+                    .into(),
+            ),
+        )
+        .await;
+    }
+    sees(&mut observer, &welcome, &["bob", "carol"]).await;
+    n.task.abort();
 }
 
 #[tokio::test]
