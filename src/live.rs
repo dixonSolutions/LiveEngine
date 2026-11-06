@@ -469,7 +469,7 @@ pub(crate) async fn authorize_hub(
                 Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "could not verify"),
             }
         }
-        Err(refused) => refused,
+        Err(refused) => *refused,
     }
 }
 pub(crate) async fn issue_ticket(
@@ -529,7 +529,7 @@ pub(crate) async fn issue_ticket(
             .await
             {
                 Ok(identity) => identity,
-                Err(refused) => return refused,
+                Err(refused) => return *refused,
             },
         };
         if record.auth.is_some() {
@@ -764,16 +764,25 @@ fn extended(trace: &[String], instance: &str) -> Vec<String> {
     trace
 }
 /// Carry a frame over the links of a room: to the link that knows `target`, or to every link.
+/// Where a forwarded frame goes: away from `except`, to `target` when known, or to every link.
+struct Course<'a> {
+    except: Option<&'a str>,
+    target: Option<&'a str>,
+    lossy: bool,
+}
 fn forward(
     live: &LiveRooms,
     bridge: &Bridge,
     id: &str,
     trace: &[String],
-    except: Option<&str>,
-    target: Option<&str>,
+    course: Course<'_>,
     frame: &Value,
-    lossy: bool,
 ) {
+    let Course {
+        except,
+        target,
+        lossy,
+    } = course;
     let message =
         text(serde_json::json!({"type":"link.frame","id":id,"trace":trace,"frame":frame}));
     if matches!(&message, Message::Text(t) if t.len() > MAX_WIRE) {
@@ -1091,10 +1100,12 @@ async fn ingest_frame(
                     bridge,
                     id,
                     &trace,
-                    Some(via),
-                    Some(to),
+                    Course {
+                        except: Some(via),
+                        target: Some(to),
+                        lossy,
+                    },
                     &wire["frame"],
-                    lossy,
                 );
             }
         }
@@ -1109,10 +1120,12 @@ async fn ingest_frame(
                 bridge,
                 id,
                 &trace,
-                Some(via),
-                None,
+                Course {
+                    except: Some(via),
+                    target: None,
+                    lossy,
+                },
                 &wire["frame"],
-                lossy,
             );
         }
     }
@@ -1165,7 +1178,7 @@ async fn ingest_presence(state: &Arc<Inner>, key: &RoomKey, via: &str, wire: &Va
     bridge.offer(Some(via), &wire_presence(&trace, event, Some(peer)), false);
     if event == "unreachable" {
         // The peer may still be reachable through another link: ask them to announce again.
-        let hello = wire_presence(&[state.instance_id.clone()], "join", None);
+        let hello = wire_presence(std::slice::from_ref(&state.instance_id), "join", None);
         bridge.offer(Some(via), &hello, false);
     }
 }
@@ -1192,19 +1205,26 @@ pub(crate) async fn live_socket(
         }
     }
     let live = state.live_rooms.clone();
-    if live
-        .connections
-        .fetch_update(
+    // `AtomicUsize::try_update` is the named replacement for `fetch_update` but needs a newer
+    // Rust than the crate's declared minimum, so reserve the slot with a compare-exchange loop.
+    let max_connections = limit("LIVEENGINE_LIVE_MAX_CONNECTIONS", 4096);
+    let mut current = live.connections.load(std::sync::atomic::Ordering::SeqCst);
+    loop {
+        if current >= max_connections {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "live connection capacity reached",
+            );
+        }
+        match live.connections.compare_exchange_weak(
+            current,
+            current + 1,
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
-            |n| (n < limit("LIVEENGINE_LIVE_MAX_CONNECTIONS", 4096)).then_some(n + 1),
-        )
-        .is_err()
-    {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "live connection capacity reached",
-        );
+        ) {
+            Ok(_) => break,
+            Err(seen) => current = seen,
+        }
     }
     let permit = ConnectionPermit(live);
     let frame_limit = limit("LIVEENGINE_LIVE_MAX_FRAME_BYTES", 65536);
@@ -1619,10 +1639,12 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
                     bridge,
                     &state.live_rooms.frame_id(&state.instance_id),
                     &trace,
-                    None,
-                    Some(target),
+                    Course {
+                        except: None,
+                        target: Some(target),
+                        lossy: false,
+                    },
                     &value,
-                    false,
                 );
             } else {
                 break;
@@ -1673,10 +1695,12 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
                     bridge,
                     &state.live_rooms.frame_id(&state.instance_id),
                     &trace,
-                    None,
-                    target.as_deref(),
+                    Course {
+                        except: None,
+                        target: target.as_deref(),
+                        lossy,
+                    },
                     &value,
-                    lossy,
                 );
             }
         }

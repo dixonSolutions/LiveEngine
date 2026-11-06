@@ -1316,17 +1316,16 @@ async fn everyone_hears_everyone_once(peers: &mut [(&str, &mut Ws)], round: u64)
     for i in 0..peers.len() {
         let tag = format!("{round}-{}", peers[i].0);
         say(&mut *peers[i].1, frame(round, json!(tag))).await;
-        for j in 0..peers.len() {
+        for (j, (name, ws)) in peers.iter_mut().enumerate() {
             if i != j {
-                let got = wait_for(&mut *peers[j].1, 5000, |v| v["payload"] == tag.as_str()).await;
-                assert!(got.is_some(), "{} never heard {tag}", peers[j].0);
+                let got = wait_for(ws, 5000, |v| v["payload"] == tag.as_str()).await;
+                assert!(got.is_some(), "{name} never heard {tag}");
             }
         }
-        for j in 0..peers.len() {
+        for (name, ws) in peers.iter_mut() {
             assert!(
-                wait_for(&mut *peers[j].1, 300, is_frame).await.is_none(),
-                "{} got a stray or duplicate frame",
-                peers[j].0
+                wait_for(ws, 300, is_frame).await.is_none(),
+                "{name} got a stray or duplicate frame"
             );
         }
     }

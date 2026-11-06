@@ -18,11 +18,13 @@ pub type Incoming = Pin<Box<dyn Stream<Item = Result<Message, TransportError>> +
 /// Frames going to the peer.
 pub type Outgoing = Pin<Box<dyn Sink<Message, Error = TransportError> + Send>>;
 
+/// The pending result of reading one frame.
+pub type Received<'a> =
+    Pin<Box<dyn Future<Output = Option<Result<Message, TransportError>>> + Send + 'a>>;
+
 pub trait LiveTransport: Send + 'static {
     /// The next frame, used once for the opening `auth` frame before the connection is split.
-    fn recv(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Option<Result<Message, TransportError>>> + Send + '_>>;
+    fn recv(&mut self) -> Received<'_>;
     /// Split into independent halves once the peer is authenticated.
     fn split(self) -> (Outgoing, Incoming)
     where
@@ -30,9 +32,7 @@ pub trait LiveTransport: Send + 'static {
 }
 
 impl LiveTransport for WebSocket {
-    fn recv(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Option<Result<Message, TransportError>>> + Send + '_>> {
+    fn recv(&mut self) -> Received<'_> {
         Box::pin(async move {
             WebSocket::recv(self)
                 .await

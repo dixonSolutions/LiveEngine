@@ -98,7 +98,7 @@ pub(crate) async fn authorize_route(
     state: &Arc<Inner>,
     auth: &ScopedAuth,
     request: &RouteRequest,
-) -> Result<usize, Response> {
+) -> Result<usize, Box<Response>> {
     let unauthorized = || error(StatusCode::UNAUTHORIZED, "unauthorized");
     let forbidden = || {
         error(
@@ -133,18 +133,18 @@ pub(crate) async fn authorize_route(
         current = child;
     }
     let Some(owner) = owner else {
-        return Err(unauthorized());
+        return Err(Box::new(unauthorized()));
     };
     if !ALLOWED_OPS.contains(&request.op.as_str()) {
-        return Err(forbidden());
+        return Err(Box::new(forbidden()));
     }
     // Forwarding state is set by this service; a client must not supply it.
     if request.inherited_schemas.is_some() || request.inherited_channels.is_some() {
-        return Err(forbidden());
+        return Err(Box::new(forbidden()));
     }
     // Templates are admin-owned defaults, including write-only credentials.
     if request.op == "register" && request.body.get("template").is_some() {
-        return Err(forbidden());
+        return Err(Box::new(forbidden()));
     }
     Ok(owner)
 }

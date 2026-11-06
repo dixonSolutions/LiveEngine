@@ -1712,7 +1712,7 @@ async fn route_endpoint(
         Some(axum::Extension(auth)) => {
             match crate::hosting::authorize_route(&state, &auth, &request).await {
                 Ok(owner) => Some((owner, auth.digest().to_owned())),
-                Err(refused) => return refused,
+                Err(refused) => return *refused,
             }
         }
     };
@@ -3870,11 +3870,112 @@ impl HubClient {
         .await
     }
 
+    /// Issue a live ticket for a user paired in a room of the hub `hub_id`. `path` names the
+    /// central namespace that holds the hub; the empty path targets the root. `role` is
+    /// `peer` or `service`. Pass `credential` for a hub that sets `auth`.
+    pub async fn ticket(
+        &self,
+        path: &[String],
+        hub_id: &str,
+        user_id: &str,
+        server_id: &str,
+        role: &str,
+        credential: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut body = serde_json::json!({"userId": user_id, "serverId": server_id, "role": role});
+        if let Some(credential) = credential {
+            body["credential"] = Value::String(credential.to_owned());
+        }
+        if path.is_empty() {
+            let id = encode_segment(hub_id);
+            return self
+                .request(
+                    reqwest::Method::POST,
+                    &format!("/v1/hubs/{id}/tickets"),
+                    Some(body),
+                )
+                .await;
+        }
+        body["id"] = Value::String(hub_id.to_owned());
+        self.route(path, "ticket", body).await
+    }
+
+    /// Issue a read-only watch ticket for the live registry, scoped to `path` and `depth`.
+    /// A browser holds this instead of the administrator token.
+    pub async fn watch_ticket(&self, path: &[String], depth: usize) -> Result<Value, String> {
+        self.request(
+            reqwest::Method::POST,
+            "/v1/tickets/watch",
+            Some(serde_json::json!({"path": path, "depth": depth})),
+        )
+        .await
+    }
+
+    /// Subscribe to the live registry at `path` and `depth` and pass each message (the
+    /// snapshot first, then ordered diffs) to `on_event`. Returns when `on_event` returns
+    /// `false`, or when the hub closes the stream. Authenticates with this client's token.
+    pub async fn watch(
+        &self,
+        path: &[String],
+        depth: usize,
+        mut on_event: impl FnMut(Value) -> bool,
+    ) -> Result<(), String> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+        let mut url = self.base.clone();
+        url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
+            .map_err(|_| "invalid hub address")?;
+        url.set_path("/v1/live/registry");
+        let request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|_| "invalid hub address")?;
+        let (mut socket, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        .map_err(|_| "hub connection timed out")?
+        .map_err(|_| "hub connection failed")?;
+        let auth = serde_json::json!({"type":"auth","token":self.token,"path":path,"depth":depth});
+        socket
+            .send(Message::Text(auth.to_string().into()))
+            .await
+            .map_err(|_| "hub connection failed")?;
+        while let Some(message) = socket.next().await {
+            match message.map_err(|_| "hub stream failed")? {
+                Message::Text(text) => {
+                    let value = serde_json::from_str(&text).map_err(|_| "invalid hub message")?;
+                    if !on_event(value) {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        let _ = socket.close(None).await;
+        Ok(())
+    }
+
     /// Export public registry definitions without credentials.
     pub async fn export_registry(&self) -> Result<Value, String> {
         self.request(reqwest::Method::GET, "/v1/registry/export", None)
             .await
     }
+}
+
+/// Percent-encode one path segment (everything but unreserved characters).
+fn encode_segment(segment: &str) -> String {
+    let mut out = String::new();
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

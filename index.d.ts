@@ -231,4 +231,144 @@ export declare class HubClient {
   remove(id: string): Promise<unknown>;
   call<T = unknown>(id: string, method: string, args?: unknown[], options?: { signal?: AbortSignal }): Promise<T>;
   importRegistry(registry: { address: string; token: string; prefix?: string; refreshSeconds?: number }): Promise<unknown>;
+  /** Issue a short-lived, single-use live ticket for a user already paired in `serverId`. */
+  ticket(id: string, options: TicketOptions): Promise<{ ticket: string; url: string; expiresAt: number }>;
+  /** Issue a read-only registry watch ticket scoped to a path and depth. */
+  watchTicket(options?: { path?: string[]; depth?: number }): Promise<{ ticket: string; expiresAt: number }>;
+  /** Find hubs and peers that match `requirements`. */
+  discover(options?: { kind?: 'hub' | 'peer' | 'any'; path?: string[]; depth?: number; requirements?: Record<string, unknown> }): Promise<{ candidates: DiscoveryCandidate[] }>;
+  /** Pair a subject with a hub or peer and return the descriptor for `LiveClient`. */
+  pair(request: PairRequest): Promise<LiveDescriptor>;
+  /** A `renew` function for `LiveClient` that pairs again with `request` for a fresh ticket. */
+  renewal(request: PairRequest): LiveRenew;
+  /** Subscribe to the live registry. Resolves after the first snapshot. */
+  watchRegistry(options?: WatchRegistryOptions): Promise<RegistryWatch>;
+}
+export interface TicketOptions {
+  userId: string;
+  serverId: string;
+  role?: 'peer' | 'service';
+  /** The user's credential for a hub that sets `auth`. */
+  credential?: string;
+  /** Central namespace that holds the hub. Default: the root. */
+  path?: string[];
+}
+export interface DiscoveryCandidate { kind: 'hub' | 'peer'; id: string; path: string[]; [key: string]: unknown; }
+export interface PairRequest {
+  subject: { id: string; kind?: 'peer' | 'hub'; scopes?: Record<string, unknown>; credential?: string };
+  target?: { kind: 'hub' | 'peer' | 'any'; requirements?: Record<string, unknown> };
+  path?: string[];
+  /** The subject's credential for a hub that sets `auth`. Overrides `subject.credential`. */
+  credential?: string;
+}
+/** What `pair` returns and `LiveClient` consumes. */
+export interface LiveDescriptor {
+  link: 'peer-peer' | 'peer-hub' | 'hub-hub';
+  room: string;
+  /** The id this subject has in the room. */
+  userId: string;
+  ticket: string;
+  /** WebSocket URL of the hub that holds the room. */
+  url: string;
+  transports: Array<'webrtc' | 'websocket'>;
+}
+export type LiveRenew = (context?: { credential?: string; previous?: LiveDescriptor }) => Promise<LiveDescriptor>;
+export interface WatchRegistryOptions {
+  path?: string[];
+  depth?: number;
+  /** A watch ticket from `watchTicket`; without it the client's token authenticates the watch. */
+  ticket?: string;
+  timeoutMs?: number;
+  WebSocket?: typeof WebSocket;
+}
+export interface RegistryMessage { type: 'snapshot' | 'added' | 'removed' | 'updated' | 'status'; seq: number; path: string[]; [key: string]: unknown; }
+export declare class RegistryWatch extends EventEmitter {
+  /** The latest snapshot message. */
+  snapshot: RegistryMessage | null;
+  seq: number;
+  closed: boolean;
+  resnapshot(): void;
+  close(): void;
+  on(event: RegistryMessage['type'] | 'event', listener: (message: RegistryMessage) => void): this;
+  on(event: 'close', listener: () => void): this;
+}
+
+/** Options for `LiveClient`, imported from `@dixonsolutions/liveengine/live-client`. */
+export interface LiveClientOptions {
+  /** The user's credential, or a function that returns a fresh one, handed to `renew`. */
+  credential?: string | (() => string | Promise<string>);
+  /** Returns a fresh descriptor (a new ticket) when the first is spent. Run it where the administrator token lives. */
+  renew?: LiveRenew;
+  /** `"auto"` (default) connects directly only for peer-to-peer pairings; `true` forces, `false` disables. */
+  direct?: 'auto' | boolean;
+  /** Reconnect when the hub connection drops. Default true. */
+  reconnect?: boolean;
+  retries?: number;
+  retryBaseMs?: number;
+  retryMaxMs?: number;
+  connectTimeoutMs?: number;
+  directTimeoutMs?: number;
+  maxFrameBytes?: number;
+  queueLimit?: number;
+  WebSocket?: typeof WebSocket;
+  RTCPeerConnection?: typeof RTCPeerConnection;
+}
+export interface LiveFrame {
+  v: number;
+  type: string;
+  channel: string;
+  from: string;
+  to?: string;
+  seq: number;
+  payload: unknown;
+  /** How the frame arrived. */
+  via: 'relay' | 'direct';
+}
+export interface LiveSendOptions { to?: string; channel?: string; type?: string; }
+export interface LiveClientEvents {
+  open: { reconnected: boolean };
+  welcome: { peers: string[]; iceServers: unknown[]; identity: unknown };
+  message: LiveFrame;
+  presence: { event: 'join' | 'leave'; peer: string; identity?: unknown };
+  transport: { peer: string; transport: 'direct' | 'relay'; reason?: string };
+  'direct-failed': { peer: string; reason: string };
+  reconnecting: { attempt: number; delayMs: number; error: Error };
+  disconnected: { reconnecting: boolean };
+  close: { reason: string; reconnecting: boolean; error?: Error };
+  error: Error;
+}
+export interface PeerLink {
+  readonly peer: string;
+  readonly polite: boolean;
+  readonly transport: 'direct' | 'relay';
+  readonly closed: boolean;
+  readonly failure: string | null;
+  /** Resolves with the first transport that settles: "direct" once the channel opens, else "relay". */
+  readonly ready: Promise<'direct' | 'relay'>;
+  send(frame: object): boolean;
+  close(): void;
+}
+/** Connection to a hub room with relay, direct WebRTC and reconnect handled for the caller. */
+export interface LiveClient {
+  readonly id: string;
+  readonly room: string;
+  readonly state: 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed';
+  readonly iceServers: unknown[];
+  readonly identity: unknown;
+  on<E extends keyof LiveClientEvents>(event: E, listener: (data: LiveClientEvents[E]) => void): () => void;
+  off<E extends keyof LiveClientEvents>(event: E, listener: (data: LiveClientEvents[E]) => void): this;
+  once<E extends keyof LiveClientEvents>(event: E, listener: (data: LiveClientEvents[E]) => void): () => void;
+  peers(): string[];
+  identityOf(peerId: string): unknown;
+  transportOf(peerId: string): 'direct' | 'relay' | null;
+  connect(): Promise<this>;
+  reconnect(): Promise<this>;
+  connectPeer(peerId: string, options?: ConnectPeerOptions): PeerLink;
+  send(payload: unknown, options?: LiveSendOptions): boolean;
+  close(): void;
+}
+export interface ConnectPeerOptions {
+  RTCPeerConnection?: typeof RTCPeerConnection;
+  iceServers?: unknown[];
+  directTimeoutMs?: number;
 }

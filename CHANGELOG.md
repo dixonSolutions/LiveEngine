@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add the dependency-free `LiveClient` (`@dixonsolutions/liveengine/live-client`), which connects from a pairing descriptor, retries and renews tickets, and opens WebRTC data channels with automatic fallback to the hub relay. `HubClient` gains `ticket`, `watchTicket`, `watchRegistry`, `discover`, `pair` and `renewal`, all accepting an optional credential. `pair` responses include `userId`. The Rust `HubClient` and the CLI gain `ticket`, `watch-ticket` and `watch`.
+
+- Make `cargo clippy --all-targets -- -D warnings` clean.
+
 - Add provider-hosted hubs with a hub-scoped credential, carry verified identity and claims into tickets, welcome and presence, verify a pairing credential once, and put the live transport behind a trait.
 
 - Preserve inherited live channel policies and referenced schemas when issuing tickets through remote centrals.

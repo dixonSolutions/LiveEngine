@@ -309,7 +309,7 @@ async fn routed(
     op: &str,
     body: Value,
     inherited: [Option<Value>; 3],
-) -> Result<Value, Response> {
+) -> Result<Value, Box<Response>> {
     routed_with_channels(state, headers, path, op, body, inherited, None).await
 }
 
@@ -321,7 +321,7 @@ async fn routed_with_channels(
     body: Value,
     inherited: [Option<Value>; 3],
     inherited_channels: Option<crate::live::ChannelPolicy>,
-) -> Result<Value, Response> {
+) -> Result<Value, Box<Response>> {
     let response = Box::pin(route_hub(
         State(state.clone()),
         headers,
@@ -335,13 +335,13 @@ async fn routed_with_channels(
     ))
     .await;
     if !response.status().is_success() {
-        return Err(response);
+        return Err(Box::new(response));
     }
     let bytes = axum::body::to_bytes(response.into_body(), state.config.max_response_bytes)
         .await
-        .map_err(|_| error(StatusCode::BAD_GATEWAY, "invalid pairing response"))?;
+        .map_err(|_| Box::new(error(StatusCode::BAD_GATEWAY, "invalid pairing response")))?;
     serde_json::from_slice(&bytes)
-        .map_err(|_| error(StatusCode::BAD_GATEWAY, "invalid pairing response"))
+        .map_err(|_| Box::new(error(StatusCode::BAD_GATEWAY, "invalid pairing response")))
 }
 
 pub(crate) async fn pair(
@@ -507,7 +507,7 @@ pub(crate) async fn pair(
         .await
         {
             Ok(v) => v["result"]["scopes"].clone(),
-            Err(e) => return e,
+            Err(e) => return *e,
         }
     } else {
         match routed(
@@ -521,7 +521,7 @@ pub(crate) async fn pair(
         .await
         {
             Ok(v) => v["scopes"].clone(),
-            Err(e) => return e,
+            Err(e) => return *e,
         }
     };
     let room = if peer {
@@ -547,7 +547,7 @@ pub(crate) async fn pair(
                 }
                 v["result"]["serverId"].as_str().map(str::to_owned)
             }
-            Err(e) => return e,
+            Err(e) => return *e,
         }
     } else {
         None
@@ -569,7 +569,7 @@ pub(crate) async fn pair(
     .await
     {
         Ok(v) => v,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let proof = match checked.get("receipt").and_then(Value::as_str) {
         Some(receipt) => json!({"verified":receipt}),
@@ -592,7 +592,7 @@ pub(crate) async fn pair(
         )
         .await;
         if let Err(e) = result {
-            return e;
+            return *e;
         }
     } else {
         if existing.is_none() {
@@ -607,7 +607,7 @@ pub(crate) async fn pair(
             )
             .await
             {
-                return e;
+                return *e;
             }
         }
         let user =
@@ -622,7 +622,7 @@ pub(crate) async fn pair(
         )
         .await
         {
-            return e;
+            return *e;
         }
         let current = match routed(
             state.clone(),
@@ -635,7 +635,7 @@ pub(crate) async fn pair(
         .await
         {
             Ok(v) => v,
-            Err(e) => return e,
+            Err(e) => return *e,
         };
         if current["result"]["serverId"] != room {
             let joined = match routed(
@@ -649,7 +649,7 @@ pub(crate) async fn pair(
             .await
             {
                 Ok(v) => v,
-                Err(e) => return e,
+                Err(e) => return *e,
             };
             if joined["result"]["ok"] != true {
                 return error(StatusCode::CONFLICT, "subject could not join");
@@ -674,14 +674,14 @@ pub(crate) async fn pair(
     .await
     {
         Ok(v) => v,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let link = match (kind, peer) {
         ("peer", true) => "peer-peer",
         ("hub", false) => "hub-hub",
         _ => "peer-hub",
     };
-    Json(json!({"link":link,"room":room,"ticket":ticket["ticket"],"url":ticket["url"],"transports":["webrtc","websocket"]})).into_response()
+    Json(json!({"link":link,"room":room,"userId":id,"ticket":ticket["ticket"],"url":ticket["url"],"transports":["webrtc","websocket"]})).into_response()
 }
 
 fn call_for(id: &str, method: &str, args: Vec<Value>) -> Value {

@@ -29,6 +29,8 @@
   },
   "files": [
     "lib",
+    "lib/live-client.mjs",
+    "lib/live-client.d.mts",
     "native/*.node",
     "native/liveengine-hub.*",
     "src/**/*.rs",
@@ -51,7 +53,7 @@
     "build": "node scripts/build.js",
     "build:debug": "node scripts/build.js --debug",
     "build:hub": "node scripts/build-hub.js",
-    "test": "node --test test/engine.test.js test/math-game.test.js test/hub-client.test.js",
+    "test": "node --test test/engine.test.js test/math-game.test.js test/hub-client.test.js test/live-client.test.mjs",
     "test:rust": "cargo test --locked",
     "test:all": "npm run test:rust && npm test && npm run test:integration",
     "bench": "node bench/bench.js",
@@ -78,6 +80,11 @@
       "types": "./lib/hubs.d.ts",
       "require": "./lib/hubs.js",
       "default": "./lib/hubs.js"
+    },
+    "./live-client": {
+      "types": "./lib/live-client.d.mts",
+      "import": "./lib/live-client.mjs",
+      "default": "./lib/live-client.mjs"
     },
     "./package.json": "./package.json"
   }

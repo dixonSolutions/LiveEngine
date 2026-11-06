@@ -447,35 +447,34 @@ async fn jwt_hs256_hub_refuses_other_algorithms_and_none() {
 }
 
 /// A tiny webhook the tests control: returns (url, requests seen).
-async fn webhook(
-    status: u16,
-    body: &'static str,
-    delay: Duration,
-) -> (String, Arc<Mutex<Vec<(Option<String>, Value)>>>) {
+/// Every webhook request seen: the authorization header and the JSON body.
+type Seen = Arc<Mutex<Vec<(Option<String>, Value)>>>;
+async fn webhook(status: u16, body: &'static str, delay: Duration) -> (String, Seen) {
     use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
-    let seen: Arc<Mutex<Vec<(Option<String>, Value)>>> = Arc::default();
-    let app = Router::new()
-        .route(
-            "/check",
-            post(
-                move |State(seen): State<Arc<Mutex<Vec<(Option<String>, Value)>>>>,
-                      headers: HeaderMap,
-                      Json(request): Json<Value>| async move {
-                    let authorization = headers
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_owned);
-                    seen.lock().unwrap().push((authorization, request));
-                    tokio::time::sleep(delay).await;
-                    (
-                        axum::http::StatusCode::from_u16(status).unwrap(),
-                        [("content-type", "application/json")],
-                        body,
-                    )
-                },
-            ),
-        )
-        .with_state(seen.clone());
+    let seen: Seen = Arc::default();
+    let app =
+        Router::new()
+            .route(
+                "/check",
+                post(
+                    move |State(seen): State<Seen>,
+                          headers: HeaderMap,
+                          Json(request): Json<Value>| async move {
+                        let authorization = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        seen.lock().unwrap().push((authorization, request));
+                        tokio::time::sleep(delay).await;
+                        (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            [("content-type", "application/json")],
+                            body,
+                        )
+                    },
+                ),
+            )
+            .with_state(seen.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/check", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

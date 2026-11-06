@@ -561,7 +561,7 @@ pub(crate) async fn authorize(
     room: &str,
     role: &str,
     credential: Option<&str>,
-) -> Result<Option<PeerIdentity>, Response> {
+) -> Result<Option<PeerIdentity>, Box<Response>> {
     let Some(config) = config else {
         return Ok(None);
     };
@@ -572,13 +572,13 @@ pub(crate) async fn authorize(
                 claims: verified.claims,
             };
             if !identity.within_limits() {
-                return Err(error(
+                return Err(Box::new(error(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "identity claims exceed the live limit",
-                ));
+                )));
             }
             Ok(Some(identity))
         }
-        Err(_) => Err(error(StatusCode::FORBIDDEN, "credential refused")),
+        Err(_) => Err(Box::new(error(StatusCode::FORBIDDEN, "credential refused"))),
     }
 }

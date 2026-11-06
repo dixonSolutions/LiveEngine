@@ -446,23 +446,25 @@ async fn connect(state: Arc<Inner>, entry: &Arc<Entry>) -> bool {
     let mut bytes = 0usize;
     let mut count = 0usize;
     let mut last_frame = tokio::time::Instant::now();
-    while healthy {
-        tokio::select! {
-            _ = tick.tick() => { if last_frame.elapsed() > Duration::from_secs(60) { break; } let Some(state) = weak.upgrade() else { break }; if !present(&state, entry).await { let _ = socket.close(None).await; break; } },
-            queued = async { match rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => { match queued { Some(message) => { if let Some(message) = wire(message) { if socket.send(message).await.is_err() { break; } } }, None => break } },
-            _ = async { match disconnected.as_mut() { Some(d) => { let _ = d.changed().await; }, None => std::future::pending().await } } => break,
-            msg = socket.next() => { last_frame = tokio::time::Instant::now(); match msg { Some(Ok(Message::Text(s))) => {
-                if window.elapsed() >= Duration::from_secs(1) { window = tokio::time::Instant::now(); bytes = 0; count = 0; }
-                bytes += s.len(); count += 1;
-                let (max_count, max_bytes) = if bridge.is_some() { live::link_budget() } else { (100, 1_048_576) };
-                if bytes > max_bytes || (count > max_count && bridge.is_none()) { break; }
-                let over_budget = count > max_count;
-                if let (Some(key), Ok(value)) = (&bridge, serde_json::from_str::<serde_json::Value>(&s)) {
-                    // Ordinary room frames are not carried; only the two link frame types are.
-                    if !matches!(value["type"].as_str(), Some("link.frame" | "link.presence")) { continue; }
-                    if let Some(state) = weak.upgrade() { live::ingest(&state, key, &name, &value, None, over_budget).await; }
-                }
-            }, Some(Ok(Message::Ping(data))) => { if socket.send(Message::Pong(data)).await.is_err() { break; } }, Some(Ok(Message::Pong(_))) => {}, _ => break } }
+    if healthy {
+        loop {
+            tokio::select! {
+                _ = tick.tick() => { if last_frame.elapsed() > Duration::from_secs(60) { break; } let Some(state) = weak.upgrade() else { break }; if !present(&state, entry).await { let _ = socket.close(None).await; break; } },
+                queued = async { match rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => { match queued { Some(message) => { if let Some(message) = wire(message) { if socket.send(message).await.is_err() { break; } } }, None => break } },
+                _ = async { match disconnected.as_mut() { Some(d) => { let _ = d.changed().await; }, None => std::future::pending().await } } => break,
+                msg = socket.next() => { last_frame = tokio::time::Instant::now(); match msg { Some(Ok(Message::Text(s))) => {
+                    if window.elapsed() >= Duration::from_secs(1) { window = tokio::time::Instant::now(); bytes = 0; count = 0; }
+                    bytes += s.len(); count += 1;
+                    let (max_count, max_bytes) = if bridge.is_some() { live::link_budget() } else { (100, 1_048_576) };
+                    if bytes > max_bytes || (count > max_count && bridge.is_none()) { break; }
+                    let over_budget = count > max_count;
+                    if let (Some(key), Ok(value)) = (&bridge, serde_json::from_str::<serde_json::Value>(&s)) {
+                        // Ordinary room frames are not carried; only the two link frame types are.
+                        if !matches!(value["type"].as_str(), Some("link.frame" | "link.presence")) { continue; }
+                        if let Some(state) = weak.upgrade() { live::ingest(&state, key, &name, &value, None, over_budget).await; }
+                    }
+                }, Some(Ok(Message::Ping(data))) => { if socket.send(Message::Pong(data)).await.is_err() { break; } }, Some(Ok(Message::Pong(_))) => {}, _ => break } }
+            }
         }
     }
     if let (Some(key), Some(state)) = (&bridge, weak.upgrade()) {
