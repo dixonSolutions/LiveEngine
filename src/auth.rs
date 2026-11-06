@@ -5,6 +5,7 @@
 //! resolves to an identity plus user-defined claims before a ticket is issued. Core never
 //! interprets claims. Secrets are persisted with the hub definition and never returned.
 use crate::hub::{error, validated_remote_url, Inner};
+use crate::live::PeerIdentity;
 use axum::{http::StatusCode, response::Response};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ring::{digest, hmac, signature};
@@ -550,7 +551,8 @@ pub(crate) async fn verify(
     Ok(identity)
 }
 
-/// Gate used before a ticket is issued. Any failure is the same opaque refusal.
+/// Gate used before a ticket is issued. Any failure is the same opaque refusal. A hub
+/// without `auth` yields `None`; otherwise the verified identity, bounded for live use.
 pub(crate) async fn authorize(
     state: &Inner,
     config: Option<&AuthConfig>,
@@ -559,10 +561,24 @@ pub(crate) async fn authorize(
     room: &str,
     role: &str,
     credential: Option<&str>,
-) -> Result<(), Response> {
-    let Some(config) = config else { return Ok(()) };
+) -> Result<Option<PeerIdentity>, Response> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
     match verify(state, config, hub, user, room, role, credential).await {
-        Ok(_) => Ok(()),
+        Ok(verified) => {
+            let identity = PeerIdentity {
+                identity: verified.identity,
+                claims: verified.claims,
+            };
+            if !identity.within_limits() {
+                return Err(error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "identity claims exceed the live limit",
+                ));
+            }
+            Ok(Some(identity))
+        }
         Err(_) => Err(error(StatusCode::FORBIDDEN, "credential refused")),
     }
 }

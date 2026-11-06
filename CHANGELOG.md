@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add provider-hosted hubs with a hub-scoped credential, carry verified identity and claims into tickets, welcome and presence, verify a pairing credential once, and put the live transport behind a trait.
+
 - Preserve inherited live channel policies and referenced schemas when issuing tickets through remote centrals.
 
 - Add persistent ticket-authenticated service links with connection status and retry budgets.

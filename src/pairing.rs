@@ -556,7 +556,9 @@ pub(crate) async fn pair(
     // A hub that sets `auth` must accept the subject's credential before membership changes.
     let role = if kind == "hub" { "service" } else { "peer" };
     let credential = subject.get("credential").cloned().unwrap_or(Value::Null);
-    if let Err(e) = routed(
+    // The credential is checked here once. A hub that verified it returns a receipt, which
+    // the ticket step uses in place of the credential, so a single-use credential works.
+    let checked = match routed(
         state.clone(),
         headers.clone(),
         path.clone(),
@@ -566,8 +568,13 @@ pub(crate) async fn pair(
     )
     .await
     {
-        return e;
-    }
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let proof = match checked.get("receipt").and_then(Value::as_str) {
+        Some(receipt) => json!({"verified":receipt}),
+        None => json!({"credential":credential}),
+    };
     if peer {
         let result = routed(
             state.clone(),
@@ -654,7 +661,13 @@ pub(crate) async fn pair(
         headers,
         path,
         "ticket",
-        json!({"id":hub_id,"userId":id,"serverId":room,"role":role,"credential":credential}),
+        {
+            let mut body = json!({"id":hub_id,"userId":id,"serverId":room,"role":role});
+            body.as_object_mut()
+                .unwrap()
+                .extend(proof.as_object().cloned().unwrap_or_default());
+            body
+        },
         inherited,
         inherited_channels,
     )

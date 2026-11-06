@@ -4,6 +4,8 @@
 pub mod auth;
 pub mod engine;
 #[cfg(feature = "host")]
+pub mod hosting;
+#[cfg(feature = "host")]
 pub mod hub;
 #[cfg(feature = "host")]
 pub mod links;
@@ -16,6 +18,8 @@ mod node;
 #[cfg(feature = "host")]
 pub mod pairing;
 pub mod rules;
+#[cfg(feature = "host")]
+pub mod transport;
 
 pub use engine::Engine;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

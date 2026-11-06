@@ -394,7 +394,17 @@ pub struct HubSpec {
     /// Credential verifier definition, for example `{"kind":"jwt","alg":"HS256","secret":"..."}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<Value>,
+    /// `"provider"` runs a central on this service and returns a hub-scoped credential;
+    /// create such a hub with `HubService::register_hosted`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosting: Option<String>,
     pub if_absent: bool,
+}
+
+/// A provider-hosted hub and the credential that manages it and its subtree.
+pub struct HostedHub {
+    pub info: HubInfo,
+    pub credential: String,
 }
 
 /// User-defined relay channel settings.
@@ -483,6 +493,8 @@ pub(crate) struct HubRecord {
     pub(crate) link_credentials: Vec<String>,
     /// Credential verifier with its secrets; only its kind is ever published.
     pub(crate) auth: Option<crate::auth::AuthConfig>,
+    /// SHA-256 hex digest of the hub-scoped credential of a provider-hosted hub.
+    pub(crate) hosted_credential: Option<String>,
     pub(crate) child: Option<Arc<Inner>>,
     custom: bool,
     _slot: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -658,6 +670,33 @@ impl HubService {
 
     /// Register a hub using the same validation and behavior as the HTTP API.
     pub async fn register(&self, spec: HubSpec) -> Result<HubInfo, String> {
+        if spec.hosting.is_some() {
+            return Err("use register_hosted to create a provider-hosted hub".into());
+        }
+        serde_json::from_value(self.register_value(spec).await?)
+            .map_err(|_| "invalid registration response".to_string())
+    }
+
+    /// Create a hub with `hosting` set to `"provider"`: a central that runs on this service.
+    /// The credential manages only that hub and its subtree and is returned once; only a
+    /// digest is kept.
+    pub async fn register_hosted(&self, mut spec: HubSpec) -> Result<HostedHub, String> {
+        spec.mode.get_or_insert(HubMode::Central);
+        if spec.hosting.as_deref() != Some("provider") {
+            return Err("register_hosted requires hosting=provider".into());
+        }
+        let value = self.register_value(spec).await?;
+        let credential = value
+            .get("credential")
+            .and_then(Value::as_str)
+            .ok_or("hub already exists, so no credential was issued")?
+            .to_owned();
+        let info = serde_json::from_value(value)
+            .map_err(|_| "invalid registration response".to_string())?;
+        Ok(HostedHub { info, credential })
+    }
+
+    async fn register_value(&self, spec: HubSpec) -> Result<Value, String> {
         use tower::ServiceExt;
         let mut value = serde_json::to_value(spec).map_err(|_| "invalid registration")?;
         if value["scopes"].is_null() {
@@ -719,7 +758,7 @@ impl HubService {
                 "/v1/tickets/watch",
                 post(crate::live_registry::watch_ticket),
             )
-            .route("/v1/route", post(route_hub))
+            .route("/v1/route", post(route_endpoint))
             .route("/v1/discover", post(crate::pairing::discover_endpoint))
             .route("/v1/pair", post(crate::pairing::pair_endpoint))
             .route(
@@ -765,6 +804,9 @@ impl HubService {
     /// Add a custom internal hub handler to this registry. Custom handlers use
     /// the same request, response, argument, rate, and event result checks as
     /// built-in engines.
+    ///
+    /// `HubRegistration` has no `auth`: a hub added here accepts tickets without a
+    /// credential. Auth is set only through `HubSpec::auth`, with `register` or the HTTP API.
     pub async fn register_internal<H>(
         &self,
         registration: HubRegistration,
@@ -821,6 +863,7 @@ impl HubService {
             remote_token: None,
             link_credentials: Vec::new(),
             auth: None,
+            hosted_credential: None,
             child: None,
             custom: true,
             _slot: None,
@@ -887,6 +930,8 @@ struct SavedHub {
     link_credentials: Vec<String>,
     #[serde(default)]
     auth: Option<crate::auth::AuthConfig>,
+    #[serde(default)]
+    hosted_credential: Option<String>,
     expires_at: Option<u64>,
     children: Vec<SavedHub>,
     #[serde(default)]
@@ -965,6 +1010,13 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
         .map_err(|_| "state initialization failed")?;
     for saved in saved {
         let info = saved.info;
+        if saved.hosted_credential.as_deref().is_some_and(|digest| {
+            !crate::hosting::valid_digest(digest)
+                || info.mode != HubMode::Central
+                || info.address.is_some()
+        }) {
+            return Err("invalid state file hosted credential".into());
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "invalid clock")?
@@ -1069,6 +1121,7 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
             remote_token: saved.remote_token,
             link_credentials: saved.link_credentials,
             auth: saved.auth,
+            hosted_credential: saved.hosted_credential,
             custom: saved.custom,
             child,
             _slot: Some(Arc::new(slot)),
@@ -1109,6 +1162,7 @@ fn snapshot_hubs(
                 remote_token: record.remote_token,
                 link_credentials: record.link_credentials,
                 auth: record.auth,
+                hosted_credential: record.hosted_credential,
                 expires_at,
                 children,
                 custom: record.custom,
@@ -1376,17 +1430,23 @@ async fn secure_request(
     let equal = bool::from(supplied.len().ct_eq(&expected.len())) && difference == 0;
     let mut request = request;
     if !equal {
-        let Some(auth) = crate::links::credential_auth(
+        if let Some(auth) = crate::links::credential_auth(
             &state,
             request.method(),
             request.uri().path(),
             request.headers(),
         )
         .await
-        else {
+        {
+            request.extensions_mut().insert(auth);
+        } else if let Some(scoped) =
+            crate::hosting::candidate(request.method(), request.uri().path(), request.headers())
+        {
+            // Accepted only for `POST /v1/route`, which still matches it to a hub and path.
+            request.extensions_mut().insert(scoped);
+        } else {
             return error(StatusCode::UNAUTHORIZED, "unauthorized");
-        };
-        request.extensions_mut().insert(auth);
+        }
     }
     if header_depth(request.headers()).is_none() {
         return error(StatusCode::BAD_REQUEST, "invalid forwarding depth");
@@ -1636,14 +1696,49 @@ pub(crate) struct RouteRequest {
     pub(crate) inherited_channels: Option<crate::live::ChannelPolicy>,
 }
 
-pub(crate) async fn route_hub(
-    State(mut state): State<Arc<Inner>>,
-    mut headers: HeaderMap,
+/// `POST /v1/route`. An admin request routes freely; a request that presented only a
+/// hub-scoped credential must pass `hosting::authorize_route` first.
+async fn route_endpoint(
+    State(state): State<Arc<Inner>>,
+    scoped: Option<axum::Extension<crate::hosting::ScopedAuth>>,
+    headers: HeaderMap,
     payload: Result<Json<RouteRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Ok(Json(request)) = payload else {
         return error(StatusCode::BAD_REQUEST, "invalid route request");
     };
+    let scope = match scoped {
+        None => None,
+        Some(axum::Extension(auth)) => {
+            match crate::hosting::authorize_route(&state, &auth, &request).await {
+                Ok(owner) => Some((owner, auth.digest().to_owned())),
+                Err(refused) => return refused,
+            }
+        }
+    };
+    route_scoped(state, headers, request, scope).await
+}
+
+pub(crate) async fn route_hub(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    payload: Result<Json<RouteRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = payload else {
+        return error(StatusCode::BAD_REQUEST, "invalid route request");
+    };
+    route_scoped(state, headers, request, None).await
+}
+
+/// Route a request. With `scope` (owner index and credential digest), the walk checks again
+/// that the hub at that index still holds the credential, so a hub deleted and recreated
+/// between the scope check and the walk does not inherit it.
+async fn route_scoped(
+    mut state: Arc<Inner>,
+    mut headers: HeaderMap,
+    request: RouteRequest,
+    scope: Option<(usize, String)>,
+) -> Response {
     let mut inherited = request.inherited_schemas.clone().unwrap_or_default();
     let mut inherited_channels = request.inherited_channels.clone();
     if inherited_channels
@@ -1675,6 +1770,13 @@ pub(crate) async fn route_hub(
         };
         if record.info.mode != HubMode::Central {
             return error(StatusCode::NOT_FOUND, "central hub not found");
+        }
+        if let Some((owner, digest)) = &scope {
+            if index == *owner
+                && !crate::hosting::matches(record.hosted_credential.as_deref(), digest)
+            {
+                return error(StatusCode::UNAUTHORIZED, "unauthorized");
+            }
         }
         inherited = merge_schemas(&state, &record.info, &inherited).await;
         if let Some(channels) = &record.info.channels {
@@ -2301,6 +2403,25 @@ async fn register_hub_inherited(
             return error(StatusCode::BAD_REQUEST, &message);
         }
     }
+    // `"hosting":"provider"` runs the central on this service and returns a credential that
+    // manages only that hub and its subtree. Only its digest is kept.
+    let hosted = match object.remove("hosting") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(kind)) if kind == "provider" => {
+            if object.get("mode").and_then(Value::as_str) != Some("central")
+                || ["address", "remoteToken", "remoteHubId"]
+                    .iter()
+                    .any(|key| object.get(*key).is_some_and(|v| !v.is_null()))
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "provider hosting requires a central hub without address or remote credentials",
+                );
+            }
+            Some(crate::hosting::mint())
+        }
+        _ => return error(StatusCode::BAD_REQUEST, "invalid hosting"),
+    };
     let user_schema = object.remove("userSchema");
     let server_schema = object.remove("serverSchema");
     let channels = match parse_channels(object.remove("channels"), &state).await {
@@ -2465,6 +2586,7 @@ async fn register_hub_inherited(
         remote_token: reg.remote_token,
         link_credentials: Vec::new(),
         auth,
+        hosted_credential: hosted.as_ref().map(|(_, digest)| digest.clone()),
         custom: false,
         child,
         _slot: None,
@@ -2492,7 +2614,13 @@ async fn register_hub_inherited(
     let mut record = record;
     record._slot = Some(Arc::new(slot));
     hubs.insert(id, record.clone());
-    (StatusCode::CREATED, Json(public_info(&record))).into_response()
+    let mut body = serde_json::to_value(public_info(&record)).unwrap_or(Value::Null);
+    if let (Some((credential, _)), Some(object)) = (hosted, body.as_object_mut()) {
+        // Returned once, here. It cannot be read back.
+        object.insert("hosting".into(), "provider".into());
+        object.insert("credential".into(), credential.into());
+    }
+    (StatusCode::CREATED, Json(body)).into_response()
 }
 
 async fn import_registry(
@@ -2701,6 +2829,7 @@ async fn import_registry(
             remote_token: Some(request.token.clone()),
             link_credentials: Vec::new(),
             auth: None,
+            hosted_credential: None,
             child: None,
             custom: false,
             _slot: None,

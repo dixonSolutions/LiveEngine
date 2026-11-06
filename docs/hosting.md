@@ -128,6 +128,45 @@ name it are created; nested centrals share the registry. Secrets are persisted i
 state file like remote tokens and are never returned by any route or the export;
 `GET /v1/hubs/{id}` shows only `auth: {"kind": ...}`.
 
+A hub registered with `HubSpec::auth` (through `HubService::register` or the HTTP API) is
+the only way to set `auth`. `HubRegistration`, and so `register_internal`, has no `auth`
+field: a compiled handler added with `register_internal` accepts tickets without a
+credential. The verified identity and claims travel with the connection: they are signed
+into the ticket, and the welcome frame carries `identity` (`{identity, claims}`) for the
+connecting peer and `peerIdentities` (keyed by peer id) for peers on the same hub, while a
+`presence` join carries `identity` for the peer that joined. Claims stay opaque and are
+limited to 2048 bytes serialized; a credential that resolves to more is refused with `413`.
+Identities are not carried across hub links, and a ticket for a hub forwarded to another
+service carries the identity only when that service verified the credential.
+`POST /v1/pair` checks the credential once: the `authorize` route operation returns a
+short-lived, single-use `receipt` bound to hub, room, user and role, and the ticket step
+accepts it as `verified` instead of the credential, so a single-use credential works.
+
+### Provider-hosted hubs
+
+`POST /v1/hubs` (or the `register` route operation on a central) with `"hosting":"provider"`
+and `"mode":"central"` runs the new hub on this service and returns a hub-scoped credential
+once, as `credential`. Only its SHA-256 digest is stored, in the state file. In Rust use
+`HubService::register_hosted`. The credential manages only that hub and its subtree, and
+is default deny:
+
+- It is accepted on `POST /v1/route` and nowhere else. Schemas, templates, links, export,
+  import, `/v1/tree`, `/v1/hubs`, `/v1/hubs/{id}` and every other route answer `401`.
+- The request `path` must start with the owning hub's full path. A sibling, a parent and the
+  service root are refused. Path segments are matched exactly against hub ids, never
+  normalised. The owner is found by walking local centrals only, so a credential is never
+  forwarded to a remote central before it has matched inside the subtree.
+- Only these operations run: `discover`, `pair`, `tree`, `register`, `list`, `get`,
+  `delete`, `watchTicket`, `ticket`, `authorize` and `call`. Any other operation, a
+  `register` that names a `template`, and the forwarding fields `inherited_schemas` and
+  `inherited_channels` answer `403`.
+- Digests are compared in constant time. Deleting the hub ends the credential; a hub
+  created again under the same id gets a new one. A hosted hub's holder can create nested
+  hosted hubs, whose credentials are narrower.
+
+Live transport sits behind `liveengine::transport::LiveTransport`; the built-in one is the
+axum WebSocket.
+
 Live room connections use `GET /v1/live` as a WebSocket endpoint. Send the
 single-use ticket in the first JSON text frame as `{"type":"auth","ticket":"..."}`
 within five seconds; do not put it in the URL. Set

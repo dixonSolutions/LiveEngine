@@ -59,6 +59,10 @@
         "auth": {
           "$ref": "#/$defs/AuthDefinition"
         },
+        "hosting": {
+          "const": "provider",
+          "description": "Central hubs only. Runs the hub on this service and returns a hub-scoped credential once, as `credential`, that manages only this hub and its subtree through POST /v1/route."
+        },
         "scopeSchema": {
           "description": "JSON Schema draft 2020-12 for scopes; only local references are allowed.",
           "type": [
@@ -575,6 +579,10 @@
         },
         "auth": {
           "$ref": "#/$defs/AuthDefinition"
+        },
+        "hosting": {
+          "const": "provider",
+          "description": "Central hubs only. Runs the hub on this service and returns a hub-scoped credential once, as `credential`, that manages only this hub and its subtree through POST /v1/route."
         },
         "scopeSchema": {
           "description": "JSON Schema draft 2020-12 for scopes; only local references are allowed.",

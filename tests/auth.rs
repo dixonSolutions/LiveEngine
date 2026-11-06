@@ -758,3 +758,529 @@ async fn pairing_checks_the_credential_before_changing_membership() {
     assert!(body["ticket"].is_string());
     assert!(!body.to_string().contains(good));
 }
+
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+/// Connect with a ticket and return the socket with its welcome frame.
+async fn join(base: &str, ticket: &str) -> (Socket, Value) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "{}/v1/live",
+        base.replacen("http://", "ws://", 1)
+    ))
+    .await
+    .unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"auth","ticket":ticket}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    (
+        socket,
+        serde_json::from_str(&frame.into_text().unwrap()).unwrap(),
+    )
+}
+async fn next_presence(socket: &mut Socket) -> Value {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("no presence frame")
+            .unwrap()
+            .unwrap();
+        if let Message::Text(text) = frame {
+            let value: Value = serde_json::from_str(&text).unwrap();
+            if value["type"] == "presence" {
+                return value;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn verified_identity_and_claims_travel_into_welcome_and_presence() {
+    let service = HubService::new(config()).unwrap();
+    let base = serve(&service).await;
+    let alice = "player-alice-token-0123456789abcdef";
+    let bob = "player-bob-token-0123456789abcdef-x";
+    let carol = "player-carol-token-0123456789abcdef";
+    let auth = json!({"kind":"token","tokens":[
+        {"token":alice,"identity":"alice","claims":{"team":"red","level":7}},
+        {"token":bob,"identity":"bob","claims":{"team":"blue","nested":{"any":["thing"]}}},
+        {"token":carol,"identity":"carol","claims":{"blob":"x".repeat(3000)}}
+    ]});
+    assert_eq!(hub_with(&base, auth).await, 201);
+    for (method, args) in [
+        ("upsertUser", json!([{"id":"bob"}])),
+        ("upsertUser", json!([{"id":"carol"}])),
+        ("join", json!(["bob", "room"])),
+    ] {
+        let (status, _) = post(
+            &base,
+            "/v1/hubs/game/call",
+            json!({"method":method,"args":args}),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+    let (status, issued) = ticket(&base, "alice", Some(alice)).await;
+    assert_eq!(status, 200);
+    let (mut a, welcome) = join(&base, issued["ticket"].as_str().unwrap()).await;
+    assert_eq!(welcome["type"], "welcome");
+    assert_eq!(
+        welcome["identity"],
+        json!({"identity":"alice","claims":{"team":"red","level":7}})
+    );
+    assert!(welcome.get("peerIdentities").is_none(), "{welcome}");
+    let (status, issued) = ticket(&base, "bob", Some(bob)).await;
+    assert_eq!(status, 200);
+    let (_b, welcome_b) = join(&base, issued["ticket"].as_str().unwrap()).await;
+    // Claims stay opaque: nested user-defined values arrive unchanged.
+    assert_eq!(
+        welcome_b["identity"],
+        json!({"identity":"bob","claims":{"team":"blue","nested":{"any":["thing"]}}})
+    );
+    assert_eq!(
+        welcome_b["peerIdentities"]["alice"],
+        json!({"identity":"alice","claims":{"team":"red","level":7}})
+    );
+    // The peer already in the room is told who joined, with the same bounded claims.
+    let presence = next_presence(&mut a).await;
+    assert_eq!(presence["event"], "join");
+    assert_eq!(presence["peer"], "bob");
+    assert_eq!(
+        presence["identity"],
+        json!({"identity":"bob","claims":{"team":"blue","nested":{"any":["thing"]}}})
+    );
+    // No credential ever appears in a frame.
+    for frame in [&welcome, &welcome_b, &presence] {
+        let text = frame.to_string();
+        assert!(!text.contains(alice) && !text.contains(bob), "{text}");
+    }
+    // Claims over the live bound are refused, not truncated.
+    let (status, body) = ticket(&base, "carol", Some(carol)).await;
+    assert_eq!(status, 413, "{body}");
+    assert!(!body.to_string().contains(carol));
+}
+
+#[tokio::test]
+async fn hub_without_auth_sends_no_identity() {
+    let service = HubService::new(config()).unwrap();
+    let base = serve(&service).await;
+    let (status, _) = post(&base, "/v1/hubs", json!({"id":"game","mode":"internal"})).await;
+    assert_eq!(status, 201);
+    seat(&base).await;
+    let (status, issued) = ticket(&base, "alice", None).await;
+    assert_eq!(status, 200);
+    let (_socket, welcome) = join(&base, issued["ticket"].as_str().unwrap()).await;
+    assert_eq!(welcome["type"], "welcome");
+    assert!(welcome.get("identity").is_none() && welcome.get("peerIdentities").is_none());
+}
+
+/// Accepts each credential once and counts every call, so a second check is visible.
+#[derive(Clone, Default)]
+struct Once {
+    used: Arc<Mutex<std::collections::HashSet<String>>>,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+impl AuthVerifier for Once {
+    fn verify<'a>(
+        &'a self,
+        request: &'a AuthRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<Identity, AuthError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(request.credential.to_string());
+            if !request.credential.starts_with("once-")
+                || !self
+                    .used
+                    .lock()
+                    .unwrap()
+                    .insert(request.credential.to_string())
+            {
+                return Err(AuthError);
+            }
+            let mut claims = Map::new();
+            claims.insert("tier".into(), json!("gold"));
+            Ok(Identity {
+                identity: request.user.to_string(),
+                claims,
+            })
+        })
+    }
+}
+impl Once {
+    fn count(&self, credential: &str) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == credential)
+            .count()
+    }
+}
+async fn call_as(base: &str, token: &str, method: &str, path: &str, body: Value) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .request(method.parse().unwrap(), format!("{base}{path}"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    (
+        response.status().as_u16(),
+        response.json().await.unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn a_single_use_credential_is_verified_once_by_pairing() {
+    let service = HubService::new(config()).unwrap();
+    let once = Once::default();
+    service.register_verifier("once", once.clone()).unwrap();
+    let base = serve(&service).await;
+    assert_eq!(
+        hub_with(&base, json!({"kind":"custom","name":"once"})).await,
+        201
+    );
+    let pair = |credential: &str| json!({"subject":{"kind":"peer","id":"carol","scopes":{},"credential":credential},"target":{"kind":"hub"}});
+    let (status, body) = post(&base, "/v1/pair", pair("once-1")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(once.count("once-1"), 1, "the credential was checked twice");
+    // The verified identity and claims are in the ticket.
+    let room = body["room"].as_str().unwrap().to_owned();
+    let claims = service
+        .verify_ticket(body["ticket"].as_str().unwrap(), &["game".into()], &room)
+        .unwrap();
+    let identity = claims.identity.unwrap();
+    assert_eq!(identity.identity, "carol");
+    assert_eq!(identity.claims["tier"], "gold");
+    // Spent, so a repeat is refused, and refused before membership changes.
+    let (status, _) = post(&base, "/v1/pair", pair("once-1")).await;
+    assert_eq!(status, 403);
+    assert_eq!(once.count("once-1"), 2);
+    // A hub that does not verify returns no receipt and no identity.
+    let (status, _) = post(&base, "/v1/hubs", json!({"id":"open","mode":"internal"})).await;
+    assert_eq!(status, 201);
+}
+
+#[tokio::test]
+async fn a_verification_receipt_is_single_use_and_bound() {
+    let service = HubService::new(config()).unwrap();
+    let once = Once::default();
+    service.register_verifier("once", once.clone()).unwrap();
+    let base = serve(&service).await;
+    assert_eq!(
+        hub_with(&base, json!({"kind":"custom","name":"once"})).await,
+        201
+    );
+    let (status, bob) = post(
+        &base,
+        "/v1/hubs/game/call",
+        json!({"method":"upsertUser","args":[{"id":"bob"}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{bob}");
+    let receipt = |credential: &'static str, user: &'static str| {
+        let base = base.clone();
+        async move {
+            let (status, body) = post(
+                &base,
+                "/v1/route",
+                json!({"path":[],"op":"authorize","body":{"id":"game","userId":user,"serverId":"room","role":"peer","credential":credential}}),
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            body["receipt"].as_str().unwrap().to_owned()
+        }
+    };
+    let r = receipt("once-a", "alice").await;
+    let redeem = |verified: String, user: &'static str, role: &'static str| {
+        let base = base.clone();
+        async move {
+            post(
+                &base,
+                "/v1/hubs/game/tickets",
+                json!({"userId":user,"serverId":"room","role":role,"verified":verified}),
+            )
+            .await
+        }
+    };
+    // Bound to its user, room-less mismatches and role.
+    assert_eq!(redeem(r.clone(), "bob", "peer").await.0, 403);
+    assert_eq!(redeem(r.clone(), "alice", "service").await.0, 403);
+    assert_eq!(redeem("garbage".into(), "alice", "peer").await.0, 403);
+    assert_eq!(redeem(format!("{r}x"), "alice", "peer").await.0, 403);
+    // A wrong attempt does not spend it; the right one works once.
+    let (status, body) = redeem(r.clone(), "alice", "peer").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(redeem(r, "alice", "peer").await.0, 403);
+    // The credential was verified once, at `authorize`, and not again at ticket issue.
+    assert_eq!(once.count("once-a"), 1);
+    // A ticket's own signature is not a receipt, and a receipt is not a ticket.
+    let (_, issued) = post(
+        &base,
+        "/v1/hubs/game/tickets",
+        json!({"userId":"alice","serverId":"room","credential":"once-b"}),
+    )
+    .await;
+    let ticket = issued["ticket"].as_str().unwrap().to_owned();
+    assert_eq!(redeem(ticket, "alice", "peer").await.0, 403);
+    let r2 = receipt("once-c", "alice").await;
+    assert!(service
+        .verify_ticket(&r2, &["game".into()], "room")
+        .is_err());
+}
+
+#[tokio::test]
+async fn a_hub_with_auth_behind_a_remote_central_refuses_bad_credentials() {
+    const REMOTE: &str = "auth-remote-admin-token-1234567890123";
+    let remote = HubService::new(HubConfig {
+        token: REMOTE.into(),
+        ..config()
+    })
+    .unwrap();
+    let once = Once::default();
+    remote.register_verifier("once", once.clone()).unwrap();
+    let remote_base = serve(&remote).await;
+    let (status, body) = call_as(
+        &remote_base,
+        REMOTE,
+        "POST",
+        "/v1/hubs",
+        json!({"id":"game","mode":"internal","auth":{"kind":"custom","name":"once"}}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    for (method, args) in [
+        ("upsertUser", json!([{"id":"alice"}])),
+        ("upsertServer", json!([{"id":"room","capacity":4}])),
+        ("join", json!(["alice", "room"])),
+    ] {
+        let (status, _) = call_as(
+            &remote_base,
+            REMOTE,
+            "POST",
+            "/v1/hubs/game/call",
+            json!({"method":method,"args":args}),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+    let front = HubService::new(config()).unwrap();
+    let front_base = serve(&front).await;
+    let (status, body) = post(
+        &front_base,
+        "/v1/hubs",
+        json!({"id":"r","mode":"central","address":remote_base,"remoteToken":REMOTE}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let via_ticket = |credential: Option<&'static str>| {
+        let front_base = front_base.clone();
+        async move {
+            let mut body = json!({"id":"game","userId":"alice","serverId":"room"});
+            if let Some(credential) = credential {
+                body["credential"] = credential.into();
+            }
+            post(
+                &front_base,
+                "/v1/route",
+                json!({"path":["r"],"op":"ticket","body":body}),
+            )
+            .await
+        }
+    };
+    assert_eq!(via_ticket(None).await.0, 403);
+    assert_eq!(via_ticket(Some("wrong")).await.0, 403);
+    let (status, body) = via_ticket(Some("once-1")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(via_ticket(Some("once-1")).await.0, 403);
+    // Pairing through the remote central: refused without a credential and without side
+    // effects; accepted with a good one, which the remote verifies once.
+    let pair = |credential: Option<&str>| {
+        let mut subject = json!({"kind":"peer","id":"carol","scopes":{}});
+        if let Some(credential) = credential {
+            subject["credential"] = credential.into();
+        }
+        json!({"path":["r"],"subject":subject,"target":{"kind":"hub"}})
+    };
+    for bad in [None, Some("nope"), Some("once-1")] {
+        let (status, body) = post(&front_base, "/v1/pair", pair(bad)).await;
+        assert_eq!(status, 403, "{body}");
+    }
+    let (_, user) = call_as(
+        &remote_base,
+        REMOTE,
+        "POST",
+        "/v1/hubs/game/call",
+        json!({"method":"getUser","args":["carol"]}),
+    )
+    .await;
+    assert!(
+        user["result"].is_null(),
+        "refused pairing made a user: {user}"
+    );
+    let (status, body) = post(&front_base, "/v1/pair", pair(Some("once-2"))).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(once.count("once-2"), 1, "checked more than once");
+    let room = body["room"].as_str().unwrap().to_owned();
+    let claims = remote
+        .verify_ticket(body["ticket"].as_str().unwrap(), &["game".into()], &room)
+        .unwrap();
+    assert_eq!(claims.identity.unwrap().identity, "carol");
+}
+
+#[tokio::test]
+async fn an_imported_hub_with_auth_refuses_bad_credentials() {
+    const REMOTE: &str = "auth-import-admin-token-12345678901234";
+    let source = HubService::new(HubConfig {
+        token: REMOTE.into(),
+        ..config()
+    })
+    .unwrap();
+    let source_base = serve(&source).await;
+    let good = "player-alice-token-0123456789abcdef";
+    let (status, body) = call_as(
+        &source_base,
+        REMOTE,
+        "POST",
+        "/v1/hubs",
+        json!({"id":"game","mode":"internal","auth":{"kind":"token","tokens":[{"token":good,"identity":"alice","claims":{"team":"red"}},{"token":"player-dave-token-0123456789abcdef","identity":"dave","claims":{"team":"red"}}]}}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    for (method, args) in [
+        ("upsertUser", json!([{"id":"alice"}])),
+        ("upsertServer", json!([{"id":"room","capacity":4}])),
+        ("join", json!(["alice", "room"])),
+    ] {
+        let (status, _) = call_as(
+            &source_base,
+            REMOTE,
+            "POST",
+            "/v1/hubs/game/call",
+            json!({"method":method,"args":args}),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+    let importer = HubService::new(config()).unwrap();
+    let base = serve(&importer).await;
+    let (status, body) = post(
+        &base,
+        "/v1/registries/import",
+        json!({"address":source_base,"token":REMOTE,"prefix":"b-"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let imported = |credential: Option<&str>| {
+        let mut body = json!({"userId":"alice","serverId":"room"});
+        if let Some(credential) = credential {
+            body["credential"] = credential.into();
+        }
+        let base = base.clone();
+        async move { post(&base, "/v1/hubs/b-game/tickets", body).await }
+    };
+    assert_eq!(imported(None).await.0, 403);
+    assert_eq!(
+        imported(Some("player-alice-token-0123456789abcdeX"))
+            .await
+            .0,
+        403
+    );
+    let (status, body) = imported(Some(good)).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post(
+        &base,
+        "/v1/pair",
+        json!({"subject":{"kind":"peer","id":"dave","scopes":{}},"target":{"kind":"hub"}}),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    let (status, body) = post(
+        &base,
+        "/v1/pair",
+        json!({"subject":{"kind":"peer","id":"dave","scopes":{},"credential":"player-dave-token-0123456789abcdef"},"target":{"kind":"hub"}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let room = body["room"].as_str().unwrap().to_owned();
+    let claims = source
+        .verify_ticket(body["ticket"].as_str().unwrap(), &["game".into()], &room)
+        .unwrap();
+    assert_eq!(claims.identity.unwrap().claims["team"], "red");
+}
+
+#[tokio::test]
+async fn register_internal_has_no_auth_and_hub_spec_is_the_way_to_set_it() {
+    use liveengine::hub::{HubMode, HubRegistration};
+    let service = HubService::new(config()).unwrap();
+    let info = service
+        .register_internal(
+            HubRegistration {
+                id: "custom".into(),
+                mode: HubMode::Internal,
+                address: None,
+                remote_token: None,
+                remote_hub_id: None,
+                scopes: json!({}),
+                scope_schema: None,
+                ttl_seconds: None,
+            },
+            liveengine::Engine::new(1),
+        )
+        .await
+        .unwrap();
+    assert!(info.auth.is_none());
+    let base = serve(&service).await;
+    for (method, args) in [
+        ("upsertUser", json!([{"id":"alice"}])),
+        ("upsertServer", json!([{"id":"room","capacity":2}])),
+        ("join", json!(["alice", "room"])),
+    ] {
+        let (status, _) = post(
+            &base,
+            "/v1/hubs/custom/call",
+            json!({"method":method,"args":args}),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+    let (status, _) = post(
+        &base,
+        "/v1/hubs/custom/tickets",
+        json!({"userId":"alice","serverId":"room"}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    // The same hub definition through HubSpec carries auth and refuses a missing credential.
+    let info = service
+        .register(HubSpec {
+            id: "guarded".into(),
+            auth: Some(
+                json!({"kind":"token","tokens":[{"token":"player-alice-token-0123456789abcdef"}]}),
+            ),
+            ..HubSpec::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(info.auth.unwrap().kind, "token");
+    let (status, _) = post(
+        &base,
+        "/v1/hubs/guarded/tickets",
+        json!({"userId":"alice","serverId":"room"}),
+    )
+    .await;
+    assert_eq!(status, 403);
+}

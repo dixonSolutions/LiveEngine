@@ -78,7 +78,7 @@ const MAX_CREDENTIALS: usize = 16;
 /// Marks a request authenticated by a hub link credential rather than the admin token.
 #[derive(Clone)]
 pub(crate) struct CredentialAuth;
-fn digest(token: &str) -> String {
+pub(crate) fn digest(token: &str) -> String {
     ring::digest::digest(&ring::digest::SHA256, token.as_bytes())
         .as_ref()
         .iter()

@@ -178,6 +178,8 @@ export interface HubDefinition {
   serverSchema?: Record<string, unknown> | boolean;
   channels?: Record<string, LiveChannel>;
   auth?: HubAuth;
+  /** Central hubs only: run on this service and return a hub-scoped credential once. */
+  hosting?: 'provider';
   ttlSeconds?: number;
   maxHubs?: number;
   liveDepth?: number;

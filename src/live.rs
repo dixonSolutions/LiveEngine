@@ -16,7 +16,7 @@ use base64::{
 use rand::{rngs::OsRng, RngCore};
 use ring::hmac;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -93,6 +93,28 @@ pub(crate) fn ticket_ttl_from_env() -> Result<Duration, String> {
     }
 }
 
+/// Largest serialized size of the opaque claims carried by a ticket and shown to peers.
+pub(crate) const MAX_PEER_CLAIMS_BYTES: usize = 2048;
+
+/// The identity a hub's `auth` verified for a connection. Claims are user-defined and opaque.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PeerIdentity {
+    pub identity: String,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub claims: Map<String, Value>,
+}
+impl PeerIdentity {
+    /// Bound the identity before it is signed into a ticket or sent to peers.
+    pub(crate) fn within_limits(&self) -> bool {
+        self.identity.len() <= 256
+            && serde_json::to_vec(&self.claims).is_ok_and(|v| v.len() <= MAX_PEER_CLAIMS_BYTES)
+    }
+    fn fields(&self) -> Value {
+        serde_json::json!({"identity":self.identity,"claims":self.claims})
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TicketClaims {
@@ -104,7 +126,26 @@ pub struct TicketClaims {
     pub jti: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited_channels: Option<ChannelPolicy>,
+    /// Present only when the hub verified a credential for this connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<PeerIdentity>,
 }
+
+/// What `authorize` proved, signed so pairing can hand it to ticket issue without the
+/// credential being checked a second time. Single use, bound to hub, room, user and role.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Receipt {
+    hub_path: Vec<String>,
+    hub: String,
+    room: String,
+    user: String,
+    role: String,
+    expiry: u64,
+    jti: String,
+    identity: PeerIdentity,
+}
+const RECEIPT_TTL_SECONDS: u64 = 30;
 
 /// A service-local signer and replay guard. Its key must remain private.
 pub struct TicketSigner {
@@ -134,8 +175,9 @@ impl TicketSigner {
         role: String,
         ttl: u64,
     ) -> Result<(String, u64), &'static str> {
-        self.issue_with_channels(hub_path, room, user, role, ttl, None)
+        self.issue_with_channels(hub_path, room, user, role, ttl, None, None)
     }
+    #[allow(clippy::too_many_arguments)]
     fn issue_with_channels(
         &self,
         hub_path: Vec<String>,
@@ -144,7 +186,11 @@ impl TicketSigner {
         role: String,
         ttl: u64,
         inherited_channels: Option<ChannelPolicy>,
+        identity: Option<PeerIdentity>,
     ) -> Result<(String, u64), &'static str> {
+        if identity.as_ref().is_some_and(|i| !i.within_limits()) {
+            return Err("identity exceeds size limit");
+        }
         if !matches!(role.as_str(), "peer" | "service" | "watch") || ttl == 0 {
             return Err("invalid ticket parameters");
         }
@@ -159,6 +205,7 @@ impl TicketSigner {
             expiry,
             jti: URL_SAFE_NO_PAD.encode(random),
             inherited_channels,
+            identity,
         };
         let encoded = URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&claims).map_err(|_| "cannot encode ticket")?);
@@ -171,6 +218,84 @@ impl TicketSigner {
             return Err("ticket exceeds size limit");
         }
         Ok((ticket, expiry))
+    }
+    fn receipt_key(&self) -> hmac::Key {
+        // Domain separated from ticket signing so neither can stand in for the other.
+        let derived = hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA256, &self.key),
+            b"liveengine receipt v1",
+        );
+        hmac::Key::new(hmac::HMAC_SHA256, derived.as_ref())
+    }
+    /// Sign the result of a successful credential check for one ticket request.
+    fn issue_receipt(
+        &self,
+        hub_path: Vec<String>,
+        hub: &str,
+        room: &str,
+        user: &str,
+        role: &str,
+        identity: PeerIdentity,
+    ) -> Result<String, &'static str> {
+        let mut random = [0u8; 16];
+        OsRng.fill_bytes(&mut random);
+        let receipt = Receipt {
+            hub_path,
+            hub: hub.to_owned(),
+            room: room.to_owned(),
+            user: user.to_owned(),
+            role: role.to_owned(),
+            expiry: now()?.saturating_add(RECEIPT_TTL_SECONDS),
+            jti: URL_SAFE_NO_PAD.encode(random),
+            identity,
+        };
+        let encoded = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&receipt).map_err(|_| "cannot encode receipt")?);
+        let mac = hmac::sign(&self.receipt_key(), encoded.as_bytes());
+        Ok(format!(
+            "{}.{}",
+            encoded,
+            URL_SAFE_NO_PAD.encode(mac.as_ref())
+        ))
+    }
+    /// Verify and consume a receipt for exactly this request. Any miss is the same refusal.
+    fn consume_receipt(
+        &self,
+        receipt: &str,
+        hub_path: &[String],
+        hub: &str,
+        room: &str,
+        user: &str,
+        role: &str,
+    ) -> Result<PeerIdentity, &'static str> {
+        const REFUSED: &str = "invalid receipt";
+        if receipt.len() > 16384 {
+            return Err(REFUSED);
+        }
+        let (payload, signature) = receipt.split_once('.').ok_or(REFUSED)?;
+        let signature = URL_SAFE_NO_PAD.decode(signature).map_err(|_| REFUSED)?;
+        hmac::verify(&self.receipt_key(), payload.as_bytes(), &signature).map_err(|_| REFUSED)?;
+        let bytes = URL_SAFE_NO_PAD.decode(payload).map_err(|_| REFUSED)?;
+        let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|_| REFUSED)?;
+        let now = now()?;
+        if receipt.expiry <= now
+            || receipt.hub_path != hub_path
+            || receipt.hub != hub
+            || receipt.room != room
+            || receipt.user != user
+            || receipt.role != role
+            || receipt.jti.is_empty()
+        {
+            return Err(REFUSED);
+        }
+        let mut used = self.used.lock().map_err(|_| "ticket guard unavailable")?;
+        used.retain(|_, expiry| *expiry > now);
+        let key = format!("receipt:{}", receipt.jti);
+        if used.contains_key(&key) || used.len() >= MAX_USED {
+            return Err(REFUSED);
+        }
+        used.insert(key, receipt.expiry);
+        Ok(receipt.identity)
     }
     /// Verify signature, expiry and binding, consuming the ticket on success.
     pub fn verify(
@@ -241,6 +366,11 @@ pub(crate) struct TicketRequest {
     /// The user's credential for a hub that sets `auth`. Never forwarded once verified here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     credential: Option<String>,
+    /// Proof from `authorize` that the credential was already checked, so a single-use
+    /// credential is not spent twice. Pairing passes it internally; it is single use,
+    /// short lived and bound to this hub, room, user and role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verified: Option<String>,
 }
 fn peer_role() -> String {
     "peer".into()
@@ -322,7 +452,23 @@ pub(crate) async fn authorize_hub(
     )
     .await
     {
-        Ok(()) => Json(serde_json::json!({"ok":true})).into_response(),
+        Ok(None) => Json(serde_json::json!({"ok":true})).into_response(),
+        Ok(Some(identity)) => {
+            // The credential is spent here; the receipt lets ticket issue skip a second check.
+            match state.ticket_signer.issue_receipt(
+                state.hub_path.clone(),
+                &id,
+                &request.server_id,
+                &request.user_id,
+                &request.role,
+                identity,
+            ) {
+                Ok(receipt) => {
+                    Json(serde_json::json!({"ok":true,"receipt":receipt})).into_response()
+                }
+                Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "could not verify"),
+            }
+        }
         Err(refused) => refused,
     }
 }
@@ -352,20 +498,40 @@ pub(crate) async fn issue_ticket(
         return error(StatusCode::NOT_FOUND, "hub not found");
     };
     // Link credentials were issued by this hub's administrator and are not user credentials.
-    if !trusted {
-        if let Err(refused) = crate::auth::authorize(
-            &state,
-            record.auth.as_ref(),
-            &id,
-            &request.user_id,
-            &request.server_id,
-            &request.role,
-            request.credential.as_deref(),
-        )
-        .await
-        {
-            return refused;
-        }
+    // A hub that only forwards is checked by the service that owns it.
+    let forwards_raw =
+        record.auth.is_none() && record.handler.is_none() && record.info.address.is_some();
+    let mut identity = None;
+    if trusted {
+        request.verified = None;
+    } else if !forwards_raw {
+        identity = match request.verified.take() {
+            Some(receipt) => match state.ticket_signer.consume_receipt(
+                &receipt,
+                &state.hub_path,
+                &id,
+                &request.server_id,
+                &request.user_id,
+                &request.role,
+            ) {
+                Ok(identity) => Some(identity),
+                Err(_) => return error(StatusCode::FORBIDDEN, "credential refused"),
+            },
+            None => match crate::auth::authorize(
+                &state,
+                record.auth.as_ref(),
+                &id,
+                &request.user_id,
+                &request.server_id,
+                &request.role,
+                request.credential.as_deref(),
+            )
+            .await
+            {
+                Ok(identity) => identity,
+                Err(refused) => return refused,
+            },
+        };
         if record.auth.is_some() {
             request.credential = None;
         }
@@ -425,6 +591,7 @@ pub(crate) async fn issue_ticket(
             request.role,
             state.config.ticket_ttl.as_secs(),
             inherited_channels,
+            identity,
         ) {
             Ok((ticket, expires_at)) => {
                 Json(serde_json::json!({"ticket":ticket,"url":url,"expiresAt":expires_at}))
@@ -462,7 +629,8 @@ pub(crate) async fn issue_ticket(
     }
 }
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use crate::transport::LiveTransport;
+use axum::extract::ws::{Message, WebSocketUpgrade};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
@@ -473,6 +641,8 @@ struct PeerQueue {
     disconnect: tokio::sync::watch::Sender<bool>,
     /// Service sockets are never announced as bridged peers.
     service: bool,
+    /// What the hub's `auth` verified for this peer, shown to the room.
+    identity: Option<Arc<PeerIdentity>>,
 }
 impl PeerQueue {
     fn send(&self, message: Message, lossy: bool) {
@@ -670,6 +840,7 @@ pub(crate) async fn attach_link(
         sender,
         disconnect,
         service: true,
+        identity: None,
     };
     let (generation, snapshot) =
         attach(state, key, format!("out:{link_id}"), None, Some(queue)).await?;
@@ -1041,7 +1212,7 @@ pub(crate) async fn live_socket(
         .max_frame_size(frame_limit)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            serve_socket(state, socket).await
+            serve_connection(state, socket).await
         })
 }
 
@@ -1171,7 +1342,8 @@ async fn build_validators(
     Some(validators)
 }
 
-async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
+/// Serve one peer over any [`LiveTransport`].
+async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
     let first = tokio::time::timeout(Duration::from_secs(5), socket.recv()).await;
     let Some(Ok(Message::Text(text))) = first.ok().flatten() else {
         return;
@@ -1195,6 +1367,7 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
         return;
     }
     let inherited_channels = claims.inherited_channels;
+    let identity = claims.identity.map(Arc::new);
     let service = claims.role == "service";
     let key = (claims.hub_path, claims.room);
     let user = claims.user;
@@ -1250,17 +1423,29 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
         let Some(ice_servers) = ice_servers(&state.config, &user) else {
             return;
         };
-        let welcome = serde_json::json!({"type":"welcome","peers":peers,"iceServers":ice_servers})
-            .to_string();
+        let mut welcome =
+            serde_json::json!({"type":"welcome","peers":peers,"iceServers":ice_servers});
+        if let Some(own) = &identity {
+            welcome["identity"] = own.fields();
+        }
+        // Verified identities of the peers on this hub, keyed by peer id.
+        let known: Map<String, Value> = room
+            .iter()
+            .filter_map(|(peer, queue)| Some((peer.clone(), queue.identity.as_ref()?.fields())))
+            .collect();
+        if !known.is_empty() {
+            welcome["peerIdentities"] = Value::Object(known);
+        }
+        let welcome = welcome.to_string();
         if tx.try_send(Message::Text(welcome.into())).is_err() {
             return;
         }
         if !resumed {
-            let joined = Message::Text(
-                serde_json::json!({"type":"presence","event":"join","peer":user})
-                    .to_string()
-                    .into(),
-            );
+            let mut joined = serde_json::json!({"type":"presence","event":"join","peer":user});
+            if let Some(own) = &identity {
+                joined["identity"] = own.fields();
+            }
+            let joined = Message::Text(joined.to_string().into());
             for queue in room.values() {
                 queue.send(joined.clone(), false);
             }
@@ -1277,6 +1462,7 @@ async fn serve_socket(state: Arc<Inner>, mut socket: WebSocket) {
                 sender: tx,
                 disconnect,
                 service,
+                identity: identity.clone(),
             },
         );
     }
@@ -1563,6 +1749,7 @@ mod queue_tests {
             sender,
             disconnect,
             service: false,
+            identity: None,
         };
         queue.send(Message::Text("first".into()), false);
         queue.send(Message::Text("lossy".into()), true);
