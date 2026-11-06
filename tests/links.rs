@@ -340,12 +340,13 @@ async fn remote_central_ticket_preserves_inherited_channel_schema() {
         ))
         .await
         .unwrap();
-    assert!(!matches!(
-        tokio::time::timeout(Duration::from_secs(2), alice.next())
-            .await
-            .unwrap(),
-        Some(Ok(Message::Text(_)))
-    ));
+    let frame = tokio::time::timeout(Duration::from_secs(2), alice.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let error: Value = serde_json::from_str(&frame.into_text().unwrap()).unwrap();
+    assert_eq!(error, json!({"type":"error","code":"schema"}));
     task.abort();
     remote_task.abort();
 }
@@ -355,7 +356,7 @@ async fn credential_remote(
 ) -> (String, tokio::task::JoinHandle<()>, String) {
     let remote = HubService::new(HubConfig {
         token: B.into(),
-        public_url: Some("ws://localhost/v1/live".into()),
+        public_url: None,
         state_file,
         ..Default::default()
     })

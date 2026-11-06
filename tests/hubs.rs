@@ -1466,3 +1466,35 @@ async fn a_stuck_handler_refuses_callers_at_the_queue_deadline() {
     release_tx.send(()).unwrap();
     assert_eq!(first.await.unwrap().0, 200);
 }
+
+#[test]
+fn malformed_live_limits_fail_at_startup() {
+    for name in [
+        "LIVEENGINE_LIVE_MAX_CONNECTIONS",
+        "LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM",
+        "LIVEENGINE_LIVE_MAX_FRAME_BYTES",
+        "LIVEENGINE_LIVE_SEND_QUEUE",
+        "LIVEENGINE_LIVE_IDLE_SECONDS",
+        "LIVEENGINE_LIVE_PING_SECONDS",
+        "LIVEENGINE_LIVE_MESSAGES_PER_SECOND",
+        "LIVEENGINE_LIVE_BYTES_PER_SECOND",
+        "LIVEENGINE_LIVE_RESUME_MILLIS",
+        "LIVEENGINE_SIGNAL_MAX_BYTES",
+        "LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND",
+        "LIVEENGINE_LINK_MAX_BYTES_PER_SECOND",
+        "LIVEENGINE_LIVE_REGISTRY_MAX_SUBSCRIBERS",
+        "LIVEENGINE_LIVE_TREE_DEPTH",
+    ] {
+        for value in ["0", "bad"] {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_liveengine-hub"))
+                .env("LIVEENGINE_TOKEN", TOKEN)
+                .env("LIVEENGINE_INSTANCE_ID", "test-instance")
+                .env("LIVEENGINE_BIND", "127.0.0.1:0")
+                .env(name, value)
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{name}={value}");
+            assert!(!output.stderr.is_empty(), "{name}={value}");
+        }
+    }
+}

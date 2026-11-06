@@ -215,7 +215,7 @@ export declare class HubClient {
   contract(): Promise<{ protocol: typeof HUB_PROTOCOL; [key: string]: unknown }>;
   ping(options?: HubPingOptions): Promise<HubPing>;
   tree(depth?: number): Promise<unknown>;
-  route(path: string[], op: 'register' | 'list' | 'get' | 'delete' | 'call' | 'tree', body?: Record<string, unknown>): Promise<unknown>;
+  route(path: string[], op: 'register' | 'list' | 'get' | 'delete' | 'call' | 'tree' | 'ticket' | 'watchTicket' | 'authorize' | 'discover' | 'pair', body?: Record<string, unknown>): Promise<unknown>;
   listTemplates(): Promise<unknown>;
   createTemplate(template: HubTemplate): Promise<unknown>;
   getTemplate(name: string): Promise<unknown>;

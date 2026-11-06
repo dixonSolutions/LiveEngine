@@ -8,7 +8,7 @@ Set `LIVEENGINE_TOKEN` to an unpredictable secret of at least 24 bytes. Internal
 
 `LIVEENGINE_BIND` defaults to `127.0.0.1:8787`. For a LAN device, bind the appropriate interface and connect to the host's LAN address. For a different network, use a reachable HTTPS ingress or a private overlay such as Tailscale. A container test proves process/network isolation; it does not prove a physical device on another network connected.
 
-`LIVEENGINE_ALLOWED_REMOTE_HOSTS` is a comma-separated allowlist for remote registrations and imports. Listing `remote` permits the Compose service hostname. Listing loopback/private hostnames is an explicit authorization to connect to them. Use exact hostnames you control. HTTP redirects are disabled; endpoint paths are appended to the registered base path.
+`LIVEENGINE_ALLOWED_REMOTE_HOSTS` is a comma-separated allowlist for remote registrations and imports. Listing `remote` permits the Compose service hostname. Listing loopback/private hostnames is an explicit authorization to connect to them. Wildcards such as `*.example.com` allow subdomains; use hostnames you control. HTTP redirects are disabled; endpoint paths are appended to the registered base path.
 
 Limits are configurable through `HubConfig` when embedding the router. The standalone host accepts:
 
@@ -28,13 +28,14 @@ Limits are configurable through `HubConfig` when embedding the router. The stand
 | `LIVEENGINE_CALL_QUEUE_MS` | 1000 |
 | `LIVEENGINE_MAX_QUEUED_CALLS` | 1024 |
 | `LIVEENGINE_MAX_PAIR_WAIT_MS` | 30000 |
-| `LIVEENGINE_MAX_PENDING_PAIRS` | 1024 |
+| `LIVEENGINE_MAX_PENDING_PAIRS` | 1024 per namespace |
+| `LIVEENGINE_LIVE_REGISTRY_MAX_SUBSCRIBERS` | 256 |
 | `LIVEENGINE_RATE_LIMIT_REQUESTS` | 120 |
 | `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` | 60 |
 | `LIVEENGINE_RATE_LIMIT_PEERS` | 4096 |
 | `LIVEENGINE_SEED` | 0 |
 
-Limits and windows must be positive. Internal handlers run on blocking workers so they do not stall the API runtime. Capacity remains occupied until the handler finishes, even if its HTTP request times out. A timeout does not roll back a handler that already started; reconcile state before retrying a mutation. Outbound timeout and maximum registration TTL can also be changed through Rust `HubConfig`. Request, response, hub, entity and event limits apply to the hosted service; direct local `Engine` use is controlled by the embedding application.
+Limits and windows must be positive; malformed or zero values cause startup to fail. Live and link limits are capped at 16777216. Internal handlers run on blocking workers so they do not stall the API runtime. Capacity remains occupied until the handler finishes, even if its HTTP request times out. A timeout does not roll back a handler that already started; reconcile state before retrying a mutation. Outbound timeout and maximum registration TTL can also be changed through Rust `HubConfig`. Request, response, hub, entity and event limits apply to the hosted service; direct local `Engine` use is controlled by the embedding application.
 
 The host uses actual socket peers for request budgets. It ignores arbitrary `X-Forwarded-For` headers. A reverse proxy therefore shares its peer budget across clients; apply public-client limits at the proxy as well when required by your deployment.
 
@@ -112,7 +113,7 @@ matches nothing answers `404`.
 ### Waiting for a partner
 
 `POST /v1/pair` and the `pair` route operation accept `waitMs`, for a peer subject with a `peer` or
-`any` target. A peer with no candidate yet stays queued, per hub, and the next peer that pairs with it
+`any` target. A peer with no candidate yet stays queued, per namespace, and the next peer that pairs with it
 wakes it with its own ticket; nothing polls. The wait ends with `408` after `waitMs`, capped by
 `LIVEENGINE_MAX_PAIR_WAIT_MS` (`0` turns waiting off), and a request its caller drops leaves the queue at
 once. A peer is queued once (`409` for a second request), at most `LIVEENGINE_MAX_PENDING_PAIRS` wait at a

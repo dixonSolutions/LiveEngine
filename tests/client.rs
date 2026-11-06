@@ -59,6 +59,16 @@ async fn tickets_are_issued_directly_and_through_a_route() {
     let (base, task) = hub().await;
     let client = HubClient::new(&base, TOKEN).unwrap();
     paired(&client).await;
+    let contract = client
+        .request(reqwest::Method::GET, "/v1/contract", None)
+        .await
+        .unwrap();
+    for route in ["/v1/discover", "/v1/pair", "/v1/live"] {
+        assert!(contract["endpoints"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(route)));
+    }
     let direct = client
         .ticket(&[], "game", "alice", "room", "peer", None)
         .await
@@ -120,5 +130,47 @@ async fn watch_tickets_are_scoped_and_the_watch_streams_a_snapshot_then_diffs() 
     assert_eq!(messages[1]["type"], "added");
     assert_eq!(messages[1]["seq"], 1);
     assert_eq!(messages[1]["path"], json!(["late"]));
+    task.abort();
+}
+
+#[tokio::test]
+async fn discover_and_pair_allow_the_requested_wait() {
+    use axum::{routing::post, Json, Router};
+    async fn discover(Json(body): Json<Value>) -> Json<Value> {
+        Json(body)
+    }
+    async fn pair(Json(body): Json<Value>) -> Json<Value> {
+        tokio::time::sleep(std::time::Duration::from_millis(5200)).await;
+        Json(body)
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/v1/discover", post(discover))
+                .route("/v1/pair", post(pair))
+                .route("/v1/route", post(pair)),
+        )
+        .await
+        .unwrap()
+    });
+    let client = HubClient::new(&base, TOKEN).unwrap();
+    assert_eq!(
+        client.discover(json!({"kind":"peer"})).await.unwrap()["kind"],
+        "peer"
+    );
+    assert_eq!(
+        client.pair(json!({"waitMs":1000})).await.unwrap()["waitMs"],
+        1000
+    );
+    assert_eq!(
+        client
+            .route(&[], "pair", json!({"waitMs":1000}))
+            .await
+            .unwrap()["op"],
+        "pair"
+    );
     task.abort();
 }

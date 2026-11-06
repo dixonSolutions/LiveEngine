@@ -571,7 +571,11 @@ pub(crate) async fn issue_ticket(
             Ok(Ok(false)) => return error(StatusCode::FORBIDDEN, "user is not paired in room"),
             _ => return error(StatusCode::SERVICE_UNAVAILABLE, "membership unavailable"),
         }
-        let Some(url) = state.config.public_url.as_ref() else {
+        let url = if trusted {
+            state.config.public_url.as_deref().unwrap_or("")
+        } else if let Some(url) = state.config.public_url.as_deref() {
+            url
+        } else {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "public URL is not configured",
@@ -1257,6 +1261,30 @@ pub(crate) fn link_budget() -> (usize, usize) {
     )
 }
 
+pub(crate) fn validate_live_limits() -> Result<(), String> {
+    for name in [
+        "LIVEENGINE_LIVE_MAX_CONNECTIONS",
+        "LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM",
+        "LIVEENGINE_LIVE_MAX_FRAME_BYTES",
+        "LIVEENGINE_LIVE_SEND_QUEUE",
+        "LIVEENGINE_LIVE_IDLE_SECONDS",
+        "LIVEENGINE_LIVE_PING_SECONDS",
+        "LIVEENGINE_LIVE_MESSAGES_PER_SECOND",
+        "LIVEENGINE_LIVE_BYTES_PER_SECOND",
+        "LIVEENGINE_LIVE_RESUME_MILLIS",
+        "LIVEENGINE_SIGNAL_MAX_BYTES",
+        "LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND",
+        "LIVEENGINE_LINK_MAX_BYTES_PER_SECOND",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            if !value.parse::<usize>().is_ok_and(|n| n > 0) {
+                return Err(format!("{name} must be a positive integer"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn limit(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -1368,10 +1396,23 @@ async fn build_validators(
     Some(validators)
 }
 
+async fn refuse<T: LiveTransport>(socket: T, code: &str) {
+    let (mut sink, _) = socket.split();
+    let _ = sink
+        .send(Message::Text(
+            serde_json::json!({"type":"error","code":code})
+                .to_string()
+                .into(),
+        ))
+        .await;
+    let _ = sink.close().await;
+}
+
 /// Serve one peer over any [`LiveTransport`].
 async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
     let first = tokio::time::timeout(Duration::from_secs(5), socket.recv()).await;
     let Some(Ok(Message::Text(text))) = first.ok().flatten() else {
+        refuse(socket, "auth").await;
         return;
     };
     #[derive(Deserialize)]
@@ -1381,15 +1422,19 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
         ticket: String,
     }
     let Ok(auth) = serde_json::from_str::<Auth>(&text) else {
+        refuse(socket, "auth").await;
         return;
     };
     if auth.r#type != "auth" {
+        refuse(socket, "auth").await;
         return;
     }
     let Ok(claims) = state.ticket_signer.verify_inner(&auth.ticket, None) else {
+        refuse(socket, "auth").await;
         return;
     };
     if claims.role == "watch" {
+        refuse(socket, "auth").await;
         return;
     }
     let inherited_channels = claims.inherited_channels;
@@ -1398,12 +1443,14 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
     let key = (claims.hub_path, claims.room);
     let user = claims.user;
     let Some((record, channels)) = resolve(&state, &key.0).await else {
+        refuse(socket, "auth").await;
         return;
     };
     if !paired(&state, &record, &user, &key.1)
         .await
         .unwrap_or(false)
     {
+        refuse(socket, "auth").await;
         return;
     }
     let local_channels = channels.is_some();
@@ -1416,21 +1463,27 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
     )
     .await
     else {
+        refuse(socket, "auth").await;
         return;
     };
     let (tx, mut rx) = mpsc::channel::<Message>(limit("LIVEENGINE_LIVE_SEND_QUEUE", 64));
     let (disconnect, mut disconnected) = tokio::sync::watch::channel(false);
+    let error_tx = tx.clone();
     {
         let mut rooms = state.live_rooms.rooms.lock().await;
         if rooms.values().map(HashMap::len).sum::<usize>()
             >= limit("LIVEENGINE_LIVE_MAX_CONNECTIONS", 4096)
         {
+            refuse(socket, "rate").await;
             return;
         }
         let room = rooms.entry(key.clone()).or_default();
-        if room.contains_key(&user)
-            || room.len() >= limit("LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM", 256)
-        {
+        if room.contains_key(&user) {
+            refuse(socket, "duplicate").await;
+            return;
+        }
+        if room.len() >= limit("LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM", 256) {
+            refuse(socket, "rate").await;
             return;
         }
         let mut pending = state.live_rooms.pending.lock().await;
@@ -1498,7 +1551,8 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
     let (mut sink, mut stream) = socket.split();
     let mut writer = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
-            if sink.send(message).await.is_err() {
+            let terminal = matches!(&message, Message::Text(text) if text.starts_with("{\"code\":") && text.contains("\"type\":\"error\""));
+            if sink.send(message).await.is_err() || terminal {
                 break;
             }
         }
@@ -1513,10 +1567,11 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
     let mut attached: Option<u64> = None;
     let link_name = format!("in:{user}");
     let trace = vec![state.instance_id.clone()];
+    let mut violation = None;
     loop {
         let message = tokio::select! {
-            result = stream.next() => match result { Some(Ok(message)) => message, _ => break },
-            _ = disconnected.changed() => break,
+            result = stream.next() => match result { Some(Ok(message)) => message, Some(Err(_)) => { violation = Some("frame"); break }, None => break },
+            _ = disconnected.changed() => { violation = Some("rate"); break },
             _ = &mut writer => break,
             _ = tick.tick() => {
                 if last_activity.elapsed() >= Duration::from_secs(limit("LIVEENGINE_LIVE_IDLE_SECONDS", 60) as u64) { break }
@@ -1533,7 +1588,10 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
         if matches!(message, Message::Pong(_) | Message::Ping(_)) {
             continue;
         }
-        let Message::Text(text) = message else { break };
+        let Message::Text(text) = message else {
+            violation = Some("frame");
+            break;
+        };
         if window.elapsed() >= Duration::from_secs(1) {
             window = tokio::time::Instant::now();
             messages = 0;
@@ -1554,12 +1612,15 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
         };
         let over_budget = messages > max_messages;
         if bytes > max_bytes || (over_budget && !linked) {
+            violation = Some("rate");
             break;
         }
         let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+            violation = Some("frame");
             break;
         };
         let Some(object) = value.as_object_mut() else {
+            violation = Some("frame");
             break;
         };
         if object
@@ -1569,6 +1630,7 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
         {
             // Only a service socket may carry linked frames; a peer sending one is refused.
             if !service {
+                violation = Some("frame");
                 break;
             }
             if attached.is_none() {
@@ -1606,6 +1668,7 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
             )
             .await
             {
+                violation = Some("frame");
                 break;
             }
             continue;
@@ -1620,20 +1683,24 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
             || !object.contains_key("payload")
             || object.get("to").is_some_and(|v| !v.is_string())
         {
+            violation = Some("frame");
             break;
         }
         let channel = object["channel"].as_str().unwrap();
         let frame_type = object["type"].as_str().unwrap();
         let signal = SIGNAL_TYPES.contains(&frame_type);
         if reserved_type(frame_type) {
+            violation = Some("frame");
             break;
         }
         if signal {
             let Some(target) = object.get("to").and_then(Value::as_str).map(str::to_owned) else {
+                violation = Some("frame");
                 break;
             };
             let target = target.as_str();
             if target == user || text.len() > limit("LIVEENGINE_SIGNAL_MAX_BYTES", 16384) {
+                violation = Some("frame");
                 break;
             }
             let rooms = state.live_rooms.rooms.lock().await;
@@ -1656,6 +1723,7 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
                     &value,
                 );
             } else {
+                violation = Some("frame");
                 break;
             }
             continue;
@@ -1663,6 +1731,7 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
         let mut lossy = false;
         if let Some(channels) = &channels {
             let Some(definition) = channels.get(channel) else {
+                violation = Some("channel");
                 break;
             };
             lossy = matches!(definition.delivery, LiveDelivery::Lossy);
@@ -1670,6 +1739,7 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
             *count += 1;
             // maxRate is a per-peer, per-channel messages-per-second budget.
             if definition.max_rate.is_some_and(|max| *count > max) {
+                violation = Some("rate");
                 break;
             }
         }
@@ -1677,6 +1747,7 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
             .get(channel)
             .is_some_and(|v| !v.is_valid(&object["payload"]))
         {
+            violation = Some("schema");
             break;
         }
         let target = object.get("to").and_then(Value::as_str).map(str::to_owned);
@@ -1712,6 +1783,18 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
                     &value,
                 );
             }
+        }
+    }
+    if let Some(code) = violation {
+        let frame = serde_json::json!({"type":"error","code":code}).to_string();
+        if tokio::time::timeout(
+            Duration::from_secs(1),
+            error_tx.send(Message::Text(frame.into())),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok())
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(1), &mut writer).await;
         }
     }
     writer.abort();

@@ -1011,6 +1011,11 @@
         "credential": {
           "type": "string",
           "writeOnly": true
+        },
+        "verified": {
+          "type": "string",
+          "writeOnly": true,
+          "description": "Single-use authorization receipt bound to this ticket request."
         }
       }
     },

@@ -82,6 +82,7 @@ pub struct HubConfig {
     pub max_hubs: usize,
     pub max_depth: usize,
     pub live_tree_depth: usize,
+    pub live_registry_max_subscribers: usize,
     pub instance_id: Option<String>,
     /// Optional durable registry snapshot path.
     pub state_file: Option<std::path::PathBuf>,
@@ -125,6 +126,7 @@ impl Default for HubConfig {
             max_hubs: 256,
             max_depth: 8,
             live_tree_depth: 3,
+            live_registry_max_subscribers: 256,
             instance_id: None,
             state_file: None,
             max_request_bytes: 1024 * 1024,
@@ -185,6 +187,12 @@ impl HubConfig {
             config.live_tree_depth,
         )?
         .min(config.max_depth);
+        config.live_registry_max_subscribers = env_limit(
+            "LIVEENGINE_LIVE_REGISTRY_MAX_SUBSCRIBERS",
+            config.live_registry_max_subscribers,
+        )?
+        .min(16_777_216);
+        crate::live::validate_live_limits()?;
         config.state_file = std::env::var_os("LIVEENGINE_STATE_FILE").map(Into::into);
         config.instance_id = if config.state_file.is_some() {
             std::env::var("LIVEENGINE_INSTANCE_ID").ok()
@@ -272,7 +280,8 @@ impl HubConfig {
         {
             return Err("invalid LIVEENGINE_INSTANCE_ID".into());
         }
-        if self.live_tree_depth == 0
+        if self.live_registry_max_subscribers == 0
+            || self.live_tree_depth == 0
             || self.max_hubs == 0
             || self.max_request_bytes == 0
             || self.max_response_bytes == 0
@@ -661,6 +670,7 @@ pub(crate) struct Inner {
     pub(crate) ticket_signer: Arc<TicketSigner>,
     pub(crate) hub_path: Vec<String>,
     pub(crate) live_rooms: Arc<LiveRooms>,
+    pub(crate) registry_subscribers: Arc<Semaphore>,
     pub(crate) registry_upstreams: Arc<crate::live_registry::Upstreams>,
     pub(crate) links: Arc<crate::links::Links>,
     pub(crate) verifiers: crate::auth::Verifiers,
@@ -709,6 +719,7 @@ impl HubService {
             .as_ref()
             .and_then(|s| s.signing_key)
             .unwrap_or_else(TicketSigner::random_key);
+        let registry_subscribers = Arc::new(Semaphore::new(config.live_registry_max_subscribers));
         let service = Self {
             inner: Arc::new(Inner {
                 config,
@@ -736,6 +747,7 @@ impl HubService {
                 ticket_signer: Arc::new(TicketSigner::new(signing_key)),
                 hub_path: Vec::new(),
                 live_rooms: Arc::new(LiveRooms::default()),
+                registry_subscribers,
                 registry_upstreams: Default::default(),
                 links: Default::default(),
                 verifiers: Default::default(),
@@ -868,7 +880,7 @@ impl HubService {
     }
 
     /// Router for embedding in another Axum application. It owns routes rooted
-    /// at `/health` and `/v1/{ping,contract,schemas,templates,route,tree,hubs,registries,registry}`.
+    /// at `/health` and `/v1/{ping,contract,schemas,templates,route,tree,hubs,registries,registry,tickets,live,links,discover,pair}`.
     pub fn router(&self) -> Router {
         start_reaper(&self.inner);
         crate::links::start(&self.inner);
@@ -1200,6 +1212,7 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
             inner.instance_id = state.instance_id.clone();
             inner.ticket_signer = state.ticket_signer.clone();
             inner.live_rooms = state.live_rooms.clone();
+            inner.registry_subscribers = state.registry_subscribers.clone();
             inner.registry_upstreams = state.registry_upstreams.clone();
             inner.links = state.links.clone();
             inner.verifiers = state.verifiers.clone();
@@ -1702,7 +1715,7 @@ async fn ping(State(state): State<Arc<Inner>>) -> Json<Value> {
 
 async fn contract() -> Json<Value> {
     Json(
-        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/hubs/{id}/tickets","/v1/hubs/{id}/link-credentials","/v1/tickets/watch","/v1/live/registry","/v1/links","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}","/v1/templates","/v1/templates/{name}","/v1/route","/v1/tree"],"schema":"/v1/contract/schema"}),
+        serde_json::json!({"protocol":HUB_PROTOCOL,"version":1,"endpoints":["/health","/v1/ping","/v1/contract","/v1/hubs","/v1/hubs/{id}","/v1/hubs/{id}/call","/v1/hubs/{id}/tickets","/v1/hubs/{id}/link-credentials","/v1/tickets/watch","/v1/live/registry","/v1/links","/v1/registries/import","/v1/registry/export","/v1/schemas","/v1/schemas/{id}","/v1/templates","/v1/templates/{name}","/v1/route","/v1/tree","/v1/discover","/v1/pair","/v1/live"],"schema":"/v1/contract/schema"}),
     )
 }
 async fn contract_schema() -> Response {
@@ -2450,6 +2463,27 @@ async fn create_template(
     if !valid_max_hubs(max_hubs.as_ref(), &validation, state.global_max_hubs) {
         return error(StatusCode::BAD_REQUEST, "invalid maxHubs");
     }
+    if let Some(auth) = validation.remove("auth") {
+        let Ok(auth) = serde_json::from_value::<crate::auth::AuthConfig>(auth) else {
+            return error(StatusCode::BAD_REQUEST, "invalid auth");
+        };
+        if validation.get("mode").and_then(Value::as_str) == Some("central") {
+            return error(StatusCode::BAD_REQUEST, "central hubs cannot set auth");
+        }
+        if let Err(message) = auth.validate(&state, true) {
+            return error(StatusCode::BAD_REQUEST, &message);
+        }
+    }
+    if let Some(hosting) = validation.remove("hosting") {
+        if hosting != "provider"
+            || validation.get("mode").and_then(Value::as_str) != Some("central")
+            || ["address", "remoteToken", "remoteHubId"]
+                .iter()
+                .any(|key| validation.get(*key).is_some_and(|v| !v.is_null()))
+        {
+            return error(StatusCode::BAD_REQUEST, "invalid hosting");
+        }
+    }
     let user_schema = validation.remove("userSchema");
     let server_schema = validation.remove("serverSchema");
     let channels = match parse_channels(validation.remove("channels"), &state).await {
@@ -2756,6 +2790,7 @@ async fn register_hub_inherited(
         inner.instance_id = state.instance_id.clone();
         inner.ticket_signer = state.ticket_signer.clone();
         inner.live_rooms = state.live_rooms.clone();
+        inner.registry_subscribers = state.registry_subscribers.clone();
         inner.registry_upstreams = state.registry_upstreams.clone();
         inner.links = state.links.clone();
         inner.verifiers = state.verifiers.clone();
@@ -4032,7 +4067,26 @@ impl HubClient {
             base.pop();
         }
         let url = Url::parse(&format!("{base}{route}")).map_err(|_| "invalid hub route")?;
-        let mut request = self.client.request(method, url).bearer_auth(&self.token);
+        let wait = body
+            .as_ref()
+            .and_then(|b| {
+                if route == "/v1/pair" {
+                    b.get("waitMs")
+                } else if route == "/v1/route"
+                    && b.get("op").and_then(Value::as_str) == Some("pair")
+                {
+                    b.get("body").and_then(|v| v.get("waitMs"))
+                } else {
+                    None
+                }
+            })
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let mut request = self
+            .client
+            .request(method, url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(5).saturating_add(Duration::from_millis(wait)));
         if let Some(body) = body {
             request = request.json(&body);
         }
@@ -4054,6 +4108,18 @@ impl HubClient {
             Some(serde_json::json!({"path": path, "op": op, "body": body})),
         )
         .await
+    }
+
+    /// Search the hub tree for matching candidates.
+    pub async fn discover(&self, body: Value) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/v1/discover", Some(body))
+            .await
+    }
+
+    /// Pair a subject with a matching target.
+    pub async fn pair(&self, body: Value) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/v1/pair", Some(body))
+            .await
     }
 
     /// Recursively discover hub branches up to the given depth.

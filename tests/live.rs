@@ -371,10 +371,24 @@ mod sockets {
         let result = tokio::time::timeout(Duration::from_secs(2), socket.next())
             .await
             .unwrap();
-        assert!(matches!(
-            result,
-            None | Some(Ok(Message::Close(_))) | Some(Err(_))
-        ));
+        if let Some(Ok(Message::Text(text))) = result {
+            let error: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(error["type"], "error");
+            assert!(["auth", "channel", "rate", "schema", "frame", "duplicate"]
+                .contains(&error["code"].as_str().unwrap()));
+            let next = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap();
+            assert!(matches!(
+                next,
+                None | Some(Ok(Message::Close(_))) | Some(Err(_))
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                None | Some(Ok(Message::Close(_))) | Some(Err(_))
+            ));
+        }
     }
     #[tokio::test]
     async fn relay_broadcast_target_and_presence() {
@@ -601,10 +615,11 @@ mod sockets {
         let result = tokio::time::timeout(Duration::from_secs(7), socket.next())
             .await
             .unwrap();
-        assert!(matches!(
-            result,
-            None | Some(Ok(Message::Close(_))) | Some(Err(_))
-        ));
+        let text = result.unwrap().unwrap().into_text().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            json!({"type":"error","code":"auth"})
+        );
     }
     #[tokio::test]
     async fn channel_schema_undeclared_and_rate_enforced() {
@@ -613,10 +628,10 @@ mod sockets {
             Some(json!({"valid":{"delivery":"reliable","schemaRef":"message@1","maxRate":1}})),
         )
         .await;
-        for (channel, payload, twice) in [
-            ("valid", json!("bad"), false),
-            ("missing", json!(1), false),
-            ("valid", json!(1), true),
+        for (channel, payload, twice, code) in [
+            ("valid", json!("bad"), false, "schema"),
+            ("missing", json!(1), false, "channel"),
+            ("valid", json!(1), true, "rate"),
         ] {
             let mut a = auth(&f, &ticket(&f, "alice").await).await;
             read(&mut a).await;
@@ -626,6 +641,7 @@ mod sockets {
             if twice {
                 a.send(Message::Text(frame.into())).await.unwrap();
             }
+            assert_eq!(read(&mut a).await, json!({"type":"error","code":code}));
             closed(&mut a).await;
         }
     }
@@ -724,6 +740,7 @@ mod sockets {
         let frame = json!({"v":1,"type":"data","channel":"x","seq":1,"payload":"x".repeat(70_000)})
             .to_string();
         a.send(Message::Text(frame.into())).await.unwrap();
+        assert_eq!(read(&mut a).await, json!({"type":"error","code":"frame"}));
         closed(&mut a).await;
     }
     #[tokio::test]

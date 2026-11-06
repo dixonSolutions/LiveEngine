@@ -16,11 +16,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 use subtle::ConstantTimeEq;
-use tokio::sync::Semaphore;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as UpstreamMessage};
 
 #[derive(Default)]
@@ -271,10 +270,7 @@ pub(crate) async fn registry_socket(
             return error(StatusCode::FORBIDDEN, "origin not allowed");
         }
     }
-    static SUBSCRIBERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    let slots = SUBSCRIBERS
-        .get_or_init(|| Arc::new(Semaphore::new(256)))
-        .clone();
+    let slots = state.registry_subscribers.clone();
     let Ok(permit) = slots.try_acquire_owned() else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,

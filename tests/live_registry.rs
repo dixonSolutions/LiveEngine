@@ -377,3 +377,43 @@ async fn remote_registry_refuses_trace_loops() {
     let snapshot = read(&mut ws).await;
     assert_eq!(snapshot["hubs"][0]["status"], "unreachable");
 }
+
+#[tokio::test]
+async fn subscriber_capacity_is_configurable_per_service() {
+    let service = HubService::new(HubConfig {
+        token: TOKEN.into(),
+        live_registry_max_subscribers: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/v1/live/registry", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, service.router().into_make_service())
+            .await
+            .unwrap()
+    });
+    let (mut first, _) = connect_async(&url).await.unwrap();
+    first
+        .send(Message::Text(
+            json!({"type":"auth","token":TOKEN,"path":[],"depth":1})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(read(&mut first).await["type"], "snapshot");
+    assert!(connect_async(&url).await.is_err());
+    first.close(None).await.unwrap();
+    let mut connected = false;
+    for _ in 0..50 {
+        if let Ok((mut socket, _)) = connect_async(&url).await {
+            socket.close(None).await.unwrap();
+            connected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(connected);
+    task.abort();
+}

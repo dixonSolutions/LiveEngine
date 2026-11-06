@@ -177,6 +177,16 @@ describe('HubClient pairing', () => {
 });
 
 describe('LiveClient server event trust', () => {
+  test('server error frames become error events', () => {
+    const client = new LiveClient({ url: 'ws://example.test', ticket: 'ticket', userId: 'me' }, { direct: false });
+    const errors = [];
+    client.on('error', error => errors.push(error));
+    client._frame({ type: 'error', from: 'attacker', code: 'auth' });
+    client._frame({ type: 'error', code: 'schema' });
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].code, 'schema');
+    client.close();
+  });
   test('a peer-supplied welcome cannot complete the handshake', async () => {
     let socket;
     class StubSocket {
@@ -276,10 +286,13 @@ describe('LiveClient over a real hub (relay)', () => {
     await first.connect();
     first.close();
     const reused = track(new LiveClient(a, { retries: 0 }));
-    await assert.rejects(reused.connect(), /refused the ticket/);
+    const errors = [];
+    reused.on('error', error => errors.push(error));
+    await assert.rejects(reused.connect(), error => error.code === "auth");
+    assert.equal(errors[0].code, 'auth');
     assert.equal(reused.state, 'closed');
     const forged = track(new LiveClient({ ...a, ticket: `${a.ticket}x` }, { retries: 0 }));
-    await assert.rejects(forged.connect(), /refused the ticket/);
+    await assert.rejects(forged.connect(), error => error.code === "auth");
     assert.throws(() => new LiveClient({ url: a.url }), /ticket/);
     assert.throws(() => new LiveClient({ ticket: 't', url: 'ftp://x' }), /ws\(s\)/);
   });

@@ -22,6 +22,10 @@ fn contract_describes_live_registration_and_link_routes() {
             );
         }
     }
+    assert_eq!(
+        schema["$defs"]["TicketRequest"]["properties"]["verified"]["type"],
+        "string"
+    );
     schema["$ref"] = json!("#/$defs/HubRegistration");
     let validator = jsonschema::options()
         .with_draft(jsonschema::Draft::Draft202012)

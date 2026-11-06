@@ -313,3 +313,59 @@ async fn routed_templates_and_central_quotas_share_global_budget() {
     );
     task.abort();
 }
+
+#[tokio::test]
+async fn templates_apply_auth_and_provider_hosting() {
+    let service = HubService::new(HubConfig {
+        token: TOKEN.into(),
+        ..HubConfig::default()
+    })
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            service
+                .router()
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    let client = reqwest::Client::new();
+    let post = |path: &str, body: Value| {
+        client
+            .post(format!("{base}{path}"))
+            .bearer_auth(TOKEN)
+            .json(&body)
+            .send()
+    };
+    assert_eq!(post("/v1/templates", json!({"name":"secure","mode":"internal","auth":{"kind":"token","tokens":[{"token":"template-user-token-at-least-24-chars"}]}})).await.unwrap().status(), 201);
+    let response = post("/v1/hubs", json!({"id":"game","template":"secure"}))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["auth"]["kind"],
+        "token"
+    );
+    assert_eq!(
+        post(
+            "/v1/templates",
+            json!({"name":"hosted","mode":"central","hosting":"provider"})
+        )
+        .await
+        .unwrap()
+        .status(),
+        201
+    );
+    let response = post("/v1/hubs", json!({"id":"central","template":"hosted"}))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    assert!(response.json::<Value>().await.unwrap()["credential"]
+        .as_str()
+        .is_some());
+    task.abort();
+}
