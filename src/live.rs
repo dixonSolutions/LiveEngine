@@ -1311,30 +1311,32 @@ async fn resolve(
     None
 }
 
-async fn paired(record: &HubRecord, user: &str, room: &str) -> bool {
+async fn paired(
+    state: &Inner,
+    record: &HubRecord,
+    user: &str,
+    room: &str,
+) -> Result<bool, crate::hub::HubBusy> {
     let Some(handler) = record.handler.clone() else {
-        return false;
+        return Ok(false);
     };
     let user = user.to_owned();
     let room = room.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let Ok(mut handler) = handler.lock() else {
-            return false;
-        };
-        let Ok(u) = handler.call("getUser", vec![Value::String(user.clone())]) else {
-            return false;
-        };
-        let Ok(r) = handler.call("getServer", vec![Value::String(room.clone())]) else {
-            return false;
-        };
-        u["status"] == "paired"
-            && u["serverId"] == room
-            && r["members"]
-                .as_array()
-                .is_some_and(|m| m.iter().any(|v| v.as_str() == Some(&user)))
-    })
-    .await
-    .unwrap_or(false)
+    state
+        .run_on_hub(&handler, move |handler| {
+            let Ok(u) = handler.call("getUser", vec![Value::String(user.clone())]) else {
+                return false;
+            };
+            let Ok(r) = handler.call("getServer", vec![Value::String(room.clone())]) else {
+                return false;
+            };
+            u["status"] == "paired"
+                && u["serverId"] == room
+                && r["members"]
+                    .as_array()
+                    .is_some_and(|m| m.iter().any(|v| v.as_str() == Some(&user)))
+        })
+        .await
 }
 
 async fn build_validators(
@@ -1398,7 +1400,10 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
     let Some((record, channels)) = resolve(&state, &key.0).await else {
         return;
     };
-    if !paired(&record, &user, &key.1).await {
+    if !paired(&state, &record, &user, &key.1)
+        .await
+        .unwrap_or(false)
+    {
         return;
     }
     let local_channels = channels.is_some();
@@ -1515,7 +1520,7 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
             _ = &mut writer => break,
             _ = tick.tick() => {
                 if last_activity.elapsed() >= Duration::from_secs(limit("LIVEENGINE_LIVE_IDLE_SECONDS", 60) as u64) { break }
-                if !resolve(&state, &key.0).await.is_some_and(|(current, _)| match (&current.handler, &record.handler) { (Some(a), Some(b)) => Arc::ptr_eq(a, b), _ => false }) || !paired(&record, &user, &key.1).await { break }
+                if !resolve(&state, &key.0).await.is_some_and(|(current, _)| match (&current.handler, &record.handler) { (Some(a), Some(b)) => Arc::ptr_eq(a, b), _ => false }) || !paired(&state, &record, &user, &key.1).await.unwrap_or(true) { break }
                 if last_ping.elapsed() >= Duration::from_secs(limit("LIVEENGINE_LIVE_PING_SECONDS", 20) as u64) {
                     let rooms = state.live_rooms.rooms.lock().await;
                     if let Some(queue) = rooms.get(&key).and_then(|r| r.get(&user)) { queue.send(Message::Ping(Default::default()), false); }

@@ -727,6 +727,20 @@ mod sockets {
         closed(&mut a).await;
     }
     #[tokio::test]
+    async fn tickets_do_not_collide_with_membership_checks() {
+        let f = setup(60).await;
+        for _ in 0..20 {
+            let (a, b) = tokio::join!(ticket(&f, "alice"), ticket(&f, "bob"));
+            let _ = tokio::join!(
+                auth(&f, &a),
+                auth(&f, &b),
+                ticket(&f, "carol"),
+                ticket(&f, "alice"),
+                ticket(&f, "bob"),
+            );
+        }
+    }
+    #[tokio::test]
     async fn slow_consumer_reliable_and_lossy() {
         let Some(delivery) = std::env::var("LIVEENGINE_TEST_SLOW_CASE").ok() else {
             for delivery in ["reliable", "lossy"] {

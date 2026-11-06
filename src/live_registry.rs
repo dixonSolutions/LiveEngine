@@ -517,20 +517,18 @@ fn snapshot_inner<'a>(
         let mut nodes = Vec::new();
         for r in records {
             let (rooms, members) = if let Some(handler) = r.handler.clone() {
-                tokio::task::spawn_blocking(move || {
-                    let Ok(mut h) = handler.lock() else {
-                        return (0, 0);
-                    };
-                    let Ok(s) = h.call("stats", vec![]) else {
-                        return (0, 0);
-                    };
-                    (
-                        s["servers"].as_u64().unwrap_or(0),
-                        s["paired"].as_u64().unwrap_or(0),
-                    )
-                })
-                .await
-                .unwrap_or((0, 0))
+                state
+                    .run_on_hub(&handler, |h| {
+                        let Ok(s) = h.call("stats", vec![]) else {
+                            return (0, 0);
+                        };
+                        (
+                            s["servers"].as_u64().unwrap_or(0),
+                            s["paired"].as_u64().unwrap_or(0),
+                        )
+                    })
+                    .await
+                    .unwrap_or((0, 0))
             } else {
                 (0, 0)
             };
