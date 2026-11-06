@@ -931,6 +931,13 @@ async fn refreshed_import_marks_missing_entries_stale_and_persists_credentials_p
     }
     drop(app);
     drop(importer);
+    // The refresh saves in the background, so wait for it to reach the file.
+    for _ in 0..50 {
+        if std::fs::read_to_string(&path).is_ok_and(|s| s.contains("\"stale\":true")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let restored = HubService::new(cfg).unwrap();
     let restored_app = restored.router();
     let (_, value) = request(
