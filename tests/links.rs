@@ -995,9 +995,21 @@ async fn three_services_in_a_ring_deliver_once_and_do_not_loop() {
     assert!(frames_within(&mut alice, 1500).await.is_empty());
     assert!(frames_within(&mut bob, 100).await.is_empty());
     assert!(frames_within(&mut carol, 100).await.is_empty());
+    // Presence can arrive before the last link is bridged, so keep sending until a
+    // copy has come all the way round. Every frame must still arrive exactly once.
     let mut dropped = 0;
-    for n in [&a, &b, &c] {
-        dropped += counters(n).await.0;
+    for seq in 2..=50u64 {
+        for n in [&a, &b, &c] {
+            dropped += counters(n).await.0;
+        }
+        if dropped > 0 {
+            break;
+        }
+        say(&mut alice, frame(seq, json!("around"))).await;
+        for ws in [&mut bob, &mut carol] {
+            assert!(wait_for(ws, 5000, is_frame).await.is_some());
+            assert!(frames_within(ws, 100).await.is_empty());
+        }
     }
     assert!(dropped > 0, "the ring must have dropped looping copies");
     // A second frame from the far side behaves the same.

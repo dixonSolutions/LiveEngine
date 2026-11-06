@@ -1488,6 +1488,8 @@ async fn persist(state: &Inner) -> Result<(), String> {
             file.write_all(&bytes)?;
             file.sync_all()?;
             std::fs::rename(&temp, &path)?;
+            // Directories cannot be opened for syncing on Windows.
+            #[cfg(unix)]
             std::fs::File::open(parent)?.sync_all()?;
             Ok(())
         })();
