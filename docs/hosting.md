@@ -80,7 +80,7 @@ Hub registration accepts `schemaRef` instead of `scopeSchema`; `userSchema` and 
 
 Create a template with `POST /v1/templates`, for example `{"name":"game","mode":"internal","ttlSeconds":60}`. List templates with `GET /v1/templates`, retrieve or delete one at `/v1/templates/{name}`. Template credentials are write-only. Register with `{"id":"match-1","template":"game","ifAbsent":true}`; supplied fields override template defaults. A repeated `ifAbsent` registration returns the existing hub without changing it. The server removes expired hubs in the background. Template and hub registries are each bounded by `LIVEENGINE_MAX_HUBS`.
 
-Local central hubs accept `maxHubs` to limit their immediate children, including on-demand registrations. The service-wide `LIVEENGINE_MAX_HUBS` budget also counts central hubs and their descendants. Use `POST /v1/route` with `{ "path": ["central-id"], "op": "register", "body": { "id": "match-1", "template": "game" } }` to create a child from a service template. Nested paths are limited by `LIVEENGINE_MAX_DEPTH` (default 8, maximum 16).
+Local central hubs accept `maxHubs` to limit their immediate children, including on-demand registrations; on provider-hosted hubs it limits all descendants. The service-wide `LIVEENGINE_MAX_HUBS` budget also counts central hubs and their descendants. Use `POST /v1/route` with `{ "path": ["central-id"], "op": "register", "body": { "id": "match-1", "template": "game" } }` to create a child from a service template. Nested paths are limited by `LIVEENGINE_MAX_DEPTH` (default 8, maximum 16).
 
 
 ## Nested central hubs
@@ -191,6 +191,14 @@ is default deny:
 - Digests are compared in constant time. Deleting the hub ends the credential; a hub
   created again under the same id gets a new one. A hosted hub's holder can create nested
   hosted hubs, whose credentials are narrower.
+
+By default, a scoped credential can register internal hubs and local centrals, but external hubs,
+remote centrals and webhook auth return `403`. An administrator can opt in at provider-hosted
+creation with `"hostedPolicy":{"allowRemote":true}`. The policy persists and applies to the
+subtree; scoped credentials cannot set it, and an administrator cannot widen a nested policy
+beyond its parent. Nested hosted hubs inherit the parent policy when omitted. Outbound hosts
+remain subject to the service allowlist. A provider-hosted `maxHubs` counts every descendant,
+including nested centrals; nested limits cannot increase an ancestor's quota.
 
 Live transport sits behind `liveengine::transport::LiveTransport`; the built-in one is the
 axum WebSocket.

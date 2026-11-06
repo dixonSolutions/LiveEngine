@@ -99,7 +99,7 @@
         "maxHubs": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum immediate children of a local central hub."
+          "description": "Maximum immediate children of a local central; on provider-hosted hubs, maximum total descendants."
         },
         "liveDepth": {
           "type": "integer",
@@ -115,6 +115,9 @@
           "additionalProperties": {
             "$ref": "#/$defs/LiveChannel"
           }
+        },
+        "hostedPolicy": {
+          "$ref": "#/$defs/HostedPolicy"
         }
       },
       "allOf": [
@@ -263,7 +266,7 @@
         "maxHubs": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum immediate children of a local central hub."
+          "description": "Maximum immediate children of a local central; on provider-hosted hubs, maximum total descendants."
         },
         "auth": {
           "$ref": "#/$defs/AuthInfo",
@@ -281,6 +284,9 @@
           "additionalProperties": {
             "$ref": "#/$defs/LiveChannel"
           }
+        },
+        "hostedPolicy": {
+          "$ref": "#/$defs/HostedPolicy"
         }
       }
     },
@@ -631,7 +637,10 @@
         "maxHubs": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum immediate children of a local central hub."
+          "description": "Maximum immediate children of a local central; on provider-hosted hubs, maximum total descendants."
+        },
+        "hostedPolicy": {
+          "$ref": "#/$defs/HostedPolicy"
         }
       },
       "additionalProperties": false
@@ -1112,6 +1121,17 @@
           "minimum": 1
         }
       }
+    },
+    "HostedPolicy": {
+      "type": "object",
+      "properties": {
+        "allowRemote": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow scoped credentials to register remote hubs and webhook authentication."
+        }
+      },
+      "additionalProperties": false
     }
   },
   "x-routes": {

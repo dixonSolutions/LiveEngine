@@ -454,7 +454,17 @@ pub struct HubSpec {
     /// create such a hub with `HubService::register_hosted`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hosting: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosted_policy: Option<HostedPolicy>,
     pub if_absent: bool,
+}
+
+/// Administrator-controlled permissions for a provider-hosted subtree.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostedPolicy {
+    #[serde(default)]
+    pub allow_remote: bool,
 }
 
 /// A provider-hosted hub and the credential that manages it and its subtree.
@@ -513,6 +523,8 @@ pub struct HubInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_hubs: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_policy: Option<HostedPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_depth: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<crate::auth::AuthInfo>,
@@ -554,6 +566,7 @@ pub(crate) struct HubRecord {
     pub(crate) child: Option<Arc<Inner>>,
     custom: bool,
     _slot: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    _hosted_slots: Vec<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 struct RateEntry {
@@ -681,6 +694,8 @@ pub(crate) struct Inner {
     call_waiting: Arc<AtomicUsize>,
     hub_slots: Arc<Semaphore>,
     global_max_hubs: usize,
+    hosted_limits: Vec<Arc<Semaphore>>,
+    hosted_remote: Option<bool>,
     pub(crate) instance_id: String,
     inherited: [Option<Value>; 3],
     imports: Arc<RwLock<Vec<ImportRegistryRequest>>>,
@@ -757,6 +772,8 @@ impl HubService {
                 inflight_calls,
                 call_waiting: Arc::new(AtomicUsize::new(0)),
                 global_max_hubs,
+                hosted_limits: Vec::new(),
+                hosted_remote: None,
                 hub_slots,
                 instance_id,
                 inherited: [None, None, None],
@@ -1015,6 +1032,7 @@ impl HubService {
             server_schema: None,
             channels: None,
             max_hubs: None,
+            hosted_policy: None,
             live_depth: None,
             auth: None,
             stale: false,
@@ -1030,6 +1048,7 @@ impl HubService {
             child: None,
             custom: true,
             _slot: None,
+            _hosted_slots: Vec::new(),
         };
         let mut hubs = self.inner.hubs.write().await;
         expire_hubs(&mut hubs);
@@ -1212,6 +1231,18 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
         } else if info.auth.is_some() {
             return Err("invalid state file hub".into());
         }
+        if info.hosted_policy.is_some() && saved.hosted_credential.is_none() {
+            return Err("invalid state file hosted policy".into());
+        }
+        let mut hosted_slots = Vec::new();
+        for limit in &state.hosted_limits {
+            hosted_slots.push(Arc::new(
+                limit
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| "state file exceeds hub limits")?,
+            ));
+        }
         let child = if info.mode == HubMode::Central && info.address.is_none() {
             let mut config = state.config.clone();
             config.state_file = None;
@@ -1221,6 +1252,22 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
                 Arc::try_unwrap(service.inner).map_err(|_| "state initialization failed")?;
             inner.root = false;
             inner.global_max_hubs = state.global_max_hubs;
+            inner.hosted_limits = state.hosted_limits.clone();
+            inner.hosted_remote = state.hosted_remote;
+            if saved.hosted_credential.is_some() {
+                let allowed = info
+                    .hosted_policy
+                    .as_ref()
+                    .map(|p| p.allow_remote)
+                    .unwrap_or(state.hosted_remote.unwrap_or(false));
+                if allowed && state.hosted_remote == Some(false) {
+                    return Err("invalid state file hosted policy".into());
+                }
+                inner.hosted_remote = Some(state.hosted_remote.unwrap_or(true) && allowed);
+                if let Some(max) = info.max_hubs {
+                    inner.hosted_limits.push(Arc::new(Semaphore::new(max)));
+                }
+            }
             inner.hub_slots = state.hub_slots.clone();
             inner.schemas = state.schemas.clone();
             inner.templates = state.templates.clone();
@@ -1288,6 +1335,7 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
             custom: saved.custom,
             child,
             _slot: Some(Arc::new(slot)),
+            _hosted_slots: hosted_slots,
             info,
         };
         if hubs.insert(record.info.id.clone(), record).is_some() {
@@ -2040,6 +2088,23 @@ async fn route_scoped(
     if let Ok(value) = depth.to_string().parse() {
         headers.insert("x-liveengine-depth", value);
     }
+    if scope.is_some() && request.op == "register" {
+        let body = &request.body;
+        if body.get("hostedPolicy").is_some() {
+            return error(
+                StatusCode::FORBIDDEN,
+                "hosted policy requires administrator",
+            );
+        }
+        if !state.hosted_remote.unwrap_or(false)
+            && (body.get("mode").and_then(Value::as_str) == Some("external")
+                || (body.get("mode").and_then(Value::as_str) == Some("central")
+                    && body.get("address").is_some_and(|v| !v.is_null()))
+                || body.pointer("/auth/kind").and_then(Value::as_str) == Some("webhook"))
+        {
+            return error(StatusCode::FORBIDDEN, "remote hosting is not allowed");
+        }
+    }
     match request.op.as_str() {
         "discover" => crate::pairing::discover(state, headers, request.body).await,
         "pair" => {
@@ -2505,6 +2570,13 @@ async fn create_template(
             return error(StatusCode::BAD_REQUEST, "invalid hosting");
         }
     }
+    if let Some(policy) = validation.remove("hostedPolicy") {
+        if object.get("hosting").and_then(Value::as_str) != Some("provider")
+            || serde_json::from_value::<HostedPolicy>(policy).is_err()
+        {
+            return error(StatusCode::BAD_REQUEST, "invalid hostedPolicy");
+        }
+    }
     let user_schema = validation.remove("userSchema");
     let server_schema = validation.remove("serverSchema");
     let channels = match parse_channels(validation.remove("channels"), &state).await {
@@ -2675,6 +2747,23 @@ async fn register_hub_inherited(
         }
         _ => return error(StatusCode::BAD_REQUEST, "invalid hosting"),
     };
+    let hosted_policy = match object.remove("hostedPolicy") {
+        None => None,
+        Some(value) if hosted.is_some() => match serde_json::from_value::<HostedPolicy>(value) {
+            Ok(policy) => Some(policy),
+            Err(_) => return error(StatusCode::BAD_REQUEST, "invalid hostedPolicy"),
+        },
+        Some(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "hostedPolicy requires provider hosting",
+            )
+        }
+    };
+    if hosted_policy.as_ref().is_some_and(|p| p.allow_remote) && state.hosted_remote == Some(false)
+    {
+        return error(StatusCode::FORBIDDEN, "hosted policy exceeds parent policy");
+    }
     let user_schema = object.remove("userSchema");
     let server_schema = object.remove("serverSchema");
     let channels = match parse_channels(object.remove("channels"), &state).await {
@@ -2779,6 +2868,7 @@ async fn register_hub_inherited(
         server_schema,
         channels,
         max_hubs,
+        hosted_policy,
         live_depth,
         auth: auth.as_ref().map(crate::auth::AuthConfig::info),
         stale: false,
@@ -2798,6 +2888,20 @@ async fn register_hub_inherited(
         };
         let mut inner = Arc::try_unwrap(service.inner).ok().unwrap();
         inner.global_max_hubs = state.global_max_hubs;
+        inner.hosted_limits = state.hosted_limits.clone();
+        inner.hosted_remote = state.hosted_remote;
+        if hosted.is_some() {
+            // An omitted nested policy inherits its parent's permission.
+            let allowed = info
+                .hosted_policy
+                .as_ref()
+                .map(|p| p.allow_remote)
+                .unwrap_or(state.hosted_remote.unwrap_or(false));
+            inner.hosted_remote = Some(state.hosted_remote.unwrap_or(true) && allowed);
+            if let Some(max) = max_hubs {
+                inner.hosted_limits.push(Arc::new(Semaphore::new(max)));
+            }
+        }
         inner.hub_slots = state.hub_slots.clone();
         inner.templates = state.templates.clone();
         inner.schemas = state.schemas.clone();
@@ -2843,6 +2947,7 @@ async fn register_hub_inherited(
         custom: false,
         child,
         _slot: None,
+        _hosted_slots: Vec::new(),
     };
     let mut hubs = state.hubs.write().await;
     expire_hubs(&mut hubs);
@@ -2865,6 +2970,12 @@ async fn register_hub_inherited(
         }
     };
     let mut record = record;
+    for limit in &state.hosted_limits {
+        match limit.clone().try_acquire_owned() {
+            Ok(permit) => record._hosted_slots.push(Arc::new(permit)),
+            Err(_) => return error(StatusCode::INSUFFICIENT_STORAGE, "hub registry is full"),
+        }
+    }
     record._slot = Some(Arc::new(slot));
     hubs.insert(id, record.clone());
     let mut body = serde_json::to_value(public_info(&record)).unwrap_or(Value::Null);
@@ -3051,6 +3162,7 @@ async fn import_registry(
             server_schema: remote.get("serverSchema").cloned(),
             channels: None,
             max_hubs: None,
+            hosted_policy: None,
             live_depth: None,
             auth: None,
             stale: false,
@@ -3086,6 +3198,7 @@ async fn import_registry(
             child: None,
             custom: false,
             _slot: None,
+            _hosted_slots: Vec::new(),
         });
     }
     let new_ids = {

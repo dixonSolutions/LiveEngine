@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Restrict provider-hosted credentials to local registrations by default, add administrator-controlled remote opt-in, and enforce hosted hub quotas across descendants.
+
 - Start on read-only filesystems: without a configured location the instance id stays in memory, with a warning.
 
 - Validate live limits at startup, make the registry subscriber cap configurable, expose live error codes, and repair templates, clients, contract metadata and link service tickets.

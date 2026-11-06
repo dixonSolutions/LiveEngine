@@ -755,7 +755,10 @@ async fn provider_credential_cannot_reach_through_a_remote_central() {
     let (_, remote_hubs) = route(&remote_base, REMOTE, json!(["acme"]), "list", json!({})).await;
     assert_eq!(remote_hubs["hubs"], json!([]));
     // A hosted hub on the front service may still manage a remote central it registered itself.
-    let front_credential = hosted(&front_base, "mine").await;
+    let (status, body) = send(&front_base, "POST", "/v1/hubs", TOKEN,
+        Some(json!({"id":"mine","mode":"central","hosting":"provider","hostedPolicy":{"allowRemote":true}}))).await;
+    assert_eq!(status, 201, "{body}");
+    let front_credential = body["credential"].as_str().unwrap().to_owned();
     let (status, body) = child(
         &front_base,
         &front_credential,
@@ -816,4 +819,115 @@ async fn hosted_hub_state_is_not_shared_between_siblings_in_the_registry_views()
     .await;
     assert_eq!(status, 200, "{found}");
     assert!(!found.to_string().contains("beta"), "{found}");
+}
+
+#[tokio::test]
+async fn hosted_policy_defaults_to_local_and_cannot_be_widened() {
+    let (_service, base) = node(TOKEN).await;
+    let credential = hosted(&base, "tenant").await;
+    for body in [
+        json!({"id":"external","mode":"external","address":"http://127.0.0.1:1","remoteToken":REMOTE}),
+        json!({"id":"remote","mode":"central","address":"http://127.0.0.1:1","remoteToken":REMOTE}),
+        json!({"id":"webhook","mode":"internal","auth":{"kind":"webhook","url":"http://127.0.0.1:1"}}),
+        json!({"id":"nested","mode":"central","hosting":"provider","hostedPolicy":{"allowRemote":false}}),
+        json!({"id":"nested","mode":"central","hosting":"provider","hostedPolicy":{"allowRemote":true}}),
+    ] {
+        let (status, answer) = child(&base, &credential, json!(["tenant"]), body.clone()).await;
+        assert_eq!(status, 403, "{body}: {answer}");
+    }
+    let (status, answer) = route(&base, TOKEN, json!(["tenant"]), "register", json!({"id":"nested","mode":"central","hosting":"provider","hostedPolicy":{"allowRemote":true}})).await;
+    assert_eq!(status, 403, "{answer}");
+    for body in [
+        json!({"id":"local","mode":"internal"}),
+        json!({"id":"central","mode":"central"}),
+    ] {
+        let (status, answer) = child(&base, &credential, json!(["tenant"]), body).await;
+        assert_eq!(status, 201, "{answer}");
+    }
+}
+
+#[tokio::test]
+async fn hosted_opt_in_and_subtree_quota_survive_restart() {
+    let path = std::env::temp_dir().join(format!(
+        "hosted-policy-{}-{}.json",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let (_remote, remote) = node(REMOTE).await;
+    let mut cfg = config(TOKEN);
+    cfg.state_file = Some(path.clone());
+    let service = HubService::new(cfg.clone()).unwrap();
+    service.initialize_state().await.unwrap();
+    let base = serve(&service).await;
+    let (status, answer) = send(&base, "POST", "/v1/hubs", TOKEN, Some(json!({"id":"tenant","mode":"central","hosting":"provider","maxHubs":3,"hostedPolicy":{"allowRemote":true}}))).await;
+    assert_eq!(status, 201, "{answer}");
+    let credential = answer["credential"].as_str().unwrap();
+    let (status, answer) = child(
+        &base,
+        credential,
+        json!(["tenant"]),
+        json!({"id":"nested","mode":"central","maxHubs":20}),
+    )
+    .await;
+    assert_eq!(status, 201, "{answer}");
+    let restarted = HubService::new(cfg).unwrap();
+    let base2 = serve(&restarted).await;
+    let (status, answer) = child(
+        &base2,
+        credential,
+        json!(["tenant", "nested"]),
+        json!({"id":"remote","mode":"central","address":remote,"remoteToken":REMOTE}),
+    )
+    .await;
+    assert_eq!(status, 201, "{answer}");
+    let (status, answer) = child(
+        &base2,
+        credential,
+        json!(["tenant", "nested"]),
+        json!({"id":"local","mode":"internal"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{answer}");
+    let (status, answer) = child(
+        &base2,
+        credential,
+        json!(["tenant"]),
+        json!({"id":"over","mode":"internal"}),
+    )
+    .await;
+    assert_eq!(status, 507, "{answer}");
+    assert_eq!(answer["error"], "hub registry is full");
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn opted_in_policy_allows_remote_hubs_and_webhook_and_can_be_narrowed() {
+    let (_remote, remote) = node(REMOTE).await;
+    let (status, answer) = send(
+        &remote,
+        "POST",
+        "/v1/hubs",
+        REMOTE,
+        Some(json!({"id":"game","mode":"internal"})),
+    )
+    .await;
+    assert_eq!(status, 201, "{answer}");
+    let (_front, base) = node(TOKEN).await;
+    let (status, answer) = send(&base, "POST", "/v1/hubs", TOKEN, Some(json!({"id":"tenant","mode":"central","hosting":"provider","hostedPolicy":{"allowRemote":true}}))).await;
+    assert_eq!(status, 201, "{answer}");
+    let credential = answer["credential"].as_str().unwrap();
+    for body in [
+        json!({"id":"external","mode":"external","address":remote,"remoteHubId":"game","remoteToken":REMOTE}),
+        json!({"id":"webhook","mode":"internal","auth":{"kind":"webhook","url":format!("{remote}/verify")}}),
+    ] {
+        let (status, answer) = child(&base, credential, json!(["tenant"]), body).await;
+        assert_eq!(status, 201, "{answer}");
+    }
+    let (status, answer) = route(&base, TOKEN, json!(["tenant"]), "register", json!({"id":"narrow","mode":"central","hosting":"provider","hostedPolicy":{"allowRemote":false}})).await;
+    assert_eq!(status, 201, "{answer}");
+    let nested = answer["credential"].as_str().unwrap();
+    for token in [credential, nested] {
+        let (status, answer) = child(&base, token, json!(["tenant","narrow"]), json!({"id":"webhook","mode":"internal","auth":{"kind":"webhook","url":format!("{remote}/verify")}})).await;
+        assert_eq!(status, 403, "{answer}");
+    }
 }

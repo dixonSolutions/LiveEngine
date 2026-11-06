@@ -37,7 +37,7 @@ const created = await admin.register({
   id: 'tenant-a',
   mode: 'central',
   hosting: 'provider',
-  maxHubs: 16,          // optional: at most 16 immediate children
+  maxHubs: 16,          // optional: at most 16 descendants
   ttlSeconds: 86400,    // optional: the hub and its credential expire together
 });
 
@@ -133,7 +133,7 @@ There is no route to rotate or revoke a hosted credential other than deleting th
 
 | Setting | Effect |
 | --- | --- |
-| `maxHubs` on the hosted hub | Maximum immediate children. It does not cap descendants: a holder can create a nested central with its own `maxHubs` |
+| `maxHubs` on the hosted hub | Maximum descendants across the subtree; nested centrals cannot raise this limit |
 | `LIVEENGINE_MAX_HUBS` | Service-wide budget; counts every central and its descendants |
 | `LIVEENGINE_MAX_DEPTH` | Maximum depth, 8 by default and 16 at most; the hosted hub's own position counts |
 | `ttlSeconds` | Expires the hub and its credential. Never longer than the service maximum (24 hours by default in `HubConfig`) |
@@ -159,7 +159,7 @@ Other errors are the ones of the underlying operation (for example `404 hub not 
 ## Security notes
 
 - Treat the credential like an administrator token for that subtree. Anyone who holds it can create and delete hubs (with their own schemas, channels and `auth`), call them, and issue tickets for any room in the subtree.
-- A holder can register `external` hubs and remote centrals, and `webhook` auth, to any host in `LIVEENGINE_ALLOWED_REMOTE_HOSTS` with credentials of its choosing. Keep the allowlist to hosts you would let every tenant reach, or do not offer provider hosting to tenants you do not trust.
+- By default a holder cannot register external hubs, remote centrals, or webhook auth. An administrator can opt in at creation with `hostedPolicy: { allowRemote: true }`; the service allowlist still applies. Scoped credentials cannot set the policy, and nested hosted policies cannot exceed their parent. Omitted nested policies inherit the parent, and policies persist across restarts.
 - A holder can reference schemas that you published with `schemaRef`, and can use inline `scopeSchema`, `userSchema`, `serverSchema` and `channels`. It cannot publish schemas or templates.
 - Only a SHA-256 digest of the credential is stored (in the state file, when one is configured). The state file also holds other secrets; keep it mode 0600. Without a state file, hosted hubs and credentials disappear on restart.
 - The browser must never hold this credential. The tenant's server uses it and gives players tickets, as in [live rooms](/guides/live-rooms).
@@ -167,7 +167,7 @@ Other errors are the ones of the underlying operation (for example `404 hub not 
 ## What is not supported
 
 - No credential rotation or separate revocation; delete and recreate the hub.
-- No per-tenant resource quotas beyond `maxHubs` for immediate children and the service-wide limits.
+- No per-tenant resource quotas beyond `maxHubs` for the hosted subtree and the service-wide limits.
 - No access to schemas, templates, links, import, export or `/v1/tree` for a holder.
 - No hosting of remote centrals: provider hosting is for a local central only.
 - No change to the hosting of an existing hub.

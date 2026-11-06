@@ -180,7 +180,10 @@ export interface HubDefinition {
   auth?: HubAuth;
   /** Central hubs only: run on this service and return a hub-scoped credential once. */
   hosting?: 'provider';
+  /** Administrator-only provider-hosted policy; nested policies cannot widen their parent. */
+  hostedPolicy?: { allowRemote?: boolean };
   ttlSeconds?: number;
+  /** Provider-hosted centrals count all descendants; other centrals count immediate children. */
   maxHubs?: number;
   liveDepth?: number;
 }
