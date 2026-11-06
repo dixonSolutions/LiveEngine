@@ -553,6 +553,21 @@ pub(crate) async fn pair(
         None
     };
     let room = existing.clone().unwrap_or(room);
+    // A hub that sets `auth` must accept the subject's credential before membership changes.
+    let role = if kind == "hub" { "service" } else { "peer" };
+    let credential = subject.get("credential").cloned().unwrap_or(Value::Null);
+    if let Err(e) = routed(
+        state.clone(),
+        headers.clone(),
+        path.clone(),
+        "authorize",
+        json!({"id":hub_id,"userId":id,"serverId":room,"role":role,"credential":credential}),
+        inherited.clone(),
+    )
+    .await
+    {
+        return e;
+    }
     if peer {
         let result = routed(
             state.clone(),
@@ -634,7 +649,20 @@ pub(crate) async fn pair(
             }
         }
     }
-    let ticket = match routed_with_channels(state, headers, path, "ticket", json!({"id":hub_id,"userId":id,"serverId":room,"role":if kind == "hub" {"service"} else {"peer"}}), inherited, inherited_channels).await { Ok(v) => v, Err(e) => return e };
+    let ticket = match routed_with_channels(
+        state,
+        headers,
+        path,
+        "ticket",
+        json!({"id":hub_id,"userId":id,"serverId":room,"role":role,"credential":credential}),
+        inherited,
+        inherited_channels,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let link = match (kind, peer) {
         ("peer", true) => "peer-peer",
         ("hub", false) => "hub-hub",

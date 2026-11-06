@@ -56,6 +56,9 @@
           "additionalProperties": true,
           "default": {}
         },
+        "auth": {
+          "$ref": "#/$defs/AuthDefinition"
+        },
         "scopeSchema": {
           "description": "JSON Schema draft 2020-12 for scopes; only local references are allowed.",
           "type": [
@@ -249,9 +252,197 @@
           "minimum": 1,
           "description": "Maximum immediate children of a local central hub."
         },
+        "auth": {
+          "$ref": "#/$defs/AuthInfo",
+          "description": "Only the verifier kind; never any secret."
+        },
         "stale": {
           "type": "boolean",
           "description": "True when a refreshed registry no longer lists this imported hub."
+        }
+      }
+    },
+    "AuthDefinition": {
+      "description": "Per-hub credential verifier, checked before a ticket is issued. Write-only: secrets are persisted but never returned. Only the kind is published, as HubInfo.auth.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "tokens"
+          ],
+          "properties": {
+            "kind": {
+              "const": "token"
+            },
+            "tokens": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 256,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "token"
+                ],
+                "properties": {
+                  "token": {
+                    "type": "string",
+                    "minLength": 24,
+                    "maxLength": 512,
+                    "writeOnly": true
+                  },
+                  "identity": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "claims": {
+                    "type": "object",
+                    "description": "User-defined claims; core never interprets them."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "secret"
+          ],
+          "properties": {
+            "kind": {
+              "const": "hmac"
+            },
+            "secret": {
+              "type": "string",
+              "minLength": 32,
+              "maxLength": 512,
+              "writeOnly": true
+            },
+            "leewaySeconds": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 300
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "alg"
+          ],
+          "properties": {
+            "kind": {
+              "const": "jwt"
+            },
+            "alg": {
+              "enum": [
+                "HS256",
+                "EdDSA"
+              ],
+              "description": "Fixed by configuration; the token's own alg header is never trusted."
+            },
+            "secret": {
+              "type": "string",
+              "minLength": 32,
+              "maxLength": 512,
+              "writeOnly": true,
+              "description": "HS256 only."
+            },
+            "publicKey": {
+              "type": "string",
+              "description": "EdDSA only: 32 raw bytes, base64url without padding."
+            },
+            "issuer": {
+              "type": "string"
+            },
+            "audience": {
+              "type": "string"
+            },
+            "identityClaim": {
+              "type": "string",
+              "minLength": 1,
+              "default": "sub"
+            },
+            "leewaySeconds": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 300
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "url"
+          ],
+          "properties": {
+            "kind": {
+              "const": "webhook"
+            },
+            "url": {
+              "type": "string",
+              "format": "uri",
+              "description": "Host must be in LIVEENGINE_ALLOWED_REMOTE_HOSTS."
+            },
+            "secret": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "writeOnly": true,
+              "description": "Sent as a bearer token."
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 10000,
+              "default": 3000
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ],
+          "properties": {
+            "kind": {
+              "const": "custom"
+            },
+            "name": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.-]{1,64}$",
+              "description": "A verifier registered with HubService::register_verifier."
+            }
+          }
+        }
+      ]
+    },
+    "AuthInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "token",
+            "hmac",
+            "jwt",
+            "webhook",
+            "custom"
+          ]
         }
       }
     },
@@ -381,6 +572,9 @@
           "type": "object",
           "additionalProperties": true,
           "default": {}
+        },
+        "auth": {
+          "$ref": "#/$defs/AuthDefinition"
         },
         "scopeSchema": {
           "description": "JSON Schema draft 2020-12 for scopes; only local references are allowed.",

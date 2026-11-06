@@ -391,6 +391,9 @@ pub struct HubSpec {
     pub live_depth: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
+    /// Credential verifier definition, for example `{"kind":"jwt","alg":"HS256","secret":"..."}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<Value>,
     pub if_absent: bool,
 }
 
@@ -445,6 +448,8 @@ pub struct HubInfo {
     pub max_hubs: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_depth: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<crate::auth::AuthInfo>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stale: bool,
 }
@@ -476,6 +481,8 @@ pub(crate) struct HubRecord {
     pub(crate) remote_token: Option<String>,
     /// SHA-256 hex digests of link credentials; the raw tokens are never stored.
     pub(crate) link_credentials: Vec<String>,
+    /// Credential verifier with its secrets; only its kind is ever published.
+    pub(crate) auth: Option<crate::auth::AuthConfig>,
     pub(crate) child: Option<Arc<Inner>>,
     custom: bool,
     _slot: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -499,7 +506,7 @@ pub(crate) struct Inner {
     pub(crate) schemas: Arc<RwLock<HashMap<String, Value>>>,
     templates: Arc<RwLock<HashMap<String, Value>>>,
     reaper_started: AtomicBool,
-    client: Client,
+    pub(crate) client: Client,
     rate: Mutex<HashMap<String, RateEntry>>,
     boot: Instant,
     pub(crate) inflight_calls: Arc<Semaphore>,
@@ -517,12 +524,24 @@ pub(crate) struct Inner {
     pub(crate) live_rooms: Arc<LiveRooms>,
     pub(crate) registry_upstreams: Arc<crate::live_registry::Upstreams>,
     pub(crate) links: Arc<crate::links::Links>,
+    pub(crate) verifiers: crate::auth::Verifiers,
 }
 
 /// Cloneable state for a hosted hub registry.
 #[derive(Clone)]
 pub struct HubService {
     inner: Arc<Inner>,
+}
+
+impl Inner {
+    pub(crate) fn has_verifier(&self, name: &str) -> bool {
+        self.verifiers
+            .read()
+            .is_ok_and(|verifiers| verifiers.contains_key(name))
+    }
+    pub(crate) fn verifier(&self, name: &str) -> Option<Arc<dyn crate::auth::AuthVerifier>> {
+        self.verifiers.read().ok()?.get(name).cloned()
+    }
 }
 
 impl HubService {
@@ -578,12 +597,43 @@ impl HubService {
                 live_rooms: Arc::new(LiveRooms::default()),
                 registry_upstreams: Default::default(),
                 links: Default::default(),
+                verifiers: Default::default(),
             }),
         };
         if let Some(snapshot) = snapshot {
             restore_snapshot(&service.inner, snapshot)?;
         }
         Ok(service)
+    }
+
+    /// Register a compiled credential verifier. Hubs reference it with
+    /// `{"kind":"custom","name":"<name>"}` in their `auth`. Verifiers are shared
+    /// with every nested central and must be registered before the hubs that name them
+    /// are created.
+    pub fn register_verifier<V>(&self, name: &str, verifier: V) -> Result<(), String>
+    where
+        V: crate::auth::AuthVerifier,
+    {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+        {
+            return Err(
+                "verifier name must be 1 to 64 ASCII letters, digits, '.', '_' or '-'".into(),
+            );
+        }
+        let mut verifiers = self
+            .inner
+            .verifiers
+            .write()
+            .map_err(|_| "verifier registry unavailable")?;
+        if verifiers.contains_key(name) {
+            return Err("verifier already registered".into());
+        }
+        verifiers.insert(name.to_string(), Arc::new(verifier));
+        Ok(())
     }
 
     /// Verify and consume a ticket for a room on this service.
@@ -761,6 +811,7 @@ impl HubService {
             channels: None,
             max_hubs: None,
             live_depth: None,
+            auth: None,
             stale: false,
         };
         let mut record = HubRecord {
@@ -769,6 +820,7 @@ impl HubService {
             handler: Some(Arc::new(Mutex::new(Box::new(handler)))),
             remote_token: None,
             link_credentials: Vec::new(),
+            auth: None,
             child: None,
             custom: true,
             _slot: None,
@@ -833,6 +885,8 @@ struct SavedHub {
     remote_token: Option<String>,
     #[serde(default)]
     link_credentials: Vec<String>,
+    #[serde(default)]
+    auth: Option<crate::auth::AuthConfig>,
     expires_at: Option<u64>,
     children: Vec<SavedHub>,
     #[serde(default)]
@@ -933,6 +987,16 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
             ttl_seconds: None,
         };
         validate_registration(state, &reg).map_err(|_| "invalid state file hub")?;
+        if let Some(config) = &saved.auth {
+            if info.mode == HubMode::Central || info.auth != Some(config.info()) {
+                return Err("invalid state file hub".into());
+            }
+            config
+                .validate(state, false)
+                .map_err(|_| "invalid state file hub")?;
+        } else if info.auth.is_some() {
+            return Err("invalid state file hub".into());
+        }
         let child = if info.mode == HubMode::Central && info.address.is_none() {
             let mut config = state.config.clone();
             config.state_file = None;
@@ -955,6 +1019,8 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
             inner.live_rooms = state.live_rooms.clone();
             inner.registry_upstreams = state.registry_upstreams.clone();
             inner.links = state.links.clone();
+            inner.verifiers = state.verifiers.clone();
+            inner.verifiers = state.verifiers.clone();
             inner.hub_path = state
                 .hub_path
                 .iter()
@@ -1002,6 +1068,7 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
                 .map(|t| Instant::now() + Duration::from_secs(t - now)),
             remote_token: saved.remote_token,
             link_credentials: saved.link_credentials,
+            auth: saved.auth,
             custom: saved.custom,
             child,
             _slot: Some(Arc::new(slot)),
@@ -1041,6 +1108,7 @@ fn snapshot_hubs(
                 info: record.info,
                 remote_token: record.remote_token,
                 link_credentials: record.link_credentials,
+                auth: record.auth,
                 expires_at,
                 children,
                 custom: record.custom,
@@ -1690,6 +1758,22 @@ pub(crate) async fn route_hub(
                 headers,
                 serde_json::from_value(Value::Object(body)).ok(),
                 inherited_channels,
+                false,
+            )
+            .await
+        }
+        "authorize" => {
+            let Some(id) = request.body.get("id").and_then(Value::as_str) else {
+                return error(StatusCode::BAD_REQUEST, "missing hub id");
+            };
+            let mut body = request.body.as_object().cloned().unwrap_or_default();
+            let id = id.to_string();
+            body.remove("id");
+            crate::live::authorize_hub(
+                state,
+                id,
+                headers,
+                serde_json::from_value(Value::Object(body)).ok(),
             )
             .await
         }
@@ -2202,6 +2286,21 @@ async fn register_hub_inherited(
         Some(Value::String(s)) => Some(s),
         _ => return error(StatusCode::BAD_REQUEST, "invalid schemaRef"),
     };
+    let auth = match object.remove("auth") {
+        None | Some(Value::Null) => None,
+        Some(value) => match serde_json::from_value::<crate::auth::AuthConfig>(value) {
+            Ok(config) => Some(config),
+            Err(_) => return error(StatusCode::BAD_REQUEST, "invalid auth"),
+        },
+    };
+    if auth.is_some() && object.get("mode").and_then(Value::as_str) == Some("central") {
+        return error(StatusCode::BAD_REQUEST, "central hubs cannot set auth");
+    }
+    if let Some(config) = &auth {
+        if let Err(message) = config.validate(&state, true) {
+            return error(StatusCode::BAD_REQUEST, &message);
+        }
+    }
     let user_schema = object.remove("userSchema");
     let server_schema = object.remove("serverSchema");
     let channels = match parse_channels(object.remove("channels"), &state).await {
@@ -2307,6 +2406,7 @@ async fn register_hub_inherited(
         channels,
         max_hubs,
         live_depth,
+        auth: auth.as_ref().map(crate::auth::AuthConfig::info),
         stale: false,
     };
     let child = if reg.mode == HubMode::Central && info.address.is_none() {
@@ -2338,6 +2438,7 @@ async fn register_hub_inherited(
         inner.live_rooms = state.live_rooms.clone();
         inner.registry_upstreams = state.registry_upstreams.clone();
         inner.links = state.links.clone();
+        inner.verifiers = state.verifiers.clone();
         inner.hub_path = state
             .hub_path
             .iter()
@@ -2363,6 +2464,7 @@ async fn register_hub_inherited(
         },
         remote_token: reg.remote_token,
         link_credentials: Vec::new(),
+        auth,
         custom: false,
         child,
         _slot: None,
@@ -2569,6 +2671,7 @@ async fn import_registry(
             channels: None,
             max_hubs: None,
             live_depth: None,
+            auth: None,
             stale: false,
         };
         if info
@@ -2597,6 +2700,7 @@ async fn import_registry(
             handler: None,
             remote_token: Some(request.token.clone()),
             link_credentials: Vec::new(),
+            auth: None,
             child: None,
             custom: false,
             _slot: None,

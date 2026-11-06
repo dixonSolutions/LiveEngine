@@ -155,6 +155,14 @@ export default LiveEngine;
 
 export type HubMode = 'internal' | 'external' | 'central';
 export interface LiveChannel { schemaRef?: string; delivery: 'reliable' | 'lossy'; maxRate?: number; }
+/** Per-hub credential verifier checked before a ticket is issued. Secrets are write-only. */
+export type HubAuth =
+  | { kind: 'token'; tokens: { token: string; identity?: string; claims?: Record<string, unknown> }[] }
+  | { kind: 'hmac'; secret: string; leewaySeconds?: number }
+  | { kind: 'jwt'; alg: 'HS256'; secret: string; issuer?: string; audience?: string; identityClaim?: string; leewaySeconds?: number }
+  | { kind: 'jwt'; alg: 'EdDSA'; publicKey: string; issuer?: string; audience?: string; identityClaim?: string; leewaySeconds?: number }
+  | { kind: 'webhook'; url: string; secret?: string; timeoutMs?: number }
+  | { kind: 'custom'; name: string };
 export interface HubDefinition {
   id: string;
   mode?: HubMode;
@@ -169,6 +177,7 @@ export interface HubDefinition {
   userSchema?: Record<string, unknown> | boolean;
   serverSchema?: Record<string, unknown> | boolean;
   channels?: Record<string, LiveChannel>;
+  auth?: HubAuth;
   ttlSeconds?: number;
   maxHubs?: number;
   liveDepth?: number;

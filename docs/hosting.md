@@ -98,6 +98,36 @@ The Rust `HubClient` exposes `route`, `tree`, `export_registry`, and a general `
 
 Set `LIVEENGINE_PUBLIC_URL` to the direct live endpoint advertised by this service and optionally set `LIVEENGINE_TICKET_TTL_SECONDS` (default 60). An administrator can request `POST /v1/hubs/{id}/tickets` with `userId`, `serverId`, and optional `role` (`peer` or `service`); the user must already be paired in that server. The response contains `ticket`, `url`, and the Unix-seconds `expiresAt`. For nested hubs, use the `ticket` route operation with the hub `id` in the body. The owning service issues the ticket. Tickets are single-use and bound to the hub path and room. The signing key is stored in the private state file; used-ticket tracking is in memory and resets on restart.
 
+### Hub auth
+
+A hub may carry `auth`, a verifier that resolves the credential a user presents
+into an identity plus user-defined claims before any ticket is issued. Core never
+interprets claims. Add `credential` to the ticket request (or to `subject.credential`
+in `POST /v1/pair`, which checks it before changing membership). The verified
+identity must equal `userId`, so a credential cannot mint a ticket for someone
+else. Every failure returns the same `403 credential refused`. Hubs without `auth`
+behave as before. Link credentials, which an administrator issues for a hub, are
+not user credentials and skip this check. `auth` is not available on central hubs.
+
+| `kind` | Definition | Credential |
+| --- | --- | --- |
+| `token` | `tokens: [{token, identity?, claims?}]`, each token 24 to 512 bytes | the token, compared in constant time |
+| `hmac` | `secret` (32 to 512 bytes), `leewaySeconds?` | `base64url(payload JSON).base64url(HMAC-SHA256(secret, first segment))`; payload has `sub`, a required `exp` in Unix seconds, and any claims |
+| `jwt` | `alg` of `HS256` (with `secret`) or `EdDSA` (with `publicKey`, 32 raw bytes as unpadded base64url); `issuer?`, `audience?`, `identityClaim?` (default `sub`), `leewaySeconds?` | a compact JWT with a required `exp` |
+| `webhook` | `url`, `secret?` (sent as a bearer token), `timeoutMs?` (100 to 10000, default 3000) | opaque; forwarded to the webhook |
+| `custom` | `name` of a verifier registered with `HubService::register_verifier` | opaque; given to the verifier |
+
+The JWT algorithm comes only from the hub definition. A token whose `alg` header
+differs, including `none`, is refused, and no other algorithm can be configured.
+A webhook receives a POST of `{hub, path, userId, serverId, role, credential}` and must
+answer `200` with `{"allow":true,"identity"?,"claims"?}` within the timeout. Redirects
+are not followed, its host must be in `LIVEENGINE_ALLOWED_REMOTE_HOSTS`, and any other
+status, body, timeout or error refuses the ticket. A compiled verifier implements
+`liveengine::auth::AuthVerifier` and is registered on the service before the hubs that
+name it are created; nested centrals share the registry. Secrets are persisted in the
+state file like remote tokens and are never returned by any route or the export;
+`GET /v1/hubs/{id}` shows only `auth: {"kind": ...}`.
+
 Live room connections use `GET /v1/live` as a WebSocket endpoint. Send the
 single-use ticket in the first JSON text frame as `{"type":"auth","ticket":"..."}`
 within five seconds; do not put it in the URL. Set

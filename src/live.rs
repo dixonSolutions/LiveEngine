@@ -238,6 +238,9 @@ pub(crate) struct TicketRequest {
     server_id: String,
     #[serde(default = "peer_role")]
     role: String,
+    /// The user's credential for a hub that sets `auth`. Never forwarded once verified here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential: Option<String>,
 }
 fn peer_role() -> String {
     "peer".into()
@@ -256,14 +259,15 @@ pub(crate) async fn ticket_hub(
             "link credentials may only request service tickets",
         );
     }
-    issue_ticket(state, id, headers, request, None).await
+    issue_ticket(state, id, headers, request, None, credential.is_some()).await
 }
-pub(crate) async fn issue_ticket(
+/// Check a user's credential for a hub without issuing anything. Pairing calls this
+/// before it changes membership.
+pub(crate) async fn authorize_hub(
     state: Arc<Inner>,
     id: String,
     headers: HeaderMap,
     request: Option<TicketRequest>,
-    mut inherited_channels: Option<ChannelPolicy>,
 ) -> Response {
     let Some(request) = request else {
         return error(StatusCode::BAD_REQUEST, "invalid ticket request");
@@ -282,6 +286,90 @@ pub(crate) async fn issue_ticket(
     let Some(record) = record else {
         return error(StatusCode::NOT_FOUND, "hub not found");
     };
+    if record.auth.is_none() && record.handler.is_none() {
+        if let Some(address) = record.info.address.as_deref() {
+            let depth = header_depth(&headers).unwrap_or(usize::MAX);
+            if depth >= state.config.max_depth {
+                return error(StatusCode::LOOP_DETECTED, "forwarding depth exceeded");
+            }
+            let mut body = serde_json::to_value(request).unwrap();
+            body["id"] = Value::String(record.info.remote_hub_id);
+            return forward_route(
+                &state,
+                address,
+                record.remote_token.as_deref().unwrap_or(""),
+                &headers,
+                depth + 1,
+                &RouteRequest {
+                    path: vec![],
+                    op: "authorize".into(),
+                    body,
+                    inherited_schemas: None,
+                    inherited_channels: None,
+                },
+            )
+            .await;
+        }
+    }
+    match crate::auth::authorize(
+        &state,
+        record.auth.as_ref(),
+        &id,
+        &request.user_id,
+        &request.server_id,
+        &request.role,
+        request.credential.as_deref(),
+    )
+    .await
+    {
+        Ok(()) => Json(serde_json::json!({"ok":true})).into_response(),
+        Err(refused) => refused,
+    }
+}
+pub(crate) async fn issue_ticket(
+    state: Arc<Inner>,
+    id: String,
+    headers: HeaderMap,
+    request: Option<TicketRequest>,
+    mut inherited_channels: Option<ChannelPolicy>,
+    trusted: bool,
+) -> Response {
+    let Some(mut request) = request else {
+        return error(StatusCode::BAD_REQUEST, "invalid ticket request");
+    };
+    if request.user_id.is_empty()
+        || request.server_id.is_empty()
+        || !matches!(request.role.as_str(), "peer" | "service")
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid ticket request");
+    }
+    let record = {
+        let mut hubs = state.hubs.write().await;
+        expire_hubs(&mut hubs);
+        hubs.get(&id).cloned()
+    };
+    let Some(record) = record else {
+        return error(StatusCode::NOT_FOUND, "hub not found");
+    };
+    // Link credentials were issued by this hub's administrator and are not user credentials.
+    if !trusted {
+        if let Err(refused) = crate::auth::authorize(
+            &state,
+            record.auth.as_ref(),
+            &id,
+            &request.user_id,
+            &request.server_id,
+            &request.role,
+            request.credential.as_deref(),
+        )
+        .await
+        {
+            return refused;
+        }
+        if record.auth.is_some() {
+            request.credential = None;
+        }
+    }
     if let Some(channels) = &record.info.channels {
         if record.handler.is_some() {
             inherited_channels = None;
