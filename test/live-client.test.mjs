@@ -414,6 +414,34 @@ describe('LiveClient over a real hub (relay)', () => {
     assert.equal(client.state, 'closed');
     await proxy.stop();
   });
+
+  test('close() wins when the connection failure is reported first: connect rejects with Closed and nothing retries', async () => {
+    // A socket whose failure reaches the client's own listeners, and close() is called right after in the
+    // same tick: the attempt's failure was seen before close(), and the client must still say Closed.
+    let sockets = 0;
+    let client;
+    class FailsThenCloses {
+      constructor() {
+        sockets++;
+        this.listeners = {};
+        setTimeout(() => {
+          for (const type of ['error', 'close']) for (const listener of this.listeners[type] || []) listener({});
+          client.close();
+        }, 10);
+      }
+      addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
+      send() {}
+      close() {}
+    }
+    for (const retries of [0, 3]) {
+      sockets = 0;
+      client = track(new LiveClient({ link: 'peer-hub', room: 'r', userId: 'u', ticket: 't', url: 'ws://127.0.0.1:9/v1/live', transports: ['websocket'] }, { WebSocket: FailsThenCloses, retries, retryBaseMs: 20 }));
+      await assert.rejects(client.connect(), /^Error: Closed$/);
+      assert.equal(client.state, 'closed');
+      await sleep(150);
+      assert.equal(sockets, 1, `a retry started after close() (retries ${retries})`);
+    }
+  });
 });
 
 describe('connectPeer negotiation and fallback (injected RTCPeerConnection)', () => {

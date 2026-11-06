@@ -1,0 +1,123 @@
+---
+title: "Hub API for browsers"
+description: "Connect a page to a hosted hub through your own Node API: createHubApi publishes schemas and channels, pairs players, waits for partners, and keeps the administrator token on the server."
+---
+
+A page must never hold the administrator token. `createHubApi` is the Node side of that rule, written once: a plain `(req, res)` handler that owns the routes a page needs and keeps the token inside the `HubClient` you give it. The page gets public status, a descriptor with a single-use ticket and a live hub list.
+
+It is dependency-free ESM (`@dixonsolutions/liveengine/hub-api`), has no knowledge of any game, and mounts in `http`, Express, Fastify, Next route handlers or anything that passes Node requests.
+
+## What it owns
+
+| Concern | Behavior |
+| --- | --- |
+| Publishing | `setup()` (or the first request) checks the contract, publishes `schemas` once, and registers the hub with its `channels`, `scopes` and `auth` if the service has no such hub. A schema version is immutable, so an existing one is left alone. |
+| Pairing | `pair` pairs a player with the hub's shared room (`peerLink.kind: "hub"`) or with another player (`"peer"`). With peers it holds the request for `waitMs` until a partner arrives and answers `408` if none does. |
+| Renewal | `renew` gives a paired player a fresh single-use ticket. Credentials are never stored, so a hub with `auth` needs the player to send one again. |
+| Seats | The API tracks each player it paired, serialises operations per player, and caps players at `limits.maxPlayers`. |
+| Idle reaper | A seat with no `heartbeat` for `limits.idleMs` is released on the hub. |
+| Cancel | A page that drops its pairing request, or calls `leave` while it waits, leaves the engine's queue at once. A left player is also removed from the hub: `leave` alone returns a player to "waiting", which would make them a ghost candidate for the next pairing. |
+| Watch tickets | `watch` issues a read-only registry ticket and the registry URL, so a page can show a live hub list without the token. |
+| Browser access | Origin checks, CORS for `allowedOrigins`, preflight with the private-network opt-in, optional Host checks, body and rate limits. |
+
+## Routes
+
+Paths are relative to where you mount the handler.
+
+| Route | Method | Answer |
+| --- | --- | --- |
+| `status` | GET | `{ configured, hubId, mode, externalConfigured, ...statusExtra }`. Does not need a working hub. |
+| `ping` | GET | `{ ok, hubId, hubPingMs, serverTimeMs, waiting, seats }`. `hubPingMs` is the hub's own ping from this API; the page times its round trip to get its own. `waiting` counts pairing requests currently held. |
+| `live-client.mjs` | GET | `LiveClient` and `connectLive`, with CORS, so a page on another origin can load them from the API. |
+| `pair` | POST | `{ userId, waitMs?, credential?, ...yours }`: the descriptor for `LiveClient`. `waitMs` is clamped to `peerLink.maxWaitMs`. |
+| `renew` | POST | `{ userId, credential? }`: a fresh descriptor, or `404` for a stranger. |
+| `heartbeat` | POST | `{ userId }`: keeps the seat; `404` if there is none. |
+| `leave` | POST | `{ userId }`: releases the seat, also while a pairing is still waiting. |
+| `discover` | POST | `{ kind?, depth?, requirements? }`: public candidates under the hub path. |
+| `watch` | POST | `{ depth? }`: `{ url, ticket, expiresAt, path, depth }`. |
+| `join` | POST | Only with the `join` option: the older seat-based matchmaking. |
+
+`userId` must match `^[a-zA-Z0-9_-]{1,64}$`. A `POST` needs an `Origin` in `allowedOrigins`; a `GET` without an `Origin` (a health check) is allowed, one with a disallowed `Origin` is refused with `403`. Hub `4xx` answers such as `403 credential refused` reach the page; an administrator-token failure or anything else becomes `502`.
+
+## Plain `http`
+
+```js
+import http from 'node:http';
+import { createRequire } from 'node:module';
+import { createHubApi } from '@dixonsolutions/liveengine/hub-api';
+
+const { HubClient } = createRequire(import.meta.url)('@dixonsolutions/liveengine/hubs');
+
+const api = createHubApi({
+  client: new HubClient(process.env.HUB_URL, { token: process.env.LIVEENGINE_TOKEN }),
+  hubId: 'my-game',
+  scopes: { app: 'my-game' },
+  schemas: [{ id: 'my-game.state', version: '1', schema: { type: 'object', required: ['n'], properties: { n: { type: 'integer' } } } }],
+  channels: { state: { schemaRef: 'my-game.state@1', delivery: 'lossy', maxRate: 30 } },
+  peerLink: { kind: 'peer', waitMs: 30_000 },
+  allowedOrigins: ['https://play.example.net'],
+  basePath: '/api/live',
+});
+
+http.createServer((req, res) => {
+  if (req.url.startsWith('/api/live/')) return api(req, res);
+  res.writeHead(404).end();
+}).listen(8080);
+
+await api.setup(); // optional: publish now instead of on the first request
+```
+
+## Express
+
+Express strips the mount path, so leave `basePath` unset. The handler calls `next()` for a route it does not own.
+
+```js
+import express from 'express';
+
+const app = express();
+app.use('/api/live', api); // do not put express.json() before it: the handler reads the body itself
+app.listen(8080);
+```
+
+Fastify (with `@fastify/middie`) and Next route handlers pass Node requests the same way.
+
+## Options
+
+| Option | Purpose |
+| --- | --- |
+| `client` | A `HubClient` holding the administrator token. Omit it, with `notConfigured`, to answer `503` until configured. |
+| `hubId`, `hubPath`, `mode`, `remote` | The hub to front, the central namespace that holds it, and for `mode: "external"` the remote `{ address, hubId, token }`. |
+| `scopes` | The hub's scopes, and what a hub pairing requires. |
+| `schemas`, `channels`, `auth` | What to publish and register. `auth` is the hub's verifier; unset leaves the hub open. |
+| `peerLink` | `{ kind: "hub" \| "peer", waitMs, maxWaitMs }`. Peers are kept to this hub by an `arena` scope. |
+| `subject(input)` | Maps a request body to the scopes a player pairs with. Validate here: the body is the page's. |
+| `allowedOrigins` | A list of origins, or a predicate. |
+| `allowedHosts` | When set, another `Host` header is refused. |
+| `basePath` | Path to answer under when no router strips it. |
+| `limits` | `bodyBytes` (16384), `requestsPerMinute` (10 per address for POST), `readsPerMinute` (300 for GET), `idleMs` (180000), `maxPlayers` (4096). |
+| `join`, `statusExtra`, `watchUrl`, `notConfigured` | The legacy `join` route, extra status fields, the registry URL the page opens (default: the hub's own), the `503` message. |
+
+`api.setup()` publishes now and starts the reaper, `api.close()` stops the reaper, and `api.stats()` returns `{ seats, waiting, pairings }`.
+
+## In the page
+
+```js
+import { connectLive, watchHubs } from 'https://api.example.net/api/live/live-client.mjs';
+
+const client = await connectLive({
+  pairUrl: 'https://api.example.net/api/live/pair',
+  renewUrl: 'https://api.example.net/api/live/renew',
+  body: { userId, waitMs: 30_000 },
+});
+
+const hubs = await watchHubs({ watchUrl: 'https://api.example.net/api/live/watch', body: { depth: 2 } });
+hubs.on('change', list => render(list));
+```
+
+To cancel a search, abort the `fetch` you gave `connectLive` and `POST` to `leave`. The page's origin must be in `allowedOrigins`, and the hub's `LIVEENGINE_LIVE_ALLOWED_ORIGINS` must list it too for the room socket and the registry socket.
+
+<Warning>
+  The API has no player authentication of its own. Use the hub's `auth` and pass the player's `credential` through, or put an authenticated proxy in front of it. Rate limits are per client address: behind a proxy, put the real address in front of the handler.
+</Warning>
+
+See [Gogh Strike integration](/guides/gogh-strike) for a game built on it, and [Developer testing](/guides/dev-testing) to run the end-to-end check.

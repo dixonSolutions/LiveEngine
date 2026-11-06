@@ -269,6 +269,8 @@ export interface PairRequest {
    * default). Rejects with status 408 if none arrives. Needs a peer subject and a peer or any target.
    */
   waitMs?: number;
+  /** Aborting it drops the request, and a waiting peer leaves the queue. */
+  signal?: AbortSignal;
 }
 /** What `pair` returns and `LiveClient` consumes. */
 export interface LiveDescriptor {

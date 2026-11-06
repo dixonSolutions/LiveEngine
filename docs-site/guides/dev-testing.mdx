@@ -1,0 +1,54 @@
+---
+title: "Developer testing"
+description: "Run the Gogh Strike end-to-end test and a local dev stack against this checkout's own hub build and Node API."
+---
+
+Gogh Strike is the standing way to check LiveEngine end to end: real hub processes, the real [Node API](/guides/hub-api), the real game and headless Chromium. Both commands use this checkout's `lib/` and its own hub build, never the published package.
+
+## One-time setup
+
+You need Node 22, Rust, git and network access once.
+
+```sh
+npm install
+npm run build:hub          # the release hub binary the e2e test uses
+npm install --no-save playwright && npx playwright install chromium
+```
+
+The game is fetched automatically. `integrations/gogh-strike/setup.mjs` clones upstream Gogh Strike read-only at commit `2285e64` into `.cache/gogh-strike` (gitignored) and applies `integrations/gogh-strike/gogh-strike.patch`. To use your own patched checkout instead, set `GOGH_STRIKE_ROOT`; it is used as it is and never modified.
+
+If Playwright is missing the test says so and prints the install command above. To reuse an existing install, set `PLAYWRIGHT_PATH` (a module that exports `chromium`) and `CHROMIUM_PATH`.
+
+## Run the end-to-end test
+
+```sh
+npm run test:e2e
+```
+
+It prints one `PASS` or `FAIL` line per scenario (14 of them) and exits non-zero on any failure. `GOGH_E2E_ONLY=9,10` runs a subset for debugging and still exits non-zero. Everything binds to free loopback ports and stops at the end, even on failure. Scenario 14 binds the machine's first non-loopback, non-Tailscale IPv4 address instead; it fails, not skips, if there is none.
+
+Scenarios 9 to 14 drive the lobby's **Play online** panel by clicking and typing: two users matching and reaching a direct WebRTC connection, four users at once, cancelling a search, an API on another origin, a wrong address, and the LAN address.
+
+## Run a dev stack
+
+```sh
+npm run dev:gogh               # loopback
+npm run dev:gogh -- --lan      # the LAN address, so another device can join
+```
+
+It builds the debug hub (`cargo build --locked --bin liveengine-hub`), starts it and the Node API through `integrations/gogh-strike/bridge.mjs`, serves the game, and prints the URLs. Open the game in two tabs, press **Connect** and then **Find match** in each. Keys are generated once into `.dev/keys.json` (gitignored). Ctrl-C stops both processes. `DEV_GOGH_PORT` and `DEV_GOGH_HUB_PORT` fix the ports; `--no-build` skips the build.
+
+<Warning>
+  `--lan` exposes the hub and the game to your network with a generated administrator key. Use it on a trusted network only.
+</Warning>
+
+## The other checks
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+npm run build && npm run build:hub
+npm test
+npm run test:integration
+```

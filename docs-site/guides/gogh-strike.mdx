@@ -10,7 +10,8 @@ Players who choose **Find a LiveEngine match** are paired into one hub room and 
 ## What it does
 
 - Applies a lobby and networking patch to an upstream Gogh Strike checkout. The game holds only its DTOs, schemas and the mapping to and from game state (`src/liveengine-net.js`).
-- Serves the game, `LiveClient` and a thin API from one bridge. The API wraps `HubClient.discover`, `pair` and `renewal`.
+- Serves the game and mounts the generic [hub API](/guides/hub-api) (`lib/hub-api.mjs`) with Gogh Strike's schemas, channels and scopes. `bridge.mjs` holds only that wiring and the static file server.
+- Adds a **Play online** panel to the lobby: a hub API address (this page's origin by default, remembered), **Connect**, a live status line with ping and players waiting, the live hub list, and **Find match** with a cancel. The hub API may be on another origin.
 - On first use registers the game's schemas and the hub's channels, and a hub `auth` verifier when `GOGH_HUB_AUTH` is set.
 - Connects, retries, renews tickets and falls back from WebRTC to the hub relay inside `LiveClient`, not in the game.
 - Optionally routes through an external hub registered on a central service.
@@ -129,6 +130,8 @@ The central service must allow the remote host and use matching credentials on t
 
 ## Bridge endpoints and limits
 
+These are the hub API's routes, mounted at `/api/liveengine`; `GET /api/liveengine/ping` and `GET /api/liveengine/live-client.mjs` are also served.
+
 | Route | Behavior |
 | --- | --- |
 | `GET /health` | `{ app, hubId }` |
@@ -168,7 +171,7 @@ npm run test:integration
 
 ## Local end-to-end test
 
-`npm run test:e2e` runs `live-e2e.mjs`: real hub processes, the real bridge and the real game in headless Chromium, on free loopback ports, stopped at the end. It covers a central hub, a nested central and an on-demand hub with its own auth (bad and good credentials); peer-peer over WebRTC with the data channel asserted open and carrying frames; a forced fallback to the relay; peer-hub with a service participant; hub-hub across two linked services; reconnect with a fresh ticket; a live hub list from a watch ticket; and schema rejection. It prints one `PASS` or `FAIL` line per scenario and exits non-zero on any failure. It needs `npm run build:hub`, `PLAYWRIGHT_PATH`, `CHROMIUM_PATH` and `GOGH_STRIKE_ROOT`; `GOGH_E2E_CHROMIUM_ARGS` replaces the Chromium flags and `GOGH_E2E_ONLY=2,3` selects scenarios for debugging (the exit code is then non-zero). Chromium gets `--disable-features=WebRtcHideLocalIpsWithMdns --allow-loopback-in-peer-connection` so contexts find local WebRTC candidates, and, when `/dev/dri/renderD128` exists, ANGLE over Vulkan flags so the game renders on the GPU: software GL runs the town at under one frame a second.
+`npm run test:e2e` runs `live-e2e.mjs`: real hub processes, the real bridge and the real game in headless Chromium, on free loopback ports, stopped at the end. It covers a central hub, a nested central and an on-demand hub with its own auth (bad and good credentials); peer-peer over WebRTC with the data channel asserted open and carrying frames; a forced fallback to the relay; peer-hub with a service participant; hub-hub across two linked services; reconnect with a fresh ticket; a live hub list from a watch ticket; and schema rejection. It prints one `PASS` or `FAIL` line per scenario and exits non-zero on any failure. Scenarios 9 to 14 drive the lobby's Play online panel (two users, four users, cancel, another origin, a wrong address, the LAN address). It needs `npm run build:hub` and Playwright; the game is fetched and patched automatically (see [Developer testing](/guides/dev-testing)), and `PLAYWRIGHT_PATH`, `CHROMIUM_PATH` and `GOGH_STRIKE_ROOT` override; `GOGH_E2E_CHROMIUM_ARGS` replaces the Chromium flags and `GOGH_E2E_ONLY=2,3` selects scenarios for debugging (the exit code is then non-zero). Chromium gets `--disable-features=WebRtcHideLocalIpsWithMdns --allow-loopback-in-peer-connection` so contexts find local WebRTC candidates, and, when `/dev/dri/renderD128` exists, ANGLE over Vulkan flags so the game renders on the GPU: software GL runs the town at under one frame a second.
 
 ## Service end-to-end check
 

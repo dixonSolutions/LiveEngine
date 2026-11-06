@@ -15,4 +15,22 @@ export interface ConnectLiveOptions extends LiveClientOptions {
 }
 /** Pair through the application's own routes, connect, and resolve with the open client. */
 export declare function connectLive(options: ConnectLiveOptions): Promise<LiveClientType>;
+export interface WatchedHub { id: string; mode: string; status: string; roomCount: number; memberCount: number; path: string[]; childrenLive?: boolean }
+export interface HubWatch {
+  hubs(): WatchedHub[];
+  readonly closed: boolean;
+  on(event: 'change', listener: (hubs: WatchedHub[]) => void): () => void;
+  on(event: 'close', listener: (info: { reason: string }) => void): () => void;
+  close(): void;
+}
+export interface WatchHubsOptions {
+  /** The application's route that issues a watch ticket and answers `{ url, ticket, path, depth }`. */
+  watchUrl: string;
+  body?: Record<string, unknown>;
+  fetch?: typeof fetch;
+  WebSocket?: typeof WebSocket;
+  timeoutMs?: number;
+}
+/** Watch the live hub list with a ticket from the application's own route. Resolves after the first snapshot. */
+export declare function watchHubs(options: WatchHubsOptions): Promise<HubWatch>;
 export default LiveClient;

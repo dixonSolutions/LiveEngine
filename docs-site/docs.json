@@ -58,7 +58,9 @@
               "guides/deployment",
               "guides/user-hub",
               "guides/network-testing",
-              "guides/gogh-strike"
+              "guides/hub-api",
+              "guides/gogh-strike",
+              "guides/dev-testing"
             ]
           },
           {

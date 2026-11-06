@@ -1,10 +1,14 @@
 // The real local end-to-end test for Gogh Strike on LiveEngine. No mocks: real liveengine-hub
 // processes, the real bridge, the real game, and headless Chromium contexts that play it.
 //
-//   PLAYWRIGHT_PATH=/path/to/playwright CHROMIUM_PATH=/path/to/chrome \
-//   GOGH_STRIKE_ROOT=../gogh-strike npm run test:e2e
+//   npm run test:e2e
 //
-// Everything listens on 127.0.0.1 on free ports and is stopped at the end, also on failure. One
+// The game is fetched once into .cache/ (upstream Gogh Strike at the validated commit plus gogh-strike.patch);
+// GOGH_STRIKE_ROOT overrides it. Playwright: npm install --no-save playwright && npx playwright install chromium,
+// or PLAYWRIGHT_PATH and CHROMIUM_PATH for an existing install.
+//
+// Everything listens on 127.0.0.1 on free ports (scenario 14 uses the machine's LAN address, never a
+// Tailscale one) and is stopped at the end, also on failure. One
 // PASS or FAIL line is printed per scenario; any failure exits non-zero. Nothing is skipped: a
 // scenario whose setup breaks fails.
 //
@@ -20,12 +24,16 @@ import path from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {LiveClient} from '../../lib/live-client.mjs';
 import {freePort, startHub} from '../../test/support/hub-process.mjs';
+import {ensureGame, lanAddress} from './setup.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const {HubClient} = require('../../lib/hubs.js');
 const bridgeScript = path.resolve(here, 'bridge.mjs');
-const gameRoot = path.resolve(process.env.GOGH_STRIKE_ROOT || path.join(here, '../../../gogh-strike'));
+// GOGH_STRIKE_ROOT, else the patched upstream clone setup.mjs keeps in .cache/ (fetched on first use).
+let gameRoot;
+try { gameRoot = ensureGame(); }
+catch (error) { console.log(`FAIL setup | ${error.message}`); process.exit(1); }
 const WEBRTC_ARGS = ['--disable-features=WebRtcHideLocalIpsWithMdns', '--allow-loopback-in-peer-connection'];
 // Software GL draws the town at under one frame a second here, which starves the page's WebRTC
 // callbacks; on a machine with a render node, ANGLE over Vulkan uses the GPU, still headless.
@@ -99,16 +107,16 @@ async function startTaggedProxy(targetPort) {
 }
 
 const bridges = [];
-async function startBridge(port, hubUrl, token, env = {}) {
+async function startBridge(port, hubUrl, token, env = {}, bindHost = '127.0.0.1') {
   const output = [];
   const child = spawn(process.execPath, [bridgeScript], {
     cwd: gameRoot, stdio: ['ignore', 'pipe', 'pipe'],
-    env: {...process.env, PORT: String(port), HOST: '127.0.0.1', GOGH_STRIKE_ROOT: gameRoot,
+    env: {...process.env, PORT: String(port), HOST: bindHost, GOGH_STRIKE_ROOT: gameRoot,
       LIVEENGINE_URL: hubUrl, LIVEENGINE_TOKEN: token, GOGH_REQUEST_LIMIT: '100000', ...env},
   });
   child.stdout.on('data', chunk => output.push(String(chunk)));
   child.stderr.on('data', chunk => output.push(String(chunk)));
-  const bridge = {base: `http://127.0.0.1:${port}`, output: () => output.join('')};
+  const bridge = {base: `http://${bindHost}:${port}`, output: () => output.join('')};
   bridges.push(bridge);
   onClose(async () => { child.kill('SIGTERM'); await new Promise(resolve => child.once('exit', resolve)); });
   await until(async () => { try { return (await fetch(`${bridge.base}/health`)).ok; } catch { return false; } }, 'the bridge to start');
@@ -150,11 +158,11 @@ async function loadChromium() {
     const chromium = candidate.chromium || candidate.default?.chromium;
     if (chromium) return chromium;
   }
-  throw new Error('Playwright not found: install it or set PLAYWRIGHT_PATH to a module exporting chromium');
+  throw new Error('Playwright is not installed. Install it and a Chromium once with:\n  npm install --no-save playwright && npx playwright install chromium\nor point PLAYWRIGHT_PATH at a module that exports chromium (and CHROMIUM_PATH at a Chromium binary).');
 }
 
 /** A player: its own browser context, so its own sessionStorage, localStorage and WebSocket. */
-async function openPlayer(label, base, {userId, credential} = {}) {
+async function openPlayer(label, base, {userId, credential, online = false} = {}) {
   // A small viewport keeps the software-rendered game light enough for two pages at once.
   const context = await browser.newContext({userAgent: `gogh-e2e-${label}`, viewport: {width: 640, height: 400}, deviceScaleFactor: 1});
   const page = await context.newPage();
@@ -167,13 +175,15 @@ async function openPlayer(label, base, {userId, credential} = {}) {
   if (credential) await page.addInitScript(([key, value]) => { if (!localStorage.getItem(key)) localStorage.setItem(key, value); }, ['gogh-strike-liveengine-credential', credential]);
   const consoleErrors = [];
   page.on('console', message => { if (message.type() === 'error' || message.type() === 'warning') consoleErrors.push(message.text().slice(0, 200)); });
-  const player = {label, base, context, page, errors, consoleErrors};
+  const player = {label, base, context, page, errors, consoleErrors, requests: []};
+  page.on('request', request => player.requests.push(request.url()));
   players.push(player);
   player.load = async () => {
     // `?test` exposes the game's diagnostic hooks: teleport and read actors.
     await page.goto(`${base}/?test`, {waitUntil: 'domcontentloaded'});
     await page.waitForSelector('#deploy-button:not(:disabled)', {timeout: 90_000});
-    await page.locator('#liveengine-matchmaking').check();
+    // The online panel replaces the checkbox: a player who uses it never ticks it.
+    if (!online) await page.locator('#liveengine-matchmaking').check();
   };
   await player.load();
   player.deploy = () => page.locator('#deploy-button').click();
@@ -265,6 +275,65 @@ async function deployBoth(a, b) {
   return {a: ia.id, b: ib.id};
 }
 
+
+// ---- the front screen's "Play online" panel, driven by clicking and typing ----
+
+const phaseOf = ({page}) => page.locator('#online-state').getAttribute('data-phase');
+const waitPhase = (player, want, ms = 30_000) => player.page.waitForFunction(phase => document.querySelector('#online-state')?.dataset.phase === phase, want, {timeout: ms})
+  .catch(async error => { throw new Error(`${player.label} never reached the "${want}" state (now "${await phaseOf(player)}": ${await panelText(player)}); ${error.message.split('\n')[0]}`); });
+const panelText = ({page}) => page.locator('#online-panel').innerText().then(text => text.replace(/\s+/g, ' ').trim());
+const matchText = ({page}) => page.locator('#online-match').textContent();
+
+/** Type `address` into the panel the way a player does: clear the field, type, press Connect. */
+async function typeAddress(player, address) {
+  const field = player.page.locator('#online-address');
+  await field.click();
+  await field.fill('');
+  await field.pressSequentially(address);
+  await player.page.locator('#online-connect').click();
+}
+async function connectPanel(player, address) {
+  await typeAddress(player, address);
+  await waitPhase(player, 'connected');
+  await player.page.waitForFunction(() => /ping \d+ ms/.test(document.querySelector('#online-status')?.textContent || ''), null, {timeout: 20_000});
+}
+const findMatch = player => player.page.locator('#online-find').click();
+/** Both sides say matched and, in plain words, how they are connected. */
+async function reachDirect(player) {
+  await waitPhase(player, 'matched');
+  await player.page.waitForFunction(() => document.querySelector('#online-match')?.textContent.includes('Direct connection (peer to peer)'), null, {timeout: 40_000})
+    .catch(async () => { throw new Error(`${player.label} did not reach a direct connection; the panel says: ${await matchText(player)}`); });
+}
+/** Press Play on both pages and wait until the game runs; the matched session is already open. */
+async function playBoth(a, b) {
+  await Promise.all([a.deploy(), b.deploy()]);
+  await Promise.all([a.playing(), b.playing()]);
+  await Promise.all([instrument(a), instrument(b)]);
+  const [ia, ib] = await Promise.all([sessionInfo(a), sessionInfo(b)]);
+  assert.equal(ia.room, ib.room, 'the two matched players are in different rooms');
+  await until(async () => (await sessionInfo(a)).peers.includes(ib.id) && (await sessionInfo(b)).peers.includes(ia.id), 'both players to see each other in presence');
+  await until(async () => (await sessionInfo(a)).transport[ib.id] === 'direct' && (await sessionInfo(b)).transport[ia.id] === 'direct', 'a direct WebRTC transport on both sides', 30_000)
+    .catch(async error => { throw new Error(`${error.message}; a=${await directWhy(a)} b=${await directWhy(b)}`); });
+  return {a: ia.id, b: ib.id};
+}
+const userIdOf = ({page}) => page.evaluate(() => sessionStorage.getItem('gogh-strike-liveengine-user'));
+/** What the hub API itself reports, over plain HTTP, as a page would see it. */
+async function apiPing(bridge) {
+  const response = await fetch(`${bridge.base}/api/liveengine/ping`);
+  assert.equal(response.status, 200, 'ping failed');
+  return response.json();
+}
+/** One state frame from `from` reaches `to` while the pair is idle in the lobby. */
+async function exchange(from, to, n) {
+  const target = (await sessionInfo(to)).id;
+  const mark = await to.page.evaluate(() => window.__e2e.heard.length);
+  await from.page.evaluate(count => window.__e2e.session.send({n: count, team: 0, role: 'vanguard', x: 1, y: 0, z: 1, yaw: 0, pitch: 0, alive: true}, {channel: 'state'}), n);
+  const sender = (await sessionInfo(from)).id;
+  const frame = await until(() => to.page.evaluate(([count, id, seq]) => window.__e2e.heard.slice(count).find(f => f.from === id && f.payload?.n === seq), [mark, sender, n]), `${to.label} to receive the frame ${n} from ${from.label}`, 10_000);
+  assert.ok(target && frame, 'the frame did not arrive');
+  return frame.via;
+}
+
 // ---- scenarios ----
 
 const results = [];
@@ -295,8 +364,9 @@ const once = factory => { let promise; return () => (promise ||= factory()); };
 
 async function main() {
   const chromium = await loadChromium();
-  const ports = await Promise.all(Array.from({length: 8}, () => freePort()));
-  const [portNested, portPeer, portRelay, portLinkA, portLinkB, portReconnect, portWatch, portSchema] = ports;
+  const ports = await Promise.all(Array.from({length: 17}, () => freePort()));
+  const [portNested, portPeer, portRelay, portLinkA, portLinkB, portReconnect, portWatch, portSchema,
+    portUi, portFour, portCancel, portPage, portApi, portOther, portWrongPath, portCorrect, portClosed] = ports;
   const origins = ports.map(port => `http://127.0.0.1:${port}`).join(',');
   const common = {LIVEENGINE_LIVE_ALLOWED_ORIGINS: origins, LIVEENGINE_ALLOWED_REMOTE_HOSTS: '127.0.0.1', LIVEENGINE_ICE_SERVERS: '[]',
     // One bridge, the test and every player share the loopback address, so the default budget of 120 requests a minute is too small.
@@ -314,7 +384,8 @@ async function main() {
   const adminC = new HubClient(central.address, {token: centralToken});
   const adminR = new HubClient(remote.address, {token: remoteToken});
 
-  browser = await chromium.launch({headless: true, args: CHROMIUM_ARGS, ...(process.env.CHROMIUM_PATH ? {executablePath: process.env.CHROMIUM_PATH} : {})});
+  browser = await chromium.launch({headless: true, args: CHROMIUM_ARGS, ...(process.env.CHROMIUM_PATH ? {executablePath: process.env.CHROMIUM_PATH} : {})})
+    .catch(error => { throw new Error(`Chromium could not start: ${error.message.split('\n')[0]}\nInstall one with: npx playwright install chromium (or set CHROMIUM_PATH to a Chromium binary).`); });
   onClose(() => browser.close());
 
   // 1. Central hub, a nested central and a hub created on demand with its own auth.
@@ -603,6 +674,200 @@ async function main() {
     assert.equal(a.errors.length + b.errors.length, 0, `page errors: ${[...a.errors, ...b.errors].join('; ')}`);
     return `${malformed.length} malformed frames refused; ${moved}`;
   });
+  // ---- Play online: the front screen, a hub API and real peer-to-peer matchmaking ----
+  // Each of these drives the lobby panel by clicking and typing. Nothing reaches into the page to
+  // pair or connect for the flow under test; the helpers only read what the panel and the session show.
+
+  await scenario('9 front screen: two users connect, find a match, reach a direct connection and see each other move', async () => {
+    const bridge = await startBridge(portUi, central.address, centralToken, {LIVEENGINE_HUB_ID: 'gogh-ui', GOGH_LIVE_LINK: 'peer'});
+    const [a, b] = await twoPlayers(['ui-a', 'ui-b'], bridge.base, [{online: true}, {online: true}]);
+    assert.equal(await a.page.locator('#online-address').inputValue(), bridge.base, 'the address does not default to the page origin');
+    await Promise.all([connectPanel(a, bridge.base), connectPanel(b, bridge.base)]);
+    assert.match(await panelText(a), /Connected to gogh-ui · ping \d+ ms · \d+ players? waiting/);
+    await a.page.waitForFunction(() => document.querySelector('#online-hubs')?.textContent.includes('gogh-ui'), null, {timeout: 20_000});
+    await findMatch(a);
+    await waitPhase(a, 'searching');
+    assert.match(await matchText(a), /Waiting for another player/);
+    await until(async () => (await apiPing(bridge)).waiting === 1, 'the hub API to count one waiting player');
+    await b.page.waitForFunction(() => /· 1 player waiting/.test(document.querySelector('#online-status')?.textContent || ''), null, {timeout: 20_000});
+    await findMatch(b);
+    await Promise.all([reachDirect(a), reachDirect(b)]);
+    assert.equal((await apiPing(bridge)).waiting, 0);
+    const ids = await playBoth(a, b);
+    const moved = await seeEachOther(a, b, ids);
+    assert.equal(a.errors.length + b.errors.length, 0, `page errors: ${[...a.errors, ...b.errors].join('; ')}`);
+    return `room ${(await sessionInfo(a)).room}, direct on both sides; ${moved}`;
+  });
+
+  await scenario('10 four users at once: everyone matched, nobody in two rooms, every pair exchanges data, nobody left waiting', async () => {
+    const bridge = await startBridge(portFour, central.address, centralToken, {LIVEENGINE_HUB_ID: 'gogh-four', GOGH_LIVE_LINK: 'peer'});
+    const users = await Promise.all(['four-a', 'four-b', 'four-c', 'four-d'].map(label => openPlayer(label, bridge.base, {online: true})));
+    await Promise.all(users.map(user => connectPanel(user, bridge.base)));
+    await Promise.all(users.map(findMatch));
+    await Promise.all(users.map(reachDirect));
+    await Promise.all(users.map(instrument));
+    const infos = await Promise.all(users.map(sessionInfo));
+    // The hub seats a peer that pairs with an already seated one in that peer's room, so four players
+    // may share one room or split into pairs. Either way each is in exactly one room and sees its roommates.
+    const rooms = new Map();
+    infos.forEach((info, index) => rooms.set(info.room, [...(rooms.get(info.room) || []), index]));
+    assert.equal([...rooms.values()].flat().length, 4, 'a player is in no room or in two');
+    assert.equal(new Set(infos.map(info => info.id)).size, 4, 'two pages share a player id');
+    for (const [room, members] of rooms) {
+      assert.ok(members.length >= 2, `room ${room} holds a lone player`);
+      const seated = (await adminC.call('gogh-four', 'getServer', [room])).members;
+      assert.deepEqual([...seated].sort(), members.map(index => infos[index].id).sort(), `the hub's members of ${room} differ from the pages'`);
+    }
+    for (const [index, info] of infos.entries()) {
+      const mates = rooms.get(info.room).filter(other => other !== index).map(other => infos[other].id).sort();
+      assert.deepEqual([...info.peers].sort(), mates, `${users[index].label} does not see exactly its roommates`);
+      const member = await adminC.call('gogh-four', 'getUser', [info.id]);
+      assert.deepEqual([member.status, member.serverId], ['paired', info.room], `${users[index].label} is not seated in exactly its own room`);
+    }
+    const via = [];
+    let n = 100;
+    for (const members of rooms.values()) {
+      for (const from of members) for (const to of members) if (from !== to) via.push(await exchange(users[from], users[to], n++));
+    }
+    assert.ok(via.every(kind => kind === 'direct'), `frames did not travel over the data channel: ${via}`);
+    const ping = await apiPing(bridge);
+    assert.deepEqual([ping.waiting, ping.seats], [0, 4], 'players are left waiting or seats are missing');
+    for (const user of users) assert.match(await matchText(user), /Matched with .*Direct connection/);
+    assert.equal(users.reduce((sum, user) => sum + user.errors.length, 0), 0, 'page errors');
+    return `rooms ${[...rooms.values()].map(members => members.length).join('+')}, ${via.length} pairwise frames ${[...new Set(via)].join('/')}, waiting ${ping.waiting}, seats ${ping.seats}`;
+  });
+
+  await scenario('11 a user with no partner waits, cancels and leaves no seat behind; a later pair is unaffected', async () => {
+    const bridge = await startBridge(portCancel, central.address, centralToken, {LIVEENGINE_HUB_ID: 'gogh-cancel', GOGH_LIVE_LINK: 'peer'});
+    const lone = await openPlayer('cancel-lone', bridge.base, {online: true});
+    await connectPanel(lone, bridge.base);
+    await findMatch(lone);
+    await waitPhase(lone, 'searching');
+    const loneId = await userIdOf(lone);
+    assert.ok(loneId, 'the lone player has no id');
+    await until(async () => (await apiPing(bridge)).waiting === 1, 'the hub API to count the waiting player');
+    assert.ok(await adminC.call('gogh-cancel', 'getUser', [loneId]), 'the waiting player is not a candidate on the hub');
+    await lone.page.waitForFunction(() => /· 1 player waiting/.test(document.querySelector('#online-status')?.textContent || ''), null, {timeout: 20_000});
+    await lone.page.locator('#online-cancel').click();
+    await waitPhase(lone, 'connected');
+    assert.match(await matchText(lone), /Find match pairs you/);
+    await until(async () => { const ping = await apiPing(bridge); return ping.waiting === 0 && ping.seats === 0; }, 'the cancelled player to leave no seat in the hub API');
+    await until(async () => (await adminC.call('gogh-cancel', 'getUser', [loneId])) === null, 'the cancelled player to leave the hub');
+    // A later pair is unaffected: it matches with each other, never with the one who cancelled.
+    const [a, b] = await twoPlayers(['cancel-a', 'cancel-b'], bridge.base, [{online: true}, {online: true}]);
+    await Promise.all([connectPanel(a, bridge.base), connectPanel(b, bridge.base)]);
+    await findMatch(a);
+    await waitPhase(a, 'searching');
+    await findMatch(b);
+    await Promise.all([reachDirect(a), reachDirect(b)]);
+    await Promise.all([instrument(a), instrument(b)]);
+    const [ia, ib] = await Promise.all([sessionInfo(a), sessionInfo(b)]);
+    assert.deepEqual([ia.peers, ib.peers], [[ib.id], [ia.id]], 'the pair was matched with someone else');
+    assert.equal(ia.room, ib.room);
+    assert.notEqual(await userIdOf(lone), ia.id);
+    const via = [await exchange(a, b, 7), await exchange(b, a, 8)];
+    assert.deepEqual(via, ['direct', 'direct']);
+    const ping = await apiPing(bridge);
+    assert.deepEqual([ping.waiting, ping.seats], [0, 2]);
+    assert.equal(await adminC.call('gogh-cancel', 'getUser', [loneId]), null, 'the cancelled player came back');
+    assert.equal(lone.errors.length + a.errors.length + b.errors.length, 0, 'page errors');
+    return `cancelled ${loneId} left nothing; pair ${ia.id}/${ib.id} matched directly; seats ${ping.seats}`;
+  });
+
+  await scenario('12 the hub API is on a different origin from the page', async () => {
+    const pageBase = `http://127.0.0.1:${portPage}`;
+    const apiBase = `http://127.0.0.1:${portApi}`;
+    const otherBase = `http://127.0.0.1:${portOther}`;
+    // The page's own bridge only serves the game; the API lives on another port and allows that one page origin.
+    const pageServer = await startBridge(portPage, central.address, centralToken, {LIVEENGINE_HUB_ID: 'gogh-unused'});
+    const apiServer = await startBridge(portApi, central.address, centralToken, {LIVEENGINE_HUB_ID: 'gogh-xorigin', GOGH_LIVE_LINK: 'peer', GOGH_ALLOWED_ORIGINS: pageBase});
+    const otherServer = await startBridge(portOther, central.address, centralToken, {LIVEENGINE_HUB_ID: 'gogh-unused-2'});
+    assert.equal(pageServer.base, pageBase);
+    assert.equal(apiServer.base, apiBase);
+    const [a, b] = await twoPlayers(['x-a', 'x-b'], pageBase, [{online: true}, {online: true}]);
+    await Promise.all([connectPanel(a, apiBase), connectPanel(b, apiBase)]);
+    await a.page.waitForFunction(() => document.querySelector('#online-hubs')?.textContent.includes('gogh-xorigin'), null, {timeout: 20_000});
+    await findMatch(a);
+    await waitPhase(a, 'searching');
+    await findMatch(b);
+    await Promise.all([reachDirect(a), reachDirect(b)]);
+    const ids = await playBoth(a, b);
+    const moved = await seeEachOther(a, b, ids);
+    for (const player of [a, b]) {
+      assert.ok(player.requests.some(url => url.startsWith(`${apiBase}/api/liveengine/pair`)), `${player.label} never called the other origin`);
+      assert.ok(!player.requests.some(url => url.startsWith(`${pageBase}/api/liveengine/`)), `${player.label} called its own origin's API`);
+      assert.ok(player.requests.some(url => url === `${apiBase}/api/liveengine/live-client.mjs`), `${player.label} did not load LiveClient from the API origin`);
+    }
+    // A page the API does not list is refused by the browser's own CORS check, and the panel says so.
+    const blocked = await openPlayer('x-blocked', otherBase, {online: true});
+    await typeAddress(blocked, apiBase);
+    await blocked.page.waitForSelector('#online-error:not([hidden])', {timeout: 20_000});
+    const error = await blocked.page.locator('#online-error').textContent();
+    assert.match(error, /Could not reach a hub API at .*allows this page/);
+    assert.equal(await phaseOf(blocked), 'idle');
+    assert.equal(await blocked.page.locator('#online-find').isVisible(), false);
+    assert.equal(otherServer.base, otherBase);
+    assert.equal(a.errors.length + b.errors.length, 0, `page errors: ${[...a.errors, ...b.errors].join('; ')}`);
+    return `page ${pageBase} -> API ${apiBase}; ${moved}; unlisted origin refused`;
+  });
+
+  await scenario('13 a wrong hub API address shows a clear error and the user can correct it', async () => {
+    const bridge = await startBridge(portCorrect, central.address, centralToken, {LIVEENGINE_HUB_ID: 'gogh-correct', GOGH_LIVE_LINK: 'peer'});
+    const player = await openPlayer('wrong', bridge.base, {online: true});
+    const error = () => player.page.locator('#online-error');
+    // 1. Nothing listens there.
+    await typeAddress(player, `http://127.0.0.1:${portClosed}`);
+    await player.page.waitForSelector('#online-error:not([hidden])', {timeout: 20_000});
+    assert.match(await error().textContent(), new RegExp(`Could not reach a hub API at http://127\\.0\\.0\\.1:${portClosed}/api/liveengine\\. Check the address and that the server is running`));
+    assert.equal(await phaseOf(player), 'idle');
+    assert.equal(await player.page.locator('#online-body').isVisible(), false, 'the match controls show without a connection');
+    assert.equal(await player.page.locator('#online-connect').isEnabled(), true, 'the user cannot try again');
+    // 2. A server answers, but it is not the hub API.
+    await typeAddress(player, `${bridge.base}/nowhere`);
+    await player.page.waitForFunction(() => /not as a hub API/.test(document.querySelector('#online-error')?.textContent || ''), null, {timeout: 20_000});
+    assert.match(await error().textContent(), /answered, but not as a hub API \(HTTP 404\)\. Check the address, including any path\./);
+    assert.equal(await phaseOf(player), 'idle');
+    // 3. Not an address at all.
+    await typeAddress(player, 'http://');
+    await player.page.waitForFunction(() => /is not an address/.test(document.querySelector('#online-error')?.textContent || ''), null, {timeout: 20_000});
+    // 4. The user corrects it and connects; the error goes away and the address is remembered.
+    await typeAddress(player, bridge.base);
+    await waitPhase(player, 'connected');
+    assert.equal(await error().isHidden(), true, 'the error stayed after a good connect');
+    await player.page.waitForFunction(() => /Connected to gogh-correct · ping \d+ ms/.test(document.querySelector('#online-status')?.textContent || ''), null, {timeout: 20_000});
+    await player.page.reload({waitUntil: 'domcontentloaded'});
+    await player.page.waitForSelector('#deploy-button:not(:disabled)', {timeout: 90_000});
+    assert.equal(await player.page.locator('#online-address').inputValue(), bridge.base, 'the address was not remembered');
+    assert.equal(player.errors.length, 0, `page errors: ${player.errors.join('; ')}`);
+    return 'unreachable, not-a-hub-API and malformed addresses each explained; corrected address connected and remembered';
+  });
+
+  await scenario('14 scenario 9 with everything bound to the LAN address instead of loopback', async () => {
+    const lan = lanAddress();
+    const [hubPort, pagePort] = await Promise.all([freePort(), freePort()]);
+    const lanToken = secret();
+    const lanBase = `http://${lan}:${pagePort}`;
+    const lanHub = await startHub({LIVEENGINE_TOKEN: lanToken, LIVEENGINE_BIND: `${lan}:${hubPort}`, LIVEENGINE_PUBLIC_URL: `ws://${lan}:${hubPort}/v1/live`,
+      LIVEENGINE_LIVE_ALLOWED_ORIGINS: lanBase, LIVEENGINE_ICE_SERVERS: '[]', LIVEENGINE_RATE_LIMIT_REQUESTS: '100000'});
+    onClose(() => lanHub.stop());
+    assert.equal(lanHub.address, `http://${lan}:${hubPort}`);
+    const bridge = await startBridge(pagePort, lanHub.address, lanToken, {LIVEENGINE_HUB_ID: 'gogh-lan', GOGH_LIVE_LINK: 'peer'}, lan);
+    assert.equal(bridge.base, lanBase);
+    const [a, b] = await twoPlayers(['lan-a', 'lan-b'], bridge.base, [{online: true}, {online: true}]);
+    await Promise.all([connectPanel(a, bridge.base), connectPanel(b, bridge.base)]);
+    await findMatch(a);
+    await waitPhase(a, 'searching');
+    await findMatch(b);
+    await Promise.all([reachDirect(a), reachDirect(b)]);
+    const ids = await playBoth(a, b);
+    const moved = await seeEachOther(a, b, ids);
+    const descriptorUrl = await a.page.evaluate(() => window.__e2e.session._descriptor.url);
+    assert.equal(new URL(descriptorUrl).hostname, lan, 'the hub handed out a non-LAN address');
+    for (const player of [a, b]) assert.ok(player.requests.every(url => !/^https?:\/\/127\.0\.0\.1/.test(url)), `${player.label} used the loopback address`);
+    assert.equal(a.errors.length + b.errors.length, 0, `page errors: ${[...a.errors, ...b.errors].join('; ')}`);
+    return `LAN ${lan}, hub ${descriptorUrl}, direct on both sides; ${moved}`;
+  });
+
 }
 
 for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => closeAll().finally(() => process.exit(130)));
@@ -615,7 +880,7 @@ try {
   await closeAll();
 }
 // A scenario that never ran (its setup broke) is a failure, not a skip.
-for (let number = 1; number <= 8; number++) {
+for (let number = 1; number <= 14; number++) {
   if (results.some(result => result.name.startsWith(`${number} `))) continue;
   results.push({name: `${number}`, ok: false});
   console.log(`FAIL ${number} | did not run: setup failed`);

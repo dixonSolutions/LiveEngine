@@ -40,6 +40,8 @@ export async function freePort() {
 export async function startHub(env = {}) {
   // A caller that needs the port in advance (for a proxy in front) passes LIVEENGINE_BIND.
   const port = env.LIVEENGINE_BIND ? Number(env.LIVEENGINE_BIND.split(':').pop()) : await freePort();
+  // `LIVEENGINE_BIND` may name another address (a LAN test); the readiness check follows it.
+  const bindHost = env.LIVEENGINE_BIND ? env.LIVEENGINE_BIND.slice(0, env.LIVEENGINE_BIND.lastIndexOf(':')) : '127.0.0.1';
   const output = [];
   const child = spawn(hubBinary(), ['serve'], {
     env: {
@@ -55,7 +57,7 @@ export async function startHub(env = {}) {
   child.stderr.on('data', chunk => output.push(String(chunk)));
   let exited = false;
   child.on('exit', () => { exited = true; });
-  const address = `http://127.0.0.1:${port}`;
+  const address = `http://${bindHost}:${port}`;
   const deadline = Date.now() + 15000;
   for (;;) {
     if (exited) throw new Error(`hub exited early: ${output.join('')}`);
@@ -68,7 +70,7 @@ export async function startHub(env = {}) {
   return {
     port,
     address,
-    wsUrl: `ws://127.0.0.1:${port}/v1/live`,
+    wsUrl: `ws://${bindHost}:${port}/v1/live`,
     output: () => output.join(''),
     async stop() {
       if (exited) return;

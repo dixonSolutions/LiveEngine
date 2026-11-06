@@ -31,6 +31,8 @@
     "lib",
     "lib/live-client.mjs",
     "lib/live-client.d.mts",
+    "lib/hub-api.mjs",
+    "lib/hub-api.d.mts",
     "native/*.node",
     "native/liveengine-hub.*",
     "src/**/*.rs",
@@ -53,7 +55,7 @@
     "build": "node scripts/build.js",
     "build:debug": "node scripts/build.js --debug",
     "build:hub": "node scripts/build-hub.js",
-    "test": "node --test test/engine.test.js test/math-game.test.js test/hub-client.test.js test/live-client.test.mjs",
+    "test": "node --test test/engine.test.js test/math-game.test.js test/hub-client.test.js test/live-client.test.mjs test/hub-api.test.mjs",
     "test:rust": "cargo test --locked",
     "test:all": "npm run test:rust && npm test && npm run test:integration",
     "bench": "node bench/bench.js",
@@ -61,6 +63,7 @@
     "hub": "node bin/liveengine-hub.js",
     "test:integration": "node --test integrations/gogh-strike/bridge.test.mjs integrations/gogh-strike/bridge-live.test.mjs",
     "test:e2e": "node integrations/gogh-strike/live-e2e.mjs",
+    "dev:gogh": "node scripts/dev-gogh.mjs",
     "docs:dev": "cd docs-site && npx mint@latest dev",
     "docs:validate": "cd docs-site && npx mint@latest validate && npx mint@latest broken-links"
   },
@@ -86,6 +89,11 @@
       "types": "./lib/live-client.d.mts",
       "import": "./lib/live-client.mjs",
       "default": "./lib/live-client.mjs"
+    },
+    "./hub-api": {
+      "types": "./lib/hub-api.d.mts",
+      "import": "./lib/hub-api.mjs",
+      "default": "./lib/hub-api.mjs"
     },
     "./package.json": "./package.json"
   }

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add `createHubApi` (`@dixonsolutions/liveengine/hub-api`): a dependency-free Node handler that publishes schemas and channels, pairs players with `waitMs`, renews, heartbeats, issues watch tickets, tracks seats and reaps idle ones, with Origin checks, CORS, body and rate limits. A left player is now removed from the hub, so a cancelled search leaves no ghost candidate. Add `watchHubs` to `LiveClient` for a live hub list in a page, and `signal` to `HubClient.pair`.
+
+- Gogh Strike: a Play online panel in the lobby, scenarios 9 to 14 in the end-to-end test, a self-contained game setup (`integrations/gogh-strike/setup.mjs`) and `npm run dev:gogh`.
+
 - Restrict provider-hosted credentials to local registrations by default, add administrator-controlled remote opt-in, and enforce hosted hub quotas across descendants.
 
 - Start on read-only filesystems: without a configured location the instance id stays in memory, with a warning.

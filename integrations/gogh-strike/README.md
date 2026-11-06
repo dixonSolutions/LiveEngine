@@ -4,7 +4,7 @@ This integration connects the browser game to LiveEngine for real multiplayer. T
 
 Responsibilities are split so the game holds no connection logic:
 
-- `bridge.mjs` holds the administrator token. On first use it registers the game's schemas (`gogh-strike.state@1`, `gogh-strike.event@1`) and the hub's `state` (lossy) and `event` (reliable) channels, plus `auth` when `GOGH_HUB_AUTH` is set. It exposes thin routes over `HubClient.discover`, `pair` and `renewal`, and serves `lib/live-client.mjs` to the browser at `/liveengine/live-client.mjs`.
+- `bridge.mjs` serves the game and mounts `lib/hub-api.mjs` (the generic hub API, which holds the administrator token). On first use it registers the game's schemas (`gogh-strike.state@1`, `gogh-strike.event@1`) and the hub's `state` (lossy) and `event` (reliable) channels, plus `auth` when `GOGH_HUB_AUTH` is set. It exposes thin routes over `HubClient.discover`, `pair` and `renewal`, and serves `lib/live-client.mjs` to the browser at `/liveengine/live-client.mjs`.
 - The game's `src/liveengine-net.js` holds only the DTO and schema definitions, the channel table and the mapping to and from game state (plus a small interpolation of remote positions). The bridge imports its `LIVE_SCHEMAS` and `LIVE_CHANNELS` from the game checkout, so the game stays the one owner of its data. If the file is absent the bridge still serves the older seat-based `join` route but registers no schemas or channels.
 - Pairing, tickets, retry with backoff, a fresh ticket on every reconnect and WebRTC with relay fallback live in `lib/live-client.mjs` (`connectLive`, `LiveClient`).
 
