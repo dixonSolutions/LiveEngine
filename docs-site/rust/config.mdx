@@ -20,6 +20,8 @@ pub struct HubConfig {
     pub max_generates_per_call: usize,
     pub max_inflight_calls: usize,
     pub request_timeout: Duration,
+    pub call_queue: Duration,
+    pub max_queued_calls: usize,
     pub max_pair_wait: Duration,
     pub max_pending_pairs: usize,
     pub rate_limit_requests: usize,
@@ -43,6 +45,8 @@ pub struct HubConfig {
 | `max_generates_per_call` | `usize` | `10000` |
 | `max_inflight_calls` | `usize` | `16` |
 | `request_timeout` | `Duration` | 5 seconds |
+| `call_queue` | `Duration` | 1 second |
+| `max_queued_calls` | `usize` | `1024` |
 | `max_pair_wait` | `Duration` | 30 seconds |
 | `max_pending_pairs` | `usize` | `1024` |
 | `rate_limit_requests` | `usize` | `120` |

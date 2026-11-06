@@ -549,6 +549,8 @@ async fn timed_out_blocking_handler_keeps_its_global_permit_until_finished() {
     let mut cfg = config();
     cfg.request_timeout = Duration::from_millis(100);
     cfg.max_inflight_calls = 1;
+    // The permit is held by the timed-out worker, so a caller must not queue past the test.
+    cfg.call_queue = Duration::from_millis(20);
     let service = HubService::new(cfg).unwrap();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -1366,4 +1368,101 @@ async fn rollback_failed_public_internal_registration() {
         200
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_calls_to_one_hub_queue_instead_of_failing() {
+    // Default limits: 16 workers, and 64 callers at once on a single hub.
+    let service = HubService::new(config()).unwrap();
+    let app = service.router();
+    let (status, body) = request(
+        app.clone(),
+        "POST",
+        "/v1/hubs",
+        Some(json!({"id":"busy","mode":"internal"})),
+        true,
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let calls: Vec<_> = (0..64)
+        .map(|n| {
+            tokio::spawn(request(
+                app.clone(),
+                "POST",
+                "/v1/hubs/busy/call",
+                Some(json!({"method":"upsertUser","args":[{"id":format!("u{n}"),"scopes":{}}]})),
+                true,
+            ))
+        })
+        .collect();
+    for call in calls {
+        let (status, body) = call.await.unwrap();
+        assert_eq!(status, 200, "{body}");
+    }
+    let (_, stats) = request(
+        app,
+        "POST",
+        "/v1/hubs/busy/call",
+        Some(json!({"method":"listUsers","args":[]})),
+        true,
+    )
+    .await;
+    assert_eq!(stats["result"].as_array().unwrap().len(), 64);
+}
+
+#[tokio::test]
+async fn a_stuck_handler_refuses_callers_at_the_queue_deadline() {
+    let mut cfg = config();
+    cfg.call_queue = Duration::from_millis(300);
+    let service = HubService::new(cfg).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let registration = HubRegistration {
+        id: "stuck".into(),
+        mode: HubMode::Internal,
+        address: None,
+        remote_token: None,
+        remote_hub_id: None,
+        scopes: json!({}),
+        scope_schema: None,
+        ttl_seconds: None,
+    };
+    service
+        .register_internal(
+            registration,
+            BlockingHandler {
+                started: started_tx,
+                release: release_rx,
+            },
+        )
+        .await
+        .unwrap();
+    let app = service.router();
+    let call = || {
+        request(
+            app.clone(),
+            "POST",
+            "/v1/hubs/stuck/call",
+            Some(json!({"method":"block","args":[]})),
+            true,
+        )
+    };
+    let first = tokio::spawn(call());
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)).unwrap())
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let (status, body) = call().await;
+    let waited = started.elapsed();
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], "hub handler is busy");
+    assert!(waited >= Duration::from_millis(250), "{waited:?}");
+    assert!(waited < Duration::from_millis(1500), "{waited:?}");
+    // Other hubs and the service keep answering while one handler is stuck.
+    assert_eq!(
+        request(app.clone(), "GET", "/health", None, false).await.0,
+        200
+    );
+    release_tx.send(()).unwrap();
+    assert_eq!(first.await.unwrap().0, 200);
 }

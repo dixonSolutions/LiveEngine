@@ -38,11 +38,19 @@ struct Waiting {
     wake: oneshot::Sender<Matched>,
 }
 
-/// Peers whose `pair` request is waiting for a partner, by id. Guarded by one mutex that is
+/// A waiting peer is known by its id and its scopes, so the same id waiting in two hubs of one
+/// service (users with different scopes) stays two peers.
+type SeatKey = (String, String);
+
+fn seat_key(id: &str, scopes: &Value) -> SeatKey {
+    (id.to_owned(), scopes.to_string())
+}
+
+/// Peers whose `pair` request is waiting for a partner. Guarded by one mutex that is
 /// never held across an await, so a claim removes the waiter and the claimer together.
 #[derive(Default)]
 pub(crate) struct PendingPairs {
-    state: Mutex<(u64, HashMap<String, Waiting>)>,
+    state: Mutex<(u64, HashMap<SeatKey, Waiting>)>,
 }
 
 pub(crate) enum Claim {
@@ -64,7 +72,7 @@ pub(crate) enum Enter {
 /// A queue entry that leaves the queue when dropped, so a disconnected request frees its seat.
 pub(crate) struct Seat {
     state: Arc<Inner>,
-    id: String,
+    key: SeatKey,
     token: u64,
 }
 
@@ -74,26 +82,26 @@ impl Seat {
             .pending
             .lock()
             .1
-            .get(&self.id)
+            .get(&self.key)
             .is_some_and(|w| w.token == self.token)
     }
 }
 
 impl Drop for Seat {
     fn drop(&mut self) {
-        self.state.pending.remove(&self.id, self.token);
+        self.state.pending.remove(&self.key, self.token);
     }
 }
 
 impl PendingPairs {
-    fn lock(&self) -> std::sync::MutexGuard<'_, (u64, HashMap<String, Waiting>)> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (u64, HashMap<SeatKey, Waiting>)> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn remove(&self, id: &str, token: u64) -> bool {
+    fn remove(&self, key: &SeatKey, token: u64) -> bool {
         let mut guard = self.lock();
-        if guard.1.get(id).is_some_and(|w| w.token == token) {
-            guard.1.remove(id);
+        if guard.1.get(key).is_some_and(|w| w.token == token) {
+            guard.1.remove(key);
             return true;
         }
         false
@@ -103,11 +111,13 @@ impl PendingPairs {
         &self,
         state: &Arc<Inner>,
         id: &str,
+        scopes: &Value,
         target: &serde_json::Map<String, Value>,
         requirements: Value,
     ) -> Result<(Seat, oneshot::Receiver<Matched>), Enter> {
+        let key = seat_key(id, scopes);
         let mut guard = self.lock();
-        if guard.1.contains_key(id) {
+        if guard.1.contains_key(&key) {
             return Err(Enter::Duplicate);
         }
         if guard.1.len() >= state.config.max_pending_pairs {
@@ -117,7 +127,7 @@ impl PendingPairs {
         let token = guard.0;
         let (wake, receiver) = oneshot::channel();
         guard.1.insert(
-            id.to_owned(),
+            key.clone(),
             Waiting {
                 token,
                 kind: target.get("kind").cloned().unwrap_or(Value::Null),
@@ -129,7 +139,7 @@ impl PendingPairs {
         Ok((
             Seat {
                 state: state.clone(),
-                id: id.to_owned(),
+                key,
                 token,
             },
             receiver,
@@ -143,11 +153,15 @@ impl PendingPairs {
         seat: Option<&Seat>,
         subject_id: &str,
         scopes: &Value,
-        candidate: &str,
+        candidate: &SeatKey,
     ) -> Claim {
         let mut guard = self.lock();
         if let Some(seat) = seat {
-            if !guard.1.get(&seat.id).is_some_and(|w| w.token == seat.token) {
+            if !guard
+                .1
+                .get(&seat.key)
+                .is_some_and(|w| w.token == seat.token)
+            {
                 return Claim::Lost;
             }
         }
@@ -165,7 +179,7 @@ impl PendingPairs {
         }
         let taken = guard.1.remove(candidate).unwrap();
         if let Some(seat) = seat {
-            guard.1.remove(&seat.id);
+            guard.1.remove(&seat.key);
         }
         Claim::Taken(taken.wake)
     }
@@ -298,31 +312,11 @@ fn search<'a>(
             }
             if kind != "hub" {
                 let users = if let Some(handler) = record.handler.clone() {
-                    let mut users = None;
-                    // A hub busy with another call or short of capacity is asked again shortly.
-                    for attempt in 0..BUSY_RETRIES {
-                        let Ok(permit) = state.inflight_calls.clone().try_acquire_owned() else {
-                            busy_pause(attempt).await;
-                            continue;
-                        };
-                        let handler = handler.clone();
-                        let listed = tokio::task::spawn_blocking(move || {
-                            let _permit = permit;
-                            handler
-                                .try_lock()
-                                .ok()
-                                .map(|mut h| h.call("listUsers", vec![]).ok())
-                        })
+                    state
+                        .run_on_hub(&handler, |h| h.call("listUsers", vec![]).ok())
                         .await
                         .ok()
-                        .flatten();
-                        if let Some(listed) = listed {
-                            users = listed;
-                            break;
-                        }
-                        busy_pause(attempt).await;
-                    }
-                    users
+                        .flatten()
                 } else if record.info.mode == HubMode::External && base < state.config.max_depth {
                     if let Some(address) = record.info.address.as_deref() {
                         let request = RouteRequest {
@@ -476,13 +470,8 @@ pub(crate) async fn pair_endpoint(
     .await
 }
 
-const BUSY_RETRIES: u32 = 16;
-
-/// A short, jittered pause so peers that collided on a busy hub do not collide again together.
-async fn busy_pause(attempt: u32) {
-    let ceiling = 10 + 5 * u64::from(attempt);
-    tokio::time::sleep(Duration::from_millis(1 + rand::random::<u64>() % ceiling)).await;
-}
+/// How often a waiting peer that lost a race for a partner looks again before it waits.
+const RACE_RETRIES: u32 = 8;
 
 async fn routed(
     state: Arc<Inner>,
@@ -511,29 +500,7 @@ async fn routed_with_channels(
         inherited_schemas: Some(inherited),
         inherited_channels,
     };
-    let mut attempt = 0;
-    let response = loop {
-        let response = Box::pin(route_hub(
-            State(state.clone()),
-            headers.clone(),
-            Ok(Json(request.clone())),
-        ))
-        .await;
-        // Hub calls fail fast when the hub is busy with a concurrent call or at capacity.
-        // Pairing is concurrent by design, so those two outcomes are asked again briefly.
-        if matches!(op, "call" | "ticket")
-            && matches!(
-                response.status(),
-                StatusCode::CONFLICT | StatusCode::SERVICE_UNAVAILABLE
-            )
-            && attempt + 1 < BUSY_RETRIES
-        {
-            busy_pause(attempt).await;
-            attempt += 1;
-            continue;
-        }
-        break response;
-    };
+    let response = Box::pin(route_hub(State(state.clone()), headers, Ok(Json(request)))).await;
     if !response.status().is_success() {
         return Err(Box::new(response));
     }
@@ -585,10 +552,13 @@ pub(crate) async fn pair(
     let credential = body["subject"]["credential"].clone();
     let deadline = Instant::now() + wait;
     loop {
-        let (seat, mut wake) = match state
-            .pending
-            .enter(&state, &id, target, requirements.clone())
-        {
+        let (seat, mut wake) = match state.pending.enter(
+            &state,
+            &id,
+            &body["subject"]["scopes"],
+            target,
+            requirements.clone(),
+        ) {
             Ok(entered) => entered,
             Err(Enter::Duplicate) => {
                 return error(StatusCode::CONFLICT, "peer is already waiting to pair")
@@ -609,8 +579,7 @@ pub(crate) async fn pair(
             )
             .await;
             // Losing a race for a partner is not "no partner": look again at once.
-            if response.status() == StatusCode::CONFLICT && seat.holds() && races < BUSY_RETRIES {
-                busy_pause(races).await;
+            if response.status() == StatusCode::CONFLICT && seat.holds() && races < RACE_RETRIES {
                 races += 1;
                 continue;
             }
@@ -867,6 +836,7 @@ async fn pair_once(
     }
     let mut selected = None;
     let mut taken = None;
+    let mut candidate_scopes = Value::Null;
     if let Some(candidates) = found["candidates"].as_array() {
         for candidate in candidates {
             if candidate["kind"] == kind && candidate["id"] == id {
@@ -930,6 +900,7 @@ async fn pair_once(
                 else {
                     continue;
                 };
+                candidate_scopes = user["result"]["scopes"].clone();
                 if user["result"]["status"] == "idle"
                     || !rules::evaluate(&user["result"]["requirements"], &subject["scopes"])
                 {
@@ -958,7 +929,7 @@ async fn pair_once(
                     seat,
                     id,
                     &subject["scopes"],
-                    candidate["id"].as_str().unwrap_or(""),
+                    &seat_key(candidate["id"].as_str().unwrap_or(""), &candidate_scopes),
                 ) {
                     Claim::Lost => break,
                     Claim::Skip => continue,
@@ -1288,25 +1259,32 @@ mod tests {
         let any = target(json!({"kind":"peer"}));
         let (a, _a) = state
             .pending
-            .enter(&state, "a", &any, Value::Null)
+            .enter(&state, "a", &json!({}), &any, Value::Null)
             .ok()
             .unwrap();
         assert!(matches!(
-            state.pending.enter(&state, "a", &any, Value::Null),
+            state
+                .pending
+                .enter(&state, "a", &json!({}), &any, Value::Null),
             Err(Enter::Duplicate)
         ));
         let (_b, _b_wake) = state
             .pending
-            .enter(&state, "b", &any, Value::Null)
+            .enter(&state, "b", &json!({}), &any, Value::Null)
             .ok()
             .unwrap();
         assert!(matches!(
-            state.pending.enter(&state, "c", &any, Value::Null),
+            state
+                .pending
+                .enter(&state, "c", &json!({}), &any, Value::Null),
             Err(Enter::Full)
         ));
         drop(a);
         assert_eq!(state.pending.len(), 1);
-        assert!(state.pending.enter(&state, "c", &any, Value::Null).is_ok());
+        assert!(state
+            .pending
+            .enter(&state, "c", &json!({}), &any, Value::Null)
+            .is_ok());
     }
 
     #[test]
@@ -1315,12 +1293,12 @@ mod tests {
         let any = target(json!({"kind":"peer"}));
         let (seat, _wake) = state
             .pending
-            .enter(&state, "a", &any, Value::Null)
+            .enter(&state, "a", &json!({}), &any, Value::Null)
             .ok()
             .unwrap();
         let stale = Seat {
             state: state.clone(),
-            id: "a".into(),
+            key: seat_key("a", &json!({})),
             token: seat.token + 100,
         };
         drop(stale);
@@ -1335,24 +1313,64 @@ mod tests {
         let any = target(json!({"kind":"peer"}));
         let (a, mut a_wake) = state
             .pending
-            .enter(&state, "a", &any, Value::Null)
+            .enter(&state, "a", &json!({}), &any, Value::Null)
             .ok()
             .unwrap();
         let (b, _b_wake) = state
             .pending
-            .enter(&state, "b", &any, Value::Null)
+            .enter(&state, "b", &json!({}), &any, Value::Null)
             .ok()
             .unwrap();
         let scopes = json!({});
-        let first = state.pending.claim(Some(&a), "a", &scopes, "b");
+        let first = state
+            .pending
+            .claim(Some(&a), "a", &scopes, &seat_key("b", &json!({})));
         assert!(matches!(first, Claim::Taken(_)));
         assert_eq!(state.pending.len(), 0);
         // `b` was claimed, so its own claim of `a` finds nobody and does not pair twice.
         assert!(matches!(
-            state.pending.claim(Some(&b), "b", &scopes, "a"),
+            state
+                .pending
+                .claim(Some(&b), "b", &scopes, &seat_key("a", &json!({}))),
             Claim::Lost
         ));
         assert!(a_wake.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_same_peer_id_waits_once_per_scope() {
+        let state = state(4);
+        let any = target(json!({"kind":"peer"}));
+        let north = json!({"arena":"north"});
+        let south = json!({"arena":"south"});
+        let (_a, _a_wake) = state
+            .pending
+            .enter(&state, "twin", &north, &any, Value::Null)
+            .ok()
+            .unwrap();
+        let (_b, _b_wake) = state
+            .pending
+            .enter(&state, "twin", &south, &any, Value::Null)
+            .ok()
+            .unwrap();
+        assert!(matches!(
+            state
+                .pending
+                .enter(&state, "twin", &north, &any, Value::Null),
+            Err(Enter::Duplicate)
+        ));
+        // A claim reaches only the twin with the scopes it asked for.
+        let taken = state
+            .pending
+            .claim(None, "x", &json!({}), &seat_key("twin", &south));
+        assert!(matches!(taken, Claim::Taken(_)));
+        assert_eq!(state.pending.len(), 1);
+        assert!(matches!(
+            state
+                .pending
+                .claim(None, "x", &json!({}), &seat_key("twin", &south)),
+            Claim::Direct
+        ));
     }
 
     #[test]
@@ -1360,21 +1378,36 @@ mod tests {
         let state = state(4);
         let picky = target(json!({"kind":"peer","id":"z"}));
         let rank = rules::parse_requirements(Some(&json!({"rank":3}))).unwrap();
-        let (_seat, _wake) = state.pending.enter(&state, "w", &picky, rank).ok().unwrap();
+        let (_seat, _wake) = state
+            .pending
+            .enter(&state, "w", &json!({}), &picky, rank)
+            .ok()
+            .unwrap();
         assert!(matches!(
-            state.pending.claim(None, "y", &json!({"rank":3}), "w"),
+            state
+                .pending
+                .claim(None, "y", &json!({"rank":3}), &seat_key("w", &json!({}))),
             Claim::Skip
         ));
         assert!(matches!(
-            state.pending.claim(None, "z", &json!({"rank":1}), "w"),
+            state
+                .pending
+                .claim(None, "z", &json!({"rank":1}), &seat_key("w", &json!({}))),
             Claim::Skip
         ));
         assert!(matches!(
-            state.pending.claim(None, "z", &json!({"rank":3}), "nobody"),
+            state.pending.claim(
+                None,
+                "z",
+                &json!({"rank":3}),
+                &seat_key("nobody", &json!({}))
+            ),
             Claim::Direct
         ));
         assert!(matches!(
-            state.pending.claim(None, "z", &json!({"rank":3}), "w"),
+            state
+                .pending
+                .claim(None, "z", &json!({"rank":3}), &seat_key("w", &json!({}))),
             Claim::Taken(_)
         ));
         assert_eq!(state.pending.len(), 0);

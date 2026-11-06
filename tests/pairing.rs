@@ -543,7 +543,6 @@ fn waiting_config(token: &str) -> HubConfig {
         public_url: Some("ws://live.example.test/v1/live".into()),
         request_timeout: std::time::Duration::from_secs(1),
         max_pair_wait: std::time::Duration::from_secs(3),
-        max_inflight_calls: 512,
         ..HubConfig::default()
     }
 }
@@ -811,13 +810,16 @@ async fn simultaneous_peers_pair_exactly_once() {
         let c = reqwest::Client::new();
         let ids: Vec<String> = (0..24).map(|n| format!("p{n:02}")).collect();
         arena(&c, &base, TOKEN).await;
-        for id in &ids {
-            register(&c, &base, TOKEN, id).await;
-        }
-        // Every peer asks to pair at the same instant.
+        // Every peer registers and asks to pair at the same instant, at default limits.
         let calls: Vec<_> = ids
             .iter()
-            .map(|id| spawn_pair(&c, &base, TOKEN, wait_request(id, 3000)))
+            .map(|id| {
+                let (c, base, id) = (c.clone(), base.clone(), id.clone());
+                tokio::spawn(async move {
+                    register(&c, &base, TOKEN, &id).await;
+                    post(&c, &base, TOKEN, "/v1/pair", wait_request(&id, 3000)).await
+                })
+            })
             .collect();
         let mut rooms = std::collections::BTreeMap::new();
         for (id, call) in ids.iter().zip(calls) {
@@ -842,4 +844,196 @@ async fn simultaneous_peers_pair_exactly_once() {
         assert!(members.values().all(|n| *n >= 2), "{members:?}");
         task.abort();
     }
+}
+
+#[tokio::test]
+async fn the_same_peer_id_waits_separately_in_two_hubs() {
+    let (base, task) = server_with(waiting_config(TOKEN)).await;
+    let c = reqwest::Client::new();
+    for (hub, arena) in [("north-hub", "north"), ("south-hub", "south")] {
+        let (status, body) = post(
+            &c,
+            &base,
+            TOKEN,
+            "/v1/hubs",
+            json!({"id":hub,"mode":"internal","scopes":{"arena":arena}}),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        let (status, body) = post(
+            &c,
+            &base,
+            TOKEN,
+            &format!("/v1/hubs/{hub}/call"),
+            json!({"method":"upsertUser","args":[{"id":"twin","scopes":{"arena":arena}}]}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let request = |id: &str, arena: &str| {
+        json!({
+            "subject":{"kind":"peer","id":id,"scopes":{"arena":arena}},
+            "target":{"kind":"peer","requirements":{"arena":arena}},
+            "waitMs":3000
+        })
+    };
+    // The same id waits in both hubs at once: neither request is a duplicate of the other.
+    let north = spawn_pair(&c, &base, TOKEN, request("twin", "north"));
+    let south = spawn_pair(&c, &base, TOKEN, request("twin", "south"));
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(!north.is_finished() && !south.is_finished());
+    for (hub, arena, partner) in [("north-hub", "north", "n2"), ("south-hub", "south", "s2")] {
+        let (status, body) = post(
+            &c,
+            &base,
+            TOKEN,
+            &format!("/v1/hubs/{hub}/call"),
+            json!({"method":"upsertUser","args":[{"id":partner,"scopes":{"arena":arena}}]}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let mut arrival = request(partner, arena);
+        arrival["waitMs"] = json!(0);
+        let (status, body) = post(&c, &base, TOKEN, "/v1/pair", arrival).await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let (status, north) = north.await.unwrap();
+    assert_eq!(status, 200, "{north}");
+    let (status, south) = south.await.unwrap();
+    assert_eq!(status, 200, "{south}");
+    assert_eq!(north["room"], "pair:twin");
+    assert_eq!(south["room"], "pair:twin");
+    // Each twin was seated in its own hub, beside its own partner.
+    for (hub, partner) in [("north-hub", "n2"), ("south-hub", "s2")] {
+        let (_, user) = post(
+            &c,
+            &base,
+            TOKEN,
+            &format!("/v1/hubs/{hub}/call"),
+            json!({"method":"getUser","args":[partner]}),
+        )
+        .await;
+        assert_eq!(user["result"]["serverId"], "pair:twin", "{hub}");
+        assert_eq!(user["result"]["status"], "paired");
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_full_queue_refuses_with_503() {
+    let (base, task) = server_with(HubConfig {
+        max_pending_pairs: 1,
+        ..waiting_config(TOKEN)
+    })
+    .await;
+    let c = reqwest::Client::new();
+    arena(&c, &base, TOKEN).await;
+    register(&c, &base, TOKEN, "first").await;
+    let first = spawn_pair(&c, &base, TOKEN, wait_request("first", 2000));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    register(&c, &base, TOKEN, "second").await;
+    let (status, body) = post(&c, &base, TOKEN, "/v1/pair", wait_request("second", 500)).await;
+    assert_eq!(status, 503, "{body}");
+    // The refused request left nothing, and the waiter still holds its place.
+    assert!(!first.is_finished());
+    let (status, _) = post(&c, &base, TOKEN, "/v1/pair", wait_request("second", 0)).await;
+    assert_eq!(status, 200);
+    let (status, body) = first.await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_waiter_on_a_hub_with_auth_is_authorized_when_woken() {
+    let (base, task) = server_with(waiting_config(TOKEN)).await;
+    let c = reqwest::Client::new();
+    let (ann, ben) = (
+        "player-ann-token-0123456789abcdefgh",
+        "player-ben-token-0123456789abcdefgh",
+    );
+    let (status, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs",
+        json!({"id":"arena","mode":"internal","scopes":{"game":"g"},"auth":{"kind":"token","tokens":[
+            {"token":ann,"identity":"ann"},{"token":ben,"identity":"ben"}]}}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    register(&c, &base, TOKEN, "ann").await;
+    let with = |id: &str, credential: &str, wait_ms: u64| {
+        let mut body = wait_request(id, wait_ms);
+        body["subject"]["credential"] = json!(credential);
+        body
+    };
+    let waiting = spawn_pair(&c, &base, TOKEN, with("ann", ann, 3000));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!waiting.is_finished());
+    register(&c, &base, TOKEN, "ben").await;
+    let (status, ben_answer) = post(&c, &base, TOKEN, "/v1/pair", with("ben", ben, 0)).await;
+    assert_eq!(status, 200, "{ben_answer}");
+    let (status, ann_answer) = waiting.await.unwrap();
+    assert_eq!(status, 200, "{ann_answer}");
+    assert_eq!(ann_answer["room"], ben_answer["room"]);
+    assert_eq!(ann_answer["userId"], "ann");
+    assert!(!ann_answer.to_string().contains(ann));
+
+    // A waiter whose credential is refused when it wakes gets 403 and does not stay seated.
+    let (status, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs",
+        json!({"id":"gated","mode":"internal","scopes":{"game":"g"},"auth":{"kind":"token","tokens":[
+            {"token":"player-dan-token-0123456789abcdefgh","identity":"dan"}]}}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let gated_user = |id: &'static str| {
+        let (c, base) = (c.clone(), base.clone());
+        async move {
+            let (status, body) = post(
+                &c,
+                &base,
+                TOKEN,
+                "/v1/hubs/gated/call",
+                json!({"method":"upsertUser","args":[{"id":id,"scopes":{"game":"h"}}]}),
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+        }
+    };
+    gated_user("cat").await;
+    let gated = |id: &str, credential: &str, wait_ms: u64| {
+        json!({
+            "subject":{"kind":"peer","id":id,"scopes":{"game":"h"},"credential":credential},
+            "target":{"kind":"peer","requirements":{"game":"h"}},
+            "waitMs":wait_ms
+        })
+    };
+    let waiting = spawn_pair(&c, &base, TOKEN, gated("cat", "not-a-credential", 3000));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    gated_user("dan").await;
+    let (status, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/pair",
+        gated("dan", "player-dan-token-0123456789abcdefgh", 0),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _) = waiting.await.unwrap();
+    assert_eq!(status, 403);
+    let (_, cat) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs/gated/call",
+        json!({"method":"getUser","args":["cat"]}),
+    )
+    .await;
+    assert_ne!(cat["result"]["status"], "paired", "{cat}");
+    task.abort();
 }

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Queue concurrent calls to a hub in arrival order for up to `LIVEENGINE_CALL_QUEUE_MS` (default 1000, at most `LIVEENGINE_MAX_QUEUED_CALLS` waiting) instead of refusing them at once; key waiting `pair` peers by id and scopes.
+
 - Add `waitMs` to `POST /v1/pair` and the `pair` route operation (`HubClient.pair`): a peer with no partner waits in a bounded per-hub queue and is woken by the peer that pairs with it, with `408` on timeout. Bounded by `LIVEENGINE_MAX_PAIR_WAIT_MS` (default 30000) and `LIVEENGINE_MAX_PENDING_PAIRS`. The Gogh Strike bridge no longer polls.
 
 - Expose the engine's system-room flag and use it when selecting peer rooms.

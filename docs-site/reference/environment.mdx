@@ -20,6 +20,8 @@ These variables are read by `liveengine-hub` or `HubConfig::from_env()`.
 | `LIVEENGINE_MAX_EVENTS` | positive integer | `100000` | Maximum pending events per internal engine |
 | `LIVEENGINE_MAX_GENERATE` | positive integer | `10000` | Maximum generated users per call |
 | `LIVEENGINE_MAX_INFLIGHT_CALLS` | positive integer | `16` | Concurrent hub calls |
+| `LIVEENGINE_CALL_QUEUE_MS` | integer | `1000` | How long a hub call queues for its turn and a worker before it is refused as busy |
+| `LIVEENGINE_MAX_QUEUED_CALLS` | positive integer | `1024` | Hub calls queued at once |
 | `LIVEENGINE_MAX_PAIR_WAIT_MS` | integer | `30000` | Longest a `pair` request may wait for a partner; `0` turns waiting off |
 | `LIVEENGINE_MAX_PENDING_PAIRS` | positive integer | `1024` | Peers waiting in `pair` requests at once, per hub |
 | `LIVEENGINE_RATE_LIMIT_REQUESTS` | positive integer | `120` | Requests per peer per window |

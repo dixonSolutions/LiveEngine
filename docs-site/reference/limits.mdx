@@ -19,6 +19,8 @@ Limits fall into four groups: host configuration, per-engine budgets, protocol/f
 | Events per engine | `max_events` | `LIVEENGINE_MAX_EVENTS` | `100000` |
 | Generated per call | `max_generates_per_call` | `LIVEENGINE_MAX_GENERATE` | `10000` |
 | In-flight calls | `max_inflight_calls` | `LIVEENGINE_MAX_INFLIGHT_CALLS` | `16` |
+| Call queue time | `call_queue` | `LIVEENGINE_CALL_QUEUE_MS` | 1 second |
+| Queued calls | `max_queued_calls` | `LIVEENGINE_MAX_QUEUED_CALLS` | `1024` |
 | Longest `pair` wait | `max_pair_wait` | `LIVEENGINE_MAX_PAIR_WAIT_MS` | 30 seconds |
 | Waiting `pair` peers | `max_pending_pairs` | `LIVEENGINE_MAX_PENDING_PAIRS` | `1024` |
 | Requests per window | `rate_limit_requests` | `LIVEENGINE_RATE_LIMIT_REQUESTS` | `120` |

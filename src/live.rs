@@ -547,30 +547,25 @@ pub(crate) async fn issue_ticket(
         }
     }
     if let Some(handler) = record.handler {
-        let permit = match state.inflight_calls.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "hub call capacity is busy"),
-        };
         let user = request.user_id.clone();
         let room = request.server_id.clone();
-        let paired = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut handler = handler.try_lock().map_err(|_| ())?;
-            let user_value = handler
-                .call("getUser", vec![Value::String(user.clone())])
-                .map_err(|_| ())?;
-            let server_value = handler
-                .call("getServer", vec![Value::String(room.clone())])
-                .map_err(|_| ())?;
-            Ok::<bool, ()>(
-                user_value["status"] == "paired"
-                    && user_value["serverId"] == room
-                    && server_value["members"]
-                        .as_array()
-                        .is_some_and(|members| members.iter().any(|m| m.as_str() == Some(&user))),
-            )
-        })
-        .await;
+        let paired = state
+            .run_on_hub(&handler, move |handler| {
+                let user_value = handler
+                    .call("getUser", vec![Value::String(user.clone())])
+                    .map_err(|_| ())?;
+                let server_value = handler
+                    .call("getServer", vec![Value::String(room.clone())])
+                    .map_err(|_| ())?;
+                Ok::<bool, ()>(
+                    user_value["status"] == "paired"
+                        && user_value["serverId"] == room
+                        && server_value["members"].as_array().is_some_and(|members| {
+                            members.iter().any(|m| m.as_str() == Some(&user))
+                        }),
+                )
+            })
+            .await;
         match paired {
             Ok(Ok(true)) => {}
             Ok(Ok(false)) => return error(StatusCode::FORBIDDEN, "user is not paired in room"),

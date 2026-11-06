@@ -25,6 +25,8 @@ Limits are configurable through `HubConfig` when embedding the router. The stand
 | `LIVEENGINE_MAX_EVENTS` | 100000 |
 | `LIVEENGINE_MAX_GENERATE` | 10000 |
 | `LIVEENGINE_MAX_INFLIGHT_CALLS` | 16 |
+| `LIVEENGINE_CALL_QUEUE_MS` | 1000 |
+| `LIVEENGINE_MAX_QUEUED_CALLS` | 1024 |
 | `LIVEENGINE_MAX_PAIR_WAIT_MS` | 30000 |
 | `LIVEENGINE_MAX_PENDING_PAIRS` | 1024 |
 | `LIVEENGINE_RATE_LIMIT_REQUESTS` | 120 |
@@ -117,7 +119,11 @@ once. A peer is queued once (`409` for a second request), at most `LIVEENGINE_MA
 time (`503` beyond that), and a match removes both peers from the queue in one step. The waiting peer must
 already be a user of a hub, so that other peers can find it. A waiting `pair` gets the request timeout plus
 its own wait, also when forwarded through a nest; every other route keeps the plain request timeout. A
-busy hub (`409`) or one at call capacity (`503`) is asked again briefly during pairing.
+waiting peer is known by its id and scopes, so one id can wait in two hubs of a service.
+
+Calls to a hub queue in arrival order, for at most `LIVEENGINE_CALL_QUEUE_MS`, for the hub's turn and for one
+of `LIVEENGINE_MAX_INFLIGHT_CALLS` workers; at most `LIVEENGINE_MAX_QUEUED_CALLS` calls queue at once. Past
+that a call is refused as before (`409` handler busy, `503` capacity busy).
 
 ### Hub auth
 

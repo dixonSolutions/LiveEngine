@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -92,6 +92,10 @@ pub struct HubConfig {
     pub max_events: usize,
     pub max_generates_per_call: usize,
     pub max_inflight_calls: usize,
+    /// How long a call to a hub may queue for its turn and a free worker before it is refused as busy.
+    pub call_queue: Duration,
+    /// Calls that may be queued at once across the service; further calls are refused as busy.
+    pub max_queued_calls: usize,
     pub request_timeout: Duration,
     /// Longest a `pair` request may wait for a partner (`waitMs` is clamped to it).
     pub max_pair_wait: Duration,
@@ -130,6 +134,8 @@ impl Default for HubConfig {
             max_events: 100_000,
             max_generates_per_call: 10_000,
             max_inflight_calls: 16,
+            call_queue: Duration::from_millis(1000),
+            max_queued_calls: 1024,
             request_timeout: Duration::from_secs(5),
             max_pair_wait: Duration::from_secs(30),
             max_pending_pairs: 1024,
@@ -203,6 +209,12 @@ impl HubConfig {
         )? as u64);
         config.max_pending_pairs =
             env_limit("LIVEENGINE_MAX_PENDING_PAIRS", config.max_pending_pairs)?;
+        config.call_queue = Duration::from_millis(env_limit(
+            "LIVEENGINE_CALL_QUEUE_MS",
+            config.call_queue.as_millis() as usize,
+        )? as u64);
+        config.max_queued_calls =
+            env_limit("LIVEENGINE_MAX_QUEUED_CALLS", config.max_queued_calls)?;
         config.rate_limit_requests =
             env_limit("LIVEENGINE_RATE_LIMIT_REQUESTS", config.rate_limit_requests)?;
         config.rate_limit_peers =
@@ -270,6 +282,7 @@ impl HubConfig {
             || self.max_generates_per_call == 0
             || self.max_inflight_calls == 0
             || self.max_pending_pairs == 0
+            || self.max_queued_calls == 0
             || self.rate_limit_requests == 0
             || self.rate_limit_peers == 0
             || self.rate_limit_window.is_zero()
@@ -500,7 +513,7 @@ struct ImportRegistryRequest {
 pub(crate) struct HubRecord {
     pub(crate) info: HubInfo,
     expires_at: Option<Instant>,
-    pub(crate) handler: Option<Arc<Mutex<Box<dyn HubHandler>>>>,
+    pub(crate) handler: Option<Arc<HubSlot>>,
     pub(crate) remote_token: Option<String>,
     /// SHA-256 hex digests of link credentials; the raw tokens are never stored.
     pub(crate) link_credentials: Vec<String>,
@@ -518,8 +531,108 @@ struct RateEntry {
     requests: usize,
 }
 
+/// A hub's handler and its turnstile. Calls take turns in arrival order, so a popular hub
+/// queues callers instead of refusing them.
+pub(crate) struct HubSlot {
+    handler: Mutex<Box<dyn HubHandler>>,
+    turn: Arc<Semaphore>,
+}
+
+impl HubSlot {
+    fn new(handler: Box<dyn HubHandler>) -> Arc<Self> {
+        Arc::new(Self {
+            handler: Mutex::new(handler),
+            turn: Arc::new(Semaphore::new(1)),
+        })
+    }
+}
+
+impl std::ops::Deref for HubSlot {
+    type Target = Mutex<Box<dyn HubHandler>>;
+    fn deref(&self) -> &Self::Target {
+        &self.handler
+    }
+}
+
+/// Counts a call while it queues, so the number waiting stays bounded.
+struct Queued(Arc<AtomicUsize>);
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Inner {
+    fn queue_call(&self) -> Option<Queued> {
+        let waiting = &self.call_waiting;
+        if waiting.fetch_add(1, Ordering::AcqRel) >= self.config.max_queued_calls {
+            waiting.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Queued(waiting.clone()))
+    }
+
+    /// A worker slot, queued for up to the call queue time. Slots bound the work running at once.
+    pub(crate) async fn call_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, ()> {
+        let _queued = self.queue_call().ok_or(())?;
+        let deadline = tokio::time::Instant::now() + self.config.call_queue;
+        match tokio::time::timeout_at(deadline, self.inflight_calls.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            _ => Err(()),
+        }
+    }
+
+    /// Run `work` on the hub's handler on a blocking thread, after queueing (in order, for at
+    /// most the call queue time) for the hub's turn and a worker slot. A stuck handler keeps its
+    /// turn and slot until it returns, and callers behind it are refused as busy at the deadline.
+    pub(crate) async fn run_on_hub<T, F>(&self, slot: &Arc<HubSlot>, work: F) -> Result<T, HubBusy>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut dyn HubHandler) -> T + Send + 'static,
+    {
+        let queued = self.queue_call().ok_or(HubBusy::Capacity)?;
+        let deadline = tokio::time::Instant::now() + self.config.call_queue;
+        let turn = match tokio::time::timeout_at(deadline, slot.turn.clone().acquire_owned()).await
+        {
+            Ok(Ok(turn)) => turn,
+            _ if self.inflight_calls.available_permits() == 0 => return Err(HubBusy::Capacity),
+            _ => return Err(HubBusy::Handler),
+        };
+        let permit =
+            match tokio::time::timeout_at(deadline, self.inflight_calls.clone().acquire_owned())
+                .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => return Err(HubBusy::Capacity),
+            };
+        drop(queued);
+        let slot = slot.clone();
+        tokio::task::spawn_blocking(move || {
+            let _turn = turn;
+            let _permit = permit;
+            match slot.try_lock() {
+                Ok(mut handler) => Ok(work(&mut **handler)),
+                Err(std::sync::TryLockError::WouldBlock) => Err(HubBusy::Handler),
+                Err(std::sync::TryLockError::Poisoned(_)) => Err(HubBusy::Unavailable),
+            }
+        })
+        .await
+        .unwrap_or(Err(HubBusy::Unavailable))
+    }
+}
+
+/// Why a call to a hub's handler was refused before it ran.
+#[derive(Debug)]
+pub(crate) enum HubBusy {
+    Handler,
+    Capacity,
+    Unavailable,
+}
+
 enum HandlerCallError {
     Busy,
+    Capacity,
     Unavailable,
     Preflight(String),
     Call(String),
@@ -535,6 +648,7 @@ pub(crate) struct Inner {
     rate: Mutex<HashMap<String, RateEntry>>,
     boot: Instant,
     pub(crate) inflight_calls: Arc<Semaphore>,
+    call_waiting: Arc<AtomicUsize>,
     hub_slots: Arc<Semaphore>,
     global_max_hubs: usize,
     pub(crate) instance_id: String,
@@ -609,6 +723,7 @@ impl HubService {
                 rate: Mutex::new(HashMap::new()),
                 boot: Instant::now(),
                 inflight_calls,
+                call_waiting: Arc::new(AtomicUsize::new(0)),
                 global_max_hubs,
                 hub_slots,
                 instance_id,
@@ -874,7 +989,7 @@ impl HubService {
         let mut record = HubRecord {
             info: info.clone(),
             expires_at: ttl.map(|d| Instant::now() + d),
-            handler: Some(Arc::new(Mutex::new(Box::new(handler)))),
+            handler: Some(HubSlot::new(Box::new(handler))),
             remote_token: None,
             link_credentials: Vec::new(),
             auth: None,
@@ -1081,6 +1196,7 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
             inner.mutation_lock = state.mutation_lock.clone();
             inner.durable = state.durable;
             inner.inflight_calls = state.inflight_calls.clone();
+            inner.call_waiting = state.call_waiting.clone();
             inner.instance_id = state.instance_id.clone();
             inner.ticket_signer = state.ticket_signer.clone();
             inner.live_rooms = state.live_rooms.clone();
@@ -1124,9 +1240,7 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
             .map_err(|_| "state file exceeds global hub limit")?;
         let record = HubRecord {
             handler: if info.mode == HubMode::Internal && !saved.custom {
-                Some(Arc::new(Mutex::new(Box::new(Engine::new(
-                    state.config.seed,
-                )))))
+                Some(HubSlot::new(Box::new(Engine::new(state.config.seed))))
             } else {
                 None
             },
@@ -2075,9 +2189,8 @@ pub(crate) async fn forward_route(
     depth: usize,
     request: &RouteRequest,
 ) -> Response {
-    let _permit = match state.inflight_calls.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "hub call capacity is busy"),
+    let Ok(_permit) = state.call_permit().await else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "hub call capacity is busy");
     };
     let url =
         match validated_remote_url(state, address).and_then(|base| endpoint(&base, "v1/route")) {
@@ -2634,6 +2747,7 @@ async fn register_hub_inherited(
         inner.templates = state.templates.clone();
         inner.schemas = state.schemas.clone();
         inner.inflight_calls = state.inflight_calls.clone();
+        inner.call_waiting = state.call_waiting.clone();
         inner.root = false;
         inner.imports = state.imports.clone();
         inner.persistence_lock = state.persistence_lock.clone();
@@ -2662,9 +2776,7 @@ async fn register_hub_inherited(
         info,
         expires_at: ttl.map(|d| Instant::now() + d),
         handler: if reg.mode == HubMode::Internal {
-            Some(Arc::new(Mutex::new(Box::new(Engine::new(
-                state.config.seed,
-            )))))
+            Some(HubSlot::new(Box::new(Engine::new(state.config.seed))))
         } else {
             None
         },
@@ -3135,10 +3247,6 @@ async fn call_hub_inherited(
     if let Err(message) = enforce_schemas(&schemas, &call) {
         return error(StatusCode::BAD_REQUEST, &message);
     }
-    let permit = match state.inflight_calls.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "hub call capacity is busy"),
-    };
     let depth = header_depth(&headers).unwrap_or(usize::MAX);
     if record.handler.is_none() && depth >= state.config.max_depth {
         return error(StatusCode::LOOP_DETECTED, "forwarding depth exceeded");
@@ -3147,40 +3255,43 @@ async fn call_hub_inherited(
         let config = state.config.clone();
         let method = call.method;
         let args = call.args;
-        let task = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut handler = match handler.try_lock() {
-                Ok(handler) => handler,
-                Err(std::sync::TryLockError::WouldBlock) => return Err(HandlerCallError::Busy),
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    return Err(HandlerCallError::Unavailable)
-                }
-            };
-            handler
-                .preflight(&method, &args, &config)
-                .map_err(HandlerCallError::Preflight)?;
-            handler.call(&method, args).map_err(HandlerCallError::Call)
-        })
-        .await;
+        let task = state
+            .run_on_hub(&handler, move |handler| {
+                handler
+                    .preflight(&method, &args, &config)
+                    .map_err(HandlerCallError::Preflight)?;
+                handler.call(&method, args).map_err(HandlerCallError::Call)
+            })
+            .await
+            .map_err(|busy| match busy {
+                HubBusy::Handler => HandlerCallError::Busy,
+                HubBusy::Capacity => HandlerCallError::Capacity,
+                HubBusy::Unavailable => HandlerCallError::Unavailable,
+            })
+            .and_then(|done| done);
         match task {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(HandlerCallError::Busy)) => {
+            Ok(value) => Ok(value),
+            Err(HandlerCallError::Busy) => {
                 return error(StatusCode::CONFLICT, "hub handler is busy")
             }
-            Ok(Err(HandlerCallError::Unavailable)) => {
+            Err(HandlerCallError::Capacity) => {
+                return error(StatusCode::SERVICE_UNAVAILABLE, "hub call capacity is busy")
+            }
+            Err(HandlerCallError::Unavailable) => {
                 return error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "hub handler is unavailable",
                 )
             }
-            Ok(Err(HandlerCallError::Preflight(message))) => {
+            Err(HandlerCallError::Preflight(message)) => {
                 return error(StatusCode::PAYLOAD_TOO_LARGE, &message)
             }
-            Ok(Err(HandlerCallError::Call(message))) => Err(message),
-            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "hub handler task failed"),
+            Err(HandlerCallError::Call(message)) => Err(message),
         }
     } else {
-        let _permit = permit;
+        let Ok(_permit) = state.call_permit().await else {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "hub call capacity is busy");
+        };
         let Some(address) = record.info.address.as_deref() else {
             return error(StatusCode::BAD_GATEWAY, "external hub address is missing");
         };
