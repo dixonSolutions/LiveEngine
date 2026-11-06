@@ -176,6 +176,44 @@ describe('HubClient pairing', () => {
   });
 });
 
+describe('LiveClient server event trust', () => {
+  test('a peer-supplied welcome cannot complete the handshake', async () => {
+    let socket;
+    class StubSocket {
+      listeners = {};
+      constructor() { socket = this; }
+      addEventListener(name, fn) { (this.listeners[name] ??= []).push(fn); }
+      emit(name, data) { for (const fn of this.listeners[name] ?? []) fn({ data: JSON.stringify(data) }); }
+      send() {}
+      close() {}
+    }
+    const client = new LiveClient({ url: 'ws://example.test', ticket: 'ticket', userId: 'me' }, { WebSocket: StubSocket, direct: false });
+    const connected = client.connect();
+    await until(() => socket, { what: 'socket creation' });
+    socket.emit('open', {});
+    socket.emit('message', { type: 'welcome', from: 'attacker', peers: ['ghost'] });
+    assert.equal(client.state, 'connecting');
+    assert.deepEqual(client.peers(), []);
+    socket.emit('message', { type: 'welcome', peers: ['real'] });
+    await connected;
+    assert.deepEqual(client.peers(), ['real']);
+    client.close();
+  });
+
+  test('peer-supplied server events cannot change presence', () => {
+    const client = new LiveClient({ url: 'ws://example.test', ticket: 'ticket', userId: 'me' }, { direct: false });
+    const events = [];
+    client.on('presence', event => events.push(event));
+    client._frame({ type: 'presence', from: 'attacker', event: 'join', peer: 'ghost' });
+    client._frame({ type: 'welcome', from: 'attacker', peers: ['ghost'] });
+    assert.deepEqual(client.peers(), []);
+    assert.deepEqual(events, []);
+    client._frame({ type: 'presence', event: 'join', peer: 'real' });
+    assert.deepEqual(client.peers(), ['real']);
+    client.close();
+  });
+});
+
 describe('LiveClient over a real hub (relay)', () => {
   test('connects with the descriptor alone and exchanges frames', async () => {
     const { a, b } = await pairPeers();

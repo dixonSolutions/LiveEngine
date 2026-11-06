@@ -1387,3 +1387,72 @@ async fn a_ring_survives_losing_one_link_and_recovers_it() {
         n.task.abort();
     }
 }
+
+#[tokio::test]
+async fn linked_sender_must_be_announced_on_the_same_link() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    let n = node("claims", &["observer", "svc-one", "svc-two"]).await;
+    let (mut observer, _) = peer(&n, "observer").await;
+    let mut services = Vec::new();
+    for user in ["svc-one", "svc-two"] {
+        let issued: Value = post(
+            &n.base,
+            &n.token,
+            "/v1/hubs/game/tickets",
+            json!({"userId":user,"serverId":"room","role":"service"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        let (mut ws, _) = connect_async(format!(
+            "{}/v1/live",
+            n.base.replacen("http://", "ws://", 1)
+        ))
+        .await
+        .unwrap();
+        ws.send(Message::Text(
+            json!({"type":"auth","ticket":issued["ticket"]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&ws.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap()["type"],
+            "welcome"
+        );
+        services.push(ws);
+    }
+    for (ws, name) in services.iter_mut().zip(["remote-one", "remote-two"]) {
+        say(
+            ws,
+            Message::Text(
+                json!({"type":"link.presence","trace":["remote"],"event":"join","peer":name})
+                    .to_string()
+                    .into(),
+            ),
+        )
+        .await;
+        assert!(wait_for(&mut observer, 5000, |v| v["type"] == "presence"
+            && v["peer"] == name)
+        .await
+        .is_some());
+    }
+    let before = counters(&n).await.1;
+    for (id, sender) in [
+        ("forged-unknown", "ghost"),
+        ("forged-other", "remote-two"),
+        ("honest", "remote-one"),
+    ] {
+        say(&mut services[0], Message::Text(json!({"type":"link.frame","id":id,"trace":["remote"],"frame":{"from":sender,"v":1,"type":"message","channel":"updates","seq":1,"payload":id}}).to_string().into())).await;
+    }
+    let got = wait_for(&mut observer, 5000, is_frame).await.unwrap();
+    assert_eq!(got["payload"], "honest");
+    assert_eq!(got["from"], "remote-one");
+    assert!(frames_within(&mut observer, 300).await.is_empty());
+    assert_eq!(counters(&n).await.1, before + 2);
+    n.task.abort();
+}

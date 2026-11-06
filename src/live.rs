@@ -699,6 +699,13 @@ struct Recent {
     order: VecDeque<(std::time::Instant, u64)>,
     set: HashSet<u64>,
 }
+const SERVER_TYPES: &[&str] = &["presence", "welcome", "error", "auth"];
+const SIGNAL_TYPES: &[&str] = &["signal.offer", "signal.answer", "signal.ice"];
+fn reserved_type(frame_type: &str) -> bool {
+    SERVER_TYPES.contains(&frame_type)
+        || frame_type.starts_with("link.")
+        || (frame_type.starts_with("signal.") && !SIGNAL_TYPES.contains(&frame_type))
+}
 const MAX_WIRE: usize = 65536;
 const MAX_TRACE: usize = 32;
 const MAX_REMOTE_PEERS: usize = 1024;
@@ -1039,13 +1046,12 @@ async fn ingest_frame(
         return LiveRooms::count(&live.rejected);
     };
     let target = frame.get("to").and_then(Value::as_str);
-    let signal = matches!(frame_type, "signal.offer" | "signal.answer" | "signal.ice");
+    let signal = SIGNAL_TYPES.contains(&frame_type);
     if !frame.get("v").is_some_and(Value::is_number)
         || !frame.get("seq").is_some_and(Value::is_u64)
         || !frame.contains_key("payload")
         || frame.get("to").is_some_and(|to| !to.is_string())
-        || frame_type.starts_with("link.")
-        || (frame_type.starts_with("signal.") && !signal)
+        || reserved_type(frame_type)
         || (signal && target.is_none_or(|to| to == from))
     {
         return LiveRooms::count(&live.rejected);
@@ -1076,9 +1082,6 @@ async fn ingest_frame(
         return LiveRooms::count(&live.dropped);
     }
     let serialized = wire["frame"].to_string();
-    if live.seen(id) {
-        return LiveRooms::count(&live.dropped);
-    }
     let trace = extended(&trace, &state.instance_id);
     let message = Message::Text(serialized.into());
     let rooms = live.rooms.lock().await;
@@ -1086,6 +1089,12 @@ async fn ingest_frame(
     let Some(bridge) = bridges.get(key).filter(|b| b.links.contains_key(via)) else {
         return;
     };
+    if bridge.remote.get(from).map(String::as_str) != Some(via) {
+        return LiveRooms::count(&live.rejected);
+    }
+    if live.seen(id) {
+        return LiveRooms::count(&live.dropped);
+    }
     let room = rooms.get(key);
     match target {
         Some(to) => {
@@ -1615,8 +1624,8 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
         }
         let channel = object["channel"].as_str().unwrap();
         let frame_type = object["type"].as_str().unwrap();
-        let signal = matches!(frame_type, "signal.offer" | "signal.answer" | "signal.ice");
-        if frame_type.starts_with("signal.") && !signal {
+        let signal = SIGNAL_TYPES.contains(&frame_type);
+        if reserved_type(frame_type) {
             break;
         }
         if signal {

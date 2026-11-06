@@ -182,6 +182,10 @@ origins. Requests without an Origin header are accepted; requests with one must
 match the list. A welcome message lists current peers, and presence messages
 announce joins and leaves. Relay messages contain `v`, `type`, `channel`,
 `seq`, and `payload`, with optional `to`; the server supplies `from`.
+Application frame types are user-defined except the reserved server types `presence`,
+`welcome`, `error`, and `auth`, and the `link.` and `signal.` prefixes. The
+three signalling types described below are permitted as targeted peer frames.
+Linked frames are accepted only when their sender was announced on that link.
 
 The live relay bounds per-connection traffic with `LIVEENGINE_LIVE_MAX_FRAME_BYTES`
 (default 65536), `LIVEENGINE_LIVE_MESSAGES_PER_SECOND` (100),

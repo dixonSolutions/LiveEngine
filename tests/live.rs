@@ -510,6 +510,39 @@ mod sockets {
         assert_ne!(read(&mut b).await["iceServers"][1]["username"], username);
     }
     #[tokio::test]
+    async fn server_event_types_cannot_be_relayed_by_peers() {
+        for kind in [
+            "presence",
+            "welcome",
+            "error",
+            "auth",
+            "link.other",
+            "signal.other",
+        ] {
+            let f = setup(60).await;
+            let mut a = auth(&f, &ticket(&f, "alice").await).await;
+            read(&mut a).await;
+            let mut b = auth(&f, &ticket(&f, "bob").await).await;
+            read(&mut b).await;
+            read(&mut a).await;
+            a.send(Message::Text(json!({"v":1,"type":kind,"channel":"x","seq":1,"payload":null,"peer":"ghost","event":"join"}).to_string().into())).await.unwrap();
+            closed(&mut a).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), async {
+                    loop {
+                        let value = read(&mut b).await;
+                        if value["type"] == kind || value["peer"] == "ghost" {
+                            return;
+                        }
+                    }
+                })
+                .await
+                .is_err(),
+                "forged {kind} reached another peer"
+            );
+        }
+    }
+    #[tokio::test]
     async fn spoof_from_is_rejected() {
         let f = setup(60).await;
         let mut a = auth(&f, &ticket(&f, "alice").await).await;
