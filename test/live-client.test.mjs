@@ -599,6 +599,48 @@ describe('LiveClient direct path over a real hub (injected RTCPeerConnection)', 
     assert.equal(aliceHeard[2].payload, 'relay again');
   });
 
+  test('directBroadcast sends a broadcast over each open channel and relays only to peers without one', async () => {
+    const net = new FakeNet();
+    const RTCPeerConnection = net.rtc();
+    const { a, b } = await pairPeers();
+    const group = a.userId.split('-')[0];
+    const carolId = `${group}-c`;
+    const carolPairing = await admin.pair({ subject: { id: carolId, scopes: {} }, target: { kind: 'peer', requirements: { group } } });
+    const options = { RTCPeerConnection, directTimeoutMs: 1500 };
+    const alice = track(new LiveClient(a, { ...options, directBroadcast: true }));
+    const bob = track(new LiveClient(b, options));
+    // Carol has no WebRTC, so she can only be reached through the hub.
+    const carol = track(new LiveClient(carolPairing, { direct: false }));
+    const bobHeard = [];
+    const carolHeard = [];
+    bob.on('message', frame => bobHeard.push(frame));
+    carol.on('message', frame => carolHeard.push(frame));
+    await alice.connect();
+    await bob.connect();
+    await carol.connect();
+    await until(() => alice.transportOf(b.userId) === 'direct' && bob.transportOf(a.userId) === 'direct', { what: 'direct transport' });
+    await until(() => alice.peers().length === 2, { what: 'presence' });
+    assert.equal(alice.transportOf(carolId), 'relay');
+
+    alice.send('to all', { channel: 'moves' });
+    await until(() => bobHeard.length === 1 && carolHeard.length === 1, { what: 'both copies' });
+    assert.deepEqual([bobHeard[0].via, bobHeard[0].payload, bobHeard[0].from, bobHeard[0].channel], ['direct', 'to all', a.userId, 'moves']);
+    assert.deepEqual([carolHeard[0].via, carolHeard[0].payload, carolHeard[0].from], ['relay', 'to all', a.userId]);
+    await quiet(alice);
+    assert.equal(bobHeard.length, 1, 'bob heard the broadcast twice');
+    assert.equal(carolHeard.length, 1, 'carol heard the broadcast twice');
+
+    // With the channel gone the same call falls back to the hub for everyone.
+    net.dropChannels();
+    await until(() => alice.transportOf(b.userId) === 'relay', { what: 'fallback' });
+    alice.send('after the drop');
+    await until(() => bobHeard.length === 2 && carolHeard.length === 2, { what: 'relayed copies' });
+    assert.equal(bobHeard[1].via, 'relay');
+    assert.equal(carolHeard[1].via, 'relay');
+    await quiet(alice);
+    assert.equal(bobHeard.length + carolHeard.length, 4);
+  });
+
   test('a peer without WebRTC stays on the relay and nothing breaks', async () => {
     const net = new FakeNet();
     const { a, b } = await pairPeers();

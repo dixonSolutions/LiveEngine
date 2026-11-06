@@ -3,6 +3,7 @@ import {spawn} from 'node:child_process';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {createRequire} from 'node:module';
@@ -25,6 +26,8 @@ const port = Number(process.env.GOGH_BRIDGE_PORT || await new Promise(resolve =>
 }));
 const apiUrl = process.env.LIVEENGINE_URL || 'http://127.0.0.1:8787';
 const centralToken = await readSecret('LIVEENGINE_TOKEN');
+// The screenshot goes under TMPDIR unless GOGH_SCREENSHOT says otherwise.
+const screenshot = process.env.GOGH_SCREENSHOT || path.join(os.tmpdir(), 'liveengine-gogh-lobby.png');
 const hubId = process.env.LIVEENGINE_HUB_ID || `gogh-e2e-${suffix}`;
 const serverId = process.env.GOGH_MATCH_SERVER_ID || `gogh-e2e-room-${suffix}`;
 const mode = process.env.LIVEENGINE_HUB_MODE || 'internal';
@@ -113,7 +116,7 @@ try {
     await page.goto(`${base}/`, {waitUntil: 'domcontentloaded'});
     await page.waitForSelector('#deploy-button:not(:disabled)', {timeout: 90_000});
     await page.locator('#liveengine-matchmaking').check();
-    await page.screenshot({path: process.env.GOGH_SCREENSHOT || '/tmp/liveengine-gogh-lobby.png', fullPage: true});
+    await page.screenshot({path: screenshot, fullPage: true});
     await page.locator('#deploy-button').click();
     await page.waitForFunction(() => window.vanGoghStrike?.state?.phase === 'playing', {timeout: 45_000});
     const browserState = await page.evaluate(() => ({
@@ -125,7 +128,7 @@ try {
     assert.equal(pageErrors.length, 0, `Browser errors: ${pageErrors.join('; ')}`);
     const browserUser = await remote.call(remoteHubId, 'getUser', [browserState.userId]);
     assert.equal(browserUser?.status, 'paired');
-    console.log(`browser flow ok: phase ${browserState.phase}; screenshot ${process.env.GOGH_SCREENSHOT || '/tmp/liveengine-gogh-lobby.png'}`);
+    console.log(`browser flow ok: phase ${browserState.phase}; screenshot ${screenshot}`);
   } else {
     console.log('browser flow skipped; set PLAYWRIGHT_PATH to enable it');
   }

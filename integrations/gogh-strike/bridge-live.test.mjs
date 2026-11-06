@@ -9,7 +9,7 @@ import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {after, before, describe, test} from 'node:test';
-import {connectLive} from '../../lib/live-client.mjs';
+import {LiveClient, connectLive} from '../../lib/live-client.mjs';
 import {ADMIN_TOKEN, freePort, startHub} from '../../test/support/hub-process.mjs';
 
 const require = createRequire(import.meta.url);
@@ -211,5 +211,65 @@ describe('bridge with hub auth', () => {
 
   test('a credential cannot mint a ticket for a different player id', async () => {
     assert.equal((await bridge.post('pair', {userId: 'someone-else', credential: USER_TOKEN})).status, 403);
+  });
+});
+
+describe('bridge peer pairing and registry watch', () => {
+  let bridge, peerRoom;
+  before(async () => { bridge = await startBridge({LIVEENGINE_HUB_ID: 'gogh-peers', GOGH_LIVE_LINK: 'peer', GOGH_PEER_WAIT_MS: '5000'}); });
+
+  test('the first player waits, the second completes the pairing, and both get a peer-peer descriptor for one room', async () => {
+    const first = bridge.post('pair', {userId: 'gogh-peer-a', team: 0, role: 'vanguard'});
+    // The first request is held while no other player exists.
+    assert.equal(await Promise.race([first, sleep(500).then(() => 'waiting')]), 'waiting');
+    const second = await bridge.post('pair', {userId: 'gogh-peer-b', team: 1, role: 'vanguard'});
+    const held = await first;
+    assert.equal(second.status, 200);
+    assert.equal(held.status, 200);
+    for (const result of [held, second]) {
+      assert.equal(result.body.link, 'peer-peer');
+      assert.ok(result.body.ticket);
+    }
+    assert.equal(held.body.room, second.body.room);
+    peerRoom = held.body.room;
+    assert.equal(held.body.userId, 'gogh-peer-a');
+    assert.equal(second.body.userId, 'gogh-peer-b');
+    // Their tickets work: both connect and see each other.
+    const a = new LiveClient(held.body, {direct: false});
+    const b = new LiveClient(second.body, {direct: false});
+    clients.push(a, b);
+    await a.connect();
+    await b.connect();
+    await until(() => a.peers().includes('gogh-peer-b') && b.peers().includes('gogh-peer-a'), 'both peers to see each other');
+  });
+
+  test('renew gives a paired peer a fresh ticket without pairing again', async () => {
+    const renewed = await bridge.post('renew', {userId: 'gogh-peer-b'});
+    assert.equal(renewed.status, 200);
+    assert.equal(renewed.body.link, 'peer-peer');
+    assert.equal(renewed.body.room, peerRoom);
+    assert.equal((await bridge.post('renew', {userId: 'gogh-peer-nobody'})).status, 404);
+  });
+
+  test('a lone player is told when no one arrived, and is not left registered', async () => {
+    const other = await startBridge({LIVEENGINE_HUB_ID: 'gogh-lonely', GOGH_LIVE_LINK: 'peer', GOGH_PEER_WAIT_MS: '700'});
+    const result = await other.post('pair', {userId: 'gogh-lonely-a', team: 0, role: 'vanguard'});
+    assert.equal(result.status, 408);
+    assert.equal((await other.post('renew', {userId: 'gogh-lonely-a'})).status, 404);
+  });
+
+  test('watch issues a ticket the browser can open the registry with, and shows no token', async () => {
+    const issued = await bridge.post('watch', {depth: 1});
+    assert.equal(issued.status, 200);
+    assert.match(issued.body.url, /^ws:\/\/127\.0\.0\.1:\d+\/v1\/live\/registry$/);
+    assert.ok(!JSON.stringify(issued.body).includes(ADMIN_TOKEN));
+    const watch = await admin.watchRegistry({ticket: issued.body.ticket, path: issued.body.path, depth: issued.body.depth});
+    try {
+      assert.ok(JSON.stringify(watch.snapshot).includes('gogh-peers'));
+      const added = new Promise(resolve => watch.on('added', resolve));
+      await admin.register({id: 'gogh-watched', mode: 'internal'});
+      assert.ok(JSON.stringify(await added).includes('gogh-watched'));
+      await admin.remove('gogh-watched');
+    } finally { watch.close(); }
   });
 });

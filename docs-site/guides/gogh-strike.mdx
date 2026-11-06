@@ -136,6 +136,7 @@ The central service must allow the remote host and use matching credentials on t
 | `POST /api/liveengine/pair` | `{userId, team, role, credential?}`: returns the descriptor `{link, room, userId, ticket, url, transports}` for `LiveClient` |
 | `POST /api/liveengine/renew` | `{userId, credential?}`: a fresh descriptor for a player who paired; `404` otherwise |
 | `POST /api/liveengine/discover` | `{kind?, depth?, requirements?}`: candidates under the configured hub path |
+| `POST /api/liveengine/watch` | `{depth?}`: a read-only registry watch ticket and the registry URL, for a live hub list in the page |
 | `POST /api/liveengine/join` | The older seat-only matchmaking call; `leave` and `heartbeat` apply to both |
 | `GET /liveengine/live-client.mjs` | `lib/live-client.mjs` for the browser |
 
@@ -151,6 +152,10 @@ The bridge:
 
 `userId` must match `^[a-zA-Z0-9_-]{1,64}$`. Team is `0` or `1`; role is truncated to 40 characters.
 
+## Peer-to-peer play
+
+By default every player joins the hub's shared room and traffic uses the relay. Set `GOGH_LIVE_LINK=peer` to pair players with each other: the first player's request is held (up to `GOGH_PEER_WAIT_MS`, default 30000, then `408`) until another player pairs with them. Both get a `peer-peer` descriptor, so `LiveClient` opens a WebRTC data channel with the hub as signalling and fallback. The game sets `directBroadcast` so its player state uses the data channels. `LIVEENGINE_WATCH_URL` overrides the registry address the `watch` route returns.
+
 ## Adapter test
 
 No dependencies are needed:
@@ -161,7 +166,11 @@ npm run test:integration
 
 `bridge.test.mjs` uses a fake local HTTP hub and verifies the contract handshake, internal and external registration, the matchmaking call sequence, and rejection of hostile Host and Origin headers. `bridge-live.test.mjs` runs against a real `liveengine-hub` with real WebSockets: schema and channel registration, two players in one room on both channels, schema enforcement, renewal and reconnect, discovery, hub auth, and the administrator token never appearing in a response.
 
-## Live end-to-end check
+## Local end-to-end test
+
+`npm run test:e2e` runs `live-e2e.mjs`: real hub processes, the real bridge and the real game in headless Chromium, on free loopback ports, stopped at the end. It covers a central hub, a nested central and an on-demand hub with its own auth (bad and good credentials); peer-peer over WebRTC with the data channel asserted open and carrying frames; a forced fallback to the relay; peer-hub with a service participant; hub-hub across two linked services; reconnect with a fresh ticket; a live hub list from a watch ticket; and schema rejection. It prints one `PASS` or `FAIL` line per scenario and exits non-zero on any failure. It needs `npm run build:hub`, `PLAYWRIGHT_PATH`, `CHROMIUM_PATH` and `GOGH_STRIKE_ROOT`; `GOGH_E2E_CHROMIUM_ARGS` replaces the Chromium flags and `GOGH_E2E_ONLY=2,3` selects scenarios for debugging (the exit code is then non-zero). Chromium gets `--disable-features=WebRtcHideLocalIpsWithMdns --allow-loopback-in-peer-connection` so contexts find local WebRTC candidates, and, when `/dev/dri/renderD128` exists, ANGLE over Vulkan flags so the game renders on the GPU: software GL runs the town at under one frame a second.
+
+## Service end-to-end check
 
 `e2e.mjs` is an opt-in, replayable check against running HTTP services. It reads `LIVEENGINE_TOKEN` or `LIVEENGINE_TOKEN_FILE`. For an external run it also reads `LIVEENGINE_REMOTE_TOKEN` or `LIVEENGINE_REMOTE_TOKEN_FILE`.
 
@@ -189,7 +198,7 @@ Additional e2e variables:
 | `GOGH_BRIDGE_PORT` | Fixed bridge port; otherwise an ephemeral port |
 | `PLAYWRIGHT_PATH` | Path to a Playwright `index.mjs`; enables headless browser coverage |
 | `CHROMIUM_PATH` | Optional browser executable |
-| `GOGH_SCREENSHOT` | Screenshot path; default `/tmp/liveengine-gogh-lobby.png` |
+| `GOGH_SCREENSHOT` | Screenshot path; default `liveengine-gogh-lobby.png` under `TMPDIR` |
 
 The e2e runner creates unique hub/room IDs and removes test hubs afterward. It asserts the remote user is `paired` and the server membership includes the user. With Playwright it checks the lobby checkbox, starts a match, verifies the LiveEngine toast, checks browser user pairing, and records page errors.
 

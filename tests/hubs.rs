@@ -977,7 +977,8 @@ async fn refreshed_import_marks_missing_entries_stale_and_persists_credentials_p
         .unwrap()
         .contains(REMOTE_TOKEN));
     task.abort();
-    std::fs::remove_dir_all(dir).unwrap();
+    // A refresh may still be writing its snapshot, so cleanup is best-effort.
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[cfg(unix)]

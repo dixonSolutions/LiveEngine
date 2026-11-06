@@ -167,10 +167,10 @@ index 22dacf2..b5afeb5 100644
  }
 diff --git a/src/liveengine-matchmaking.js b/src/liveengine-matchmaking.js
 new file mode 100644
-index 0000000..99077a5
+index 0000000..bf8c9bb
 --- /dev/null
 +++ b/src/liveengine-matchmaking.js
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,76 @@
 +const USER_KEY = 'gogh-strike-liveengine-user';
 +const CREDENTIAL_KEY = 'gogh-strike-liveengine-credential';
 +let activeUser;
@@ -221,6 +221,8 @@ index 0000000..99077a5
 +  const client = await connectLive({
 +    pairUrl: '/api/liveengine/pair', renewUrl: '/api/liveengine/renew',
 +    body: {userId, team: config.team, role: config.role}, credential: storedCredential(),
++    // Player state goes to everyone; over a peer pairing it should use the data channels.
++    directBroadcast: true,
 +  });
 +  session = client;
 +  activeUser = userId;

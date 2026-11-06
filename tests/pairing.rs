@@ -402,3 +402,88 @@ async fn pairing_target_id_picks_one_of_several_hubs_with_the_same_scopes() {
     assert_eq!(status, 400);
     task.abort();
 }
+
+#[tokio::test]
+async fn peer_pairing_skips_candidates_seated_in_other_kinds_of_room() {
+    let (base, task) = server(TOKEN).await;
+    let c = reqwest::Client::new();
+    let (status, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs",
+        json!({"id":"arena","mode":"internal","scopes":{"game":"g"}}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let pair = |subject: &str, target: Value| json!({"path":[],"subject":{"kind":"peer","id":subject,"scopes":{"game":"g"}},"target":target});
+    // "a-seated" sits in the hub's shared room, "b-app" in a room an application made. Both sort
+    // before "c-waiting", which waits for a peer.
+    let (status, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/pair",
+        pair("a-seated", json!({"kind":"hub","id":"arena"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["room"], "pair:hub:arena");
+    for (method, args) in [
+        ("upsertServer", json!([{"id":"app-room","capacity":4}])),
+        ("upsertUser", json!([{"id":"b-app","scopes":{"game":"g"}}])),
+        ("join", json!(["b-app", "app-room"])),
+        (
+            "upsertUser",
+            json!([{"id":"c-waiting","scopes":{"game":"g"}}]),
+        ),
+    ] {
+        let (status, body) = post(
+            &c,
+            &base,
+            TOKEN,
+            "/v1/hubs/arena/call",
+            json!({"method":method,"args":args}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let (status, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/pair",
+        pair(
+            "newcomer",
+            json!({"kind":"peer","requirements":{"game":"g"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["link"], "peer-peer");
+    assert_eq!(body["room"], "pair:c-waiting");
+    // With the only eligible peer paired, a third joins that room, and a fourth finds only rooms it cannot join.
+    let (status, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/pair",
+        pair("third", json!({"kind":"peer","requirements":{"game":"g"}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["room"], "pair:c-waiting");
+    let (status, _) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/pair",
+        pair(
+            "fourth",
+            json!({"kind":"peer","requirements":{"game":"other"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 404);
+    task.abort();
+}

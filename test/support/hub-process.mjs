@@ -38,7 +38,8 @@ export async function freePort() {
 
 /** Start a hub. `env` adds or overrides LIVEENGINE_* settings. Call `stop()` when done. */
 export async function startHub(env = {}) {
-  const port = await freePort();
+  // A caller that needs the port in advance (for a proxy in front) passes LIVEENGINE_BIND.
+  const port = env.LIVEENGINE_BIND ? Number(env.LIVEENGINE_BIND.split(':').pop()) : await freePort();
   const output = [];
   const child = spawn(hubBinary(), ['serve'], {
     env: {

@@ -100,6 +100,9 @@ Bridge variables are read by `integrations/gogh-strike/bridge.mjs`:
 | `PORT` | number | `8967` | Bridge port on `127.0.0.1` |
 | `GOGH_MATCH_SERVER_ID` | string | `gogh-strike-local` | Room ID |
 | `GOGH_MATCH_CAPACITY` | number | `12` | Room capacity |
+| `GOGH_LIVE_LINK` | `hub` / `peer` | `hub` | `peer` pairs players with each other (WebRTC with relay fallback) |
+| `GOGH_PEER_WAIT_MS` | number | `30000` | How long a first player waits for a peer before `408` |
+| `LIVEENGINE_WATCH_URL` | URL | the hub address as `ws(s)://.../v1/live/registry` | Registry address the `watch` route returns |
 
 The e2e script additionally reads:
 
@@ -116,7 +119,9 @@ The e2e script additionally reads:
 | `GOGH_BRIDGE_PORT` | number | ephemeral | Fixed bridge port |
 | `PLAYWRIGHT_PATH` | path | unset | Playwright `index.mjs` |
 | `CHROMIUM_PATH` | path | unset | Browser executable |
-| `GOGH_SCREENSHOT` | path | `/tmp/liveengine-gogh-lobby.png` | Screenshot output |
+| `GOGH_SCREENSHOT` | path | `liveengine-gogh-lobby.png` under `TMPDIR` | Screenshot output |
+
+`npm run test:e2e` (`live-e2e.mjs`) reads `PLAYWRIGHT_PATH`, `CHROMIUM_PATH`, `GOGH_STRIKE_ROOT`, `GOGH_E2E_CHROMIUM_ARGS` (replaces the Chromium flags) and `GOGH_E2E_ONLY` (a comma-separated list of scenario numbers for debugging; the exit code is non-zero). It creates its own hubs, tokens and ports.
 
 See [Gogh Strike integration](/guides/gogh-strike) for commands and behavior.
 

@@ -309,6 +309,11 @@ export interface LiveClientOptions {
   retryMaxMs?: number;
   connectTimeoutMs?: number;
   directTimeoutMs?: number;
+  /**
+   * Send broadcasts over each open data channel and relay a targeted copy only to the peers
+   * without one. Default false: a broadcast goes through the hub, which fans it out.
+   */
+  directBroadcast?: boolean;
   maxFrameBytes?: number;
   queueLimit?: number;
   WebSocket?: typeof WebSocket;

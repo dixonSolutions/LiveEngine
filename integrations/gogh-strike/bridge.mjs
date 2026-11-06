@@ -36,6 +36,13 @@ const hubPath = (process.env.LIVEENGINE_HUB_PATH || '').split('/').filter(Boolea
 const remoteAddress = process.env.LIVEENGINE_REMOTE_ADDRESS || '';
 const remoteHubId = process.env.LIVEENGINE_REMOTE_HUB_ID || hubId;
 const hubScopes = {game: 'gogh-strike'};
+// "hub" pairs every player with the hub's shared room. "peer" pairs players with each other
+// (the hub is still the signalling and fallback path); the first player waits for the next.
+const linkKind = process.env.GOGH_LIVE_LINK === 'peer' ? 'peer' : 'hub';
+const PEER_POLL_MS = 500;
+const peerWaitMs = Number(process.env.GOGH_PEER_WAIT_MS) > 0 ? Number(process.env.GOGH_PEER_WAIT_MS) : 30_000;
+// Where the browser opens the live registry; the hub's own address unless it is reached another way.
+const watchUrl = process.env.LIVEENGINE_WATCH_URL || `${(process.env.LIVEENGINE_URL || '').replace(/^http/, 'ws').replace(/\/$/, '')}/v1/live/registry`;
 // A verifier for the hub's `auth` (see docs/hosting.md), as JSON. Unset leaves the hub open.
 const hubAuth = process.env.GOGH_HUB_AUTH ? JSON.parse(process.env.GOGH_HUB_AUTH) : undefined;
 // Gogh Strike's own DTO schemas and channels live in the game, so the game stays the one owner.
@@ -144,6 +151,7 @@ class LiveEngineClient {
 
   async pair(userId, player, credential) {
     await this.ensureReady();
+    if (linkKind === 'peer') return this.pairPeer(userId, player);
     const request = {
       subject: {id: userId, kind: 'peer', scopes: {game: 'gogh-strike', mode: 'tdm', team: player.team, artist: player.role}},
       target: {kind: 'hub', id: hubId, requirements: hubScopes}, path: hubPath,
@@ -153,10 +161,54 @@ class LiveEngineClient {
     return descriptor;
   }
 
+  // Peer pairing: register as a candidate, then take the first peer found or wait to be taken.
+  async pairPeer(userId, player) {
+    // `arena` keeps these players to this hub: other players on the service are never candidates.
+    const scopes = {game: 'gogh-strike', mode: 'tdm', team: player.team, artist: player.role, arena: hubId};
+    const request = {subject: {id: userId, kind: 'peer', scopes}, target: {kind: 'peer', requirements: {...hubScopes, arena: hubId}}, path: hubPath};
+    const known = await this.call('getUser', userId);
+    if (!known) await this.call('upsertUser', {id: userId, scopes});
+    pairings.set(userId, {peer: true});
+    const deadline = Date.now() + peerWaitMs;
+    // Registered first, so of two players arriving together the later one finds the earlier.
+    // The pairing itself costs several hub requests, so a waiting player only polls its own seat.
+    for (let attempt = 0; ; attempt++) {
+      const current = attempt ? await this.call('getUser', userId) : known;
+      if (current?.status === 'paired' && current.serverId) return this.peerDescriptor(userId, current.serverId);
+      if (attempt === 0) {
+        try { return await this.client.pair(request); }
+        catch (error) { if (error.status !== 404 && error.status !== 409) throw error; }
+      }
+      if (Date.now() >= deadline) {
+        pairings.delete(userId);
+        await this.call('leave', userId).catch(() => {});
+        throw Object.assign(new Error('No other player arrived in time'), {status: 408});
+      }
+      await new Promise(resolve => setTimeout(resolve, PEER_POLL_MS));
+    }
+  }
+
+  async peerDescriptor(userId, room) {
+    const ticket = await this.client.ticket(hubId, {userId, serverId: room, path: hubPath});
+    return {link: 'peer-peer', room, userId, ticket: ticket.ticket, url: ticket.url, transports: ['webrtc', 'websocket']};
+  }
+
   async renew(userId, credential) {
     const request = pairings.get(userId);
     if (!request) return null;
+    if (request.peer) {
+      const current = await this.call('getUser', userId);
+      return current?.serverId ? this.peerDescriptor(userId, current.serverId) : null;
+    }
     return this.client.renewal(request)({credential});
+  }
+
+  // A read-only registry watch for the namespace that holds the game hub. The browser opens the
+  // registry socket itself with this ticket and never sees the administrator token.
+  async watch(depth) {
+    await this.ensureReady();
+    const issued = await this.client.watchTicket({path: hubPath, depth});
+    return {url: watchUrl, ticket: issued.ticket, expiresAt: issued.expiresAt, path: hubPath, depth};
   }
 
   async discover(query) {
@@ -230,6 +282,12 @@ async function pairRoute(res, renewing, input) {
   } catch (error) { return failure(res, error); }
 }
 
+async function watch(res, input) {
+  const depth = Number.isInteger(input.depth) && input.depth >= 1 && input.depth <= 8 ? input.depth : 1;
+  try { return json(res, 200, await getClient().watch(depth)); }
+  catch (error) { return failure(res, error); }
+}
+
 async function discover(res, input) {
   const kind = ['hub', 'peer', 'any'].includes(input.kind) ? input.kind : 'hub';
   const query = {kind, ...(Number.isInteger(input.depth) && input.depth >= 1 && input.depth <= 8 ? {depth: input.depth} : {}),
@@ -254,7 +312,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/liveengine/status' && req.method === 'GET') {
       return json(res, 200, {configured: Boolean(apiBase && token), hubId, mode: hubMode, externalConfigured: Boolean(remoteAddress), localSimulation: true});
     }
-    if (['/api/liveengine/join', '/api/liveengine/leave', '/api/liveengine/heartbeat', '/api/liveengine/pair', '/api/liveengine/renew', '/api/liveengine/discover'].includes(url.pathname) && req.method === 'POST') {
+    if (['/api/liveengine/join', '/api/liveengine/leave', '/api/liveengine/heartbeat', '/api/liveengine/pair', '/api/liveengine/renew', '/api/liveengine/discover', '/api/liveengine/watch'].includes(url.pathname) && req.method === 'POST') {
       const origin = req.headers.origin;
       if (!allowedOrigins.has(origin)) return json(res, 403, {error: 'Cross-origin request rejected'});
       const now = Date.now();
@@ -264,6 +322,7 @@ const server = http.createServer(async (req, res) => {
       joinRates.set(req.socket.remoteAddress, timestamps);
       const input = await readJson(req);
       if (url.pathname.endsWith('/discover')) return await discover(res, input);
+      if (url.pathname.endsWith('/watch')) return await watch(res, input);
       if (typeof input.userId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(input.userId)) return json(res, 400, {error: 'Invalid userId'});
       if (url.pathname.endsWith('/pair') || url.pathname.endsWith('/renew')) return await pairRoute(res, url.pathname.endsWith('/renew'), input);
       if (url.pathname.endsWith('/heartbeat')) {

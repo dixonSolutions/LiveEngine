@@ -60,6 +60,7 @@
     "example": "node examples/math-game/server.js",
     "hub": "node bin/liveengine-hub.js",
     "test:integration": "node --test integrations/gogh-strike/bridge.test.mjs integrations/gogh-strike/bridge-live.test.mjs",
+    "test:e2e": "node integrations/gogh-strike/live-e2e.mjs",
     "docs:dev": "cd docs-site && npx mint@latest dev",
     "docs:validate": "cd docs-site && npx mint@latest validate && npx mint@latest broken-links"
   },
