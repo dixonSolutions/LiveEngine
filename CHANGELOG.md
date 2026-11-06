@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Expose the engine's system-room flag and use it when selecting peer rooms.
+
 - Reject forged server event types and linked frames claiming a sender announced on another link.
 
 - Add the dependency-free `LiveClient` (`@dixonsolutions/liveengine/live-client`), which connects from a pairing descriptor, retries and renews tickets, and opens WebRTC data channels with automatic fallback to the hub relay. `HubClient` gains `ticket`, `watchTicket`, `watchRegistry`, `discover`, `pair` and `renewal`, all accepting an optional credential. `pair` responses include `userId`. The Rust `HubClient` and the CLI gain `ticket`, `watch-ticket` and `watch`.

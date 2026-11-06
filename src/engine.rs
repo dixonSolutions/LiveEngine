@@ -161,7 +161,7 @@ impl Engine {
         json!({"id":u.id,"scopes":u.scopes,"requirements":u.req,"status":u.status,"serverId":if u.server.is_empty(){Value::Null}else{json!(u.server)},"seq":u.seq})
     }
     fn server_value(s: &Server) -> Value {
-        json!({"id":s.id,"scopes":s.scopes,"requirements":s.req,"status":s.status,"capacity":s.capacity,"minMembers":s.min,"members":s.members,"free":(s.capacity as usize).saturating_sub(s.members.len()),"seq":s.seq})
+        json!({"id":s.id,"scopes":s.scopes,"requirements":s.req,"status":s.status,"capacity":s.capacity,"minMembers":s.min,"members":s.members,"free":(s.capacity as usize).saturating_sub(s.members.len()),"seq":s.seq,"system":s.system})
     }
     fn result(ok: bool, reason: &str, user: &str, server: &str) -> Value {
         json!({"ok":ok,"reason":if reason.is_empty(){Value::Null}else{json!(reason)},"userId":if user.is_empty(){Value::Null}else{json!(user)},"serverId":if server.is_empty(){Value::Null}else{json!(server)}})

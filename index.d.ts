@@ -28,7 +28,7 @@ export interface ServerInput {
 }
 export interface Server {
   id: string; scopes: Scopes; requirements: RuleSet; status: ServerStatus;
-  capacity: number; minMembers: number; members: string[]; free: number; seq: number;
+  capacity: number; minMembers: number; members: string[]; free: number; seq: number; system: boolean;
 }
 
 export interface Affinity { key: string; weight?: number; }

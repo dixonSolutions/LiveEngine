@@ -467,11 +467,6 @@ pub(crate) async fn pair(
                     continue;
                 }
                 if let Some(room) = user["result"]["serverId"].as_str() {
-                    // Only a room this pairing made for peers can take one more. A hub's shared
-                    // room, or a room an application made, would refuse the pairing.
-                    if !room.starts_with("pair:") || room.starts_with("pair:hub:") {
-                        continue;
-                    }
                     let Ok(server) = routed(
                         state.clone(),
                         headers.clone(),
@@ -484,7 +479,7 @@ pub(crate) async fn pair(
                     else {
                         continue;
                     };
-                    if server["result"]["status"] != "open" {
+                    if server["result"]["system"] != true || server["result"]["status"] != "open" {
                         continue;
                     }
                 }

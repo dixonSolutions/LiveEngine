@@ -487,3 +487,51 @@ async fn peer_pairing_skips_candidates_seated_in_other_kinds_of_room() {
     assert_eq!(status, 404);
     task.abort();
 }
+
+#[tokio::test]
+async fn pairing_uses_room_flag_instead_of_room_name() {
+    let (base, task) = server(TOKEN).await;
+    let c = reqwest::Client::new();
+    let (status, _) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs",
+        json!({"id":"arena","mode":"internal"}),
+    )
+    .await;
+    assert_eq!(status, 201);
+    for (method, args) in [
+        (
+            "upsertServer",
+            json!([{"id":"pair:misleading","capacity":4}]),
+        ),
+        ("upsertUser", json!([{"id":"a","scopes":{}}])),
+        ("join", json!(["a", "pair:misleading"])),
+        (
+            "pairPeers",
+            json!([{"room":"unusual-name","capacity":4,"users":[{"id":"b","scopes":{}}]}]),
+        ),
+    ] {
+        let (status, body) = post(
+            &c,
+            &base,
+            TOKEN,
+            "/v1/hubs/arena/call",
+            json!({"method":method,"args":args}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let (status, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/pair",
+        json!({"subject":{"kind":"peer","id":"new","scopes":{}},"target":{"kind":"peer"}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["room"], "unusual-name");
+    task.abort();
+}
