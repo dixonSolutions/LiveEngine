@@ -1,26 +1,27 @@
 ---
 title: "Gogh Strike integration"
-description: "Add optional LiveEngine matchmaking to the Gogh Strike lobby through a loopback bridge, and run the bridge and e2e checks."
+description: "Real multiplayer for Gogh Strike through a bridge that pairs players with a hub and a LiveClient in the browser, plus the bridge tests."
 ---
 
-The integration adds an optional matchmaking lobby to [petergpt/gogh-strike](https://github.com/petergpt/gogh-strike). The browser talks only to a local Node bridge. The LiveEngine administrative token and any remote credential stay in the Node process and never reach browser code or URLs.
+The integration connects [petergpt/gogh-strike](https://github.com/petergpt/gogh-strike) to LiveEngine. The browser talks only to a Node bridge. The LiveEngine administrative token and any remote credential stay in the Node process and never reach browser code or URLs.
 
-Successful matchmaking selects a hub room, then starts Gogh Strike's existing **local** match simulation. It does **not** replicate player movement, combat, or match state between browsers.
+Players who choose **Find a LiveEngine match** are paired into one hub room and see each other move, shoot and die. Each client keeps its own simulation and bots; player state travels at 20 Hz on a lossy `state` channel, and shots, hits and deaths on a reliable `event` channel.
 
 ## What it does
 
-- Applies an optional lobby patch to an upstream Gogh Strike checkout.
-- Serves the game and a small matchmaking API from one loopback bridge.
-- Verifies `/v1/contract`, creates the configured hub if missing, registers a 12-seat room, upserts the player, and calls `autoJoin`.
+- Applies a lobby and networking patch to an upstream Gogh Strike checkout. The game holds only its DTOs, schemas and the mapping to and from game state (`src/liveengine-net.js`).
+- Serves the game, `LiveClient` and a thin API from one bridge. The API wraps `HubClient.discover`, `pair` and `renewal`.
+- On first use registers the game's schemas and the hub's channels, and a hub `auth` verifier when `GOGH_HUB_AUTH` is set.
+- Connects, retries, renews tickets and falls back from WebRTC to the hub relay inside `LiveClient`, not in the game.
 - Optionally routes through an external hub registered on a central service.
-- Keeps administrative credentials server-side.
 
 ## What it does not do
 
-- No multiplayer game-state synchronization.
+- No shared bots or scoreboard: each client simulates its own bots, and scores are tallied per client.
 - No browser-facing LiveEngine token.
-- No remote device claim; the recorded tests ran against local central/remote services.
+- No remote device claim; the recorded tests ran against local services.
 - No automatic installation of the upstream game or Playwright.
+- No browser run of the multiplayer version has been recorded yet.
 
 ## Prerequisites
 
@@ -107,6 +108,8 @@ node integrations/gogh-strike/bridge.mjs
 | `GOGH_ALLOWED_ORIGINS` | empty | Extra allowed `scheme://host:port` origins |
 | `GOGH_MATCH_SERVER_ID` | `gogh-strike-local` | Room ID |
 | `GOGH_MATCH_CAPACITY` | `12` | Room capacity |
+| `GOGH_HUB_AUTH` | empty | JSON of a hub `auth` verifier; players then need a credential |
+| `GOGH_REQUEST_LIMIT` | `10` | Requests per client address per minute, across all API routes |
 
 For an external hub:
 
@@ -130,14 +133,18 @@ The central service must allow the remote host and use matching credentials on t
 | --- | --- |
 | `GET /health` | `{ app, hubId }` |
 | `GET /api/liveengine/status` | Configuration status; does not require a working hub |
-| `POST /api/liveengine/join` | Validates `userId`, handles already-paired users, registers and joins |
+| `POST /api/liveengine/pair` | `{userId, team, role, credential?}`: returns the descriptor `{link, room, userId, ticket, url, transports}` for `LiveClient` |
+| `POST /api/liveengine/renew` | `{userId, credential?}`: a fresh descriptor for a player who paired; `404` otherwise |
+| `POST /api/liveengine/discover` | `{kind?, depth?, requirements?}`: candidates under the configured hub path |
+| `POST /api/liveengine/join` | The older seat-only matchmaking call; `leave` and `heartbeat` apply to both |
+| `GET /liveengine/live-client.mjs` | `lib/live-client.mjs` for the browser |
 
 The bridge:
 
 - validates the `Host` header against loopback, the concrete `HOST:PORT`, and `GOGH_ALLOWED_HOSTS`
 - validates the `Origin` header on join requests against the allowed hosts and `GOGH_ALLOWED_ORIGINS`
 - limits request bodies to 16 KiB
-- rate-limits joins to 10 per 60 seconds per socket peer
+- rate-limits API calls to 10 per 60 seconds per socket peer (`GOGH_REQUEST_LIMIT`)
 - returns `503` when `LIVEENGINE_URL` or `LIVEENGINE_TOKEN` is missing
 - returns `409` when matchmaking returns `ok: false`, and `400` for invalid input
 - propagates an upstream HTTP status (for example `401`) when one is available, otherwise returns `502`
@@ -149,10 +156,10 @@ The bridge:
 No dependencies are needed:
 
 ```sh
-node --test integrations/gogh-strike/bridge.test.mjs
+npm run test:integration
 ```
 
-The test uses a fake local HTTP hub and verifies the contract handshake, internal and external registration, the matchmaking call sequence, and rejection of hostile Host and Origin headers.
+`bridge.test.mjs` uses a fake local HTTP hub and verifies the contract handshake, internal and external registration, the matchmaking call sequence, and rejection of hostile Host and Origin headers. `bridge-live.test.mjs` runs against a real `liveengine-hub` with real WebSockets: schema and channel registration, two players in one room on both channels, schema enforcement, renewal and reconnect, discovery, hub auth, and the administrator token never appearing in a response.
 
 ## Live end-to-end check
 
@@ -196,4 +203,4 @@ The repository's validation record reports:
 - Optional Playwright reported `phase playing` with zero page errors.
 - A wrong local bearer returned HTTP `401` with a generic message and no token reflection.
 
-The test ran against local central and remote HTTP services, not a remote physical device. The game remains locally simulated.
+These records are for the earlier matchmaking-only version. The test ran against local central and remote HTTP services, not a remote physical device. The multiplayer version is covered by the Node tests above; a two-browser run is still to come.

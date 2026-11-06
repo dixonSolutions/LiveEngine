@@ -334,3 +334,71 @@ async fn peer_pairing_uses_user_schema_and_rolls_back_failures() {
     assert_eq!(body["result"], Value::Null);
     task.abort();
 }
+
+#[tokio::test]
+async fn pairing_target_id_picks_one_of_several_hubs_with_the_same_scopes() {
+    let (base, task) = server(TOKEN).await;
+    let c = reqwest::Client::new();
+    for id in ["alpha", "beta"] {
+        let (status, body) = post(
+            &c,
+            &base,
+            TOKEN,
+            "/v1/hubs",
+            json!({"id":id,"mode":"internal","scopes":{"game":"same"}}),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+    }
+    let pair =
+        |target: Value| json!({"subject":{"kind":"peer","id":"zoe","scopes":{}},"target":target});
+    // Without an id the first match in id order wins; with one, the named hub does.
+    let (status, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/pair",
+        pair(json!({"kind":"hub","requirements":{"game":"same"}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["room"], "pair:hub:alpha");
+    let (status, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/pair",
+        pair(json!({"kind":"hub","id":"beta","requirements":{"game":"same"}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["room"], "pair:hub:beta");
+    let (status, _) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/pair",
+        pair(json!({"kind":"hub","id":"gamma"})),
+    )
+    .await;
+    assert_eq!(status, 404);
+    let (status, _) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/pair",
+        pair(json!({"kind":"hub","id":7})),
+    )
+    .await;
+    assert_eq!(status, 400);
+    let (status, _) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/pair",
+        pair(json!({"kind":"hub","id":""})),
+    )
+    .await;
+    assert_eq!(status, 400);
+    task.abort();
+}

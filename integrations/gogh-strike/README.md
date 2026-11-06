@@ -1,6 +1,14 @@
-# Gogh Strike matchmaking bridge
+# Gogh Strike LiveEngine bridge
 
-This integration adds optional LiveEngine matchmaking to the browser game's lobby. The browser talks only to the loopback bridge; `LIVEENGINE_TOKEN` and the optional remote credential stay in the Node process. Successful matchmaking selects a hub room, then starts Gogh Strike's existing local match simulation. It does not replicate player movement, combat or match state between browsers.
+This integration connects the browser game to LiveEngine for real multiplayer. The browser talks only to the bridge; `LIVEENGINE_TOKEN` and the optional remote credential stay in the Node process. The lobby's **Find a LiveEngine match** option pairs the player with the bridge's hub through `HubClient.pair`, and the game then connects with `LiveClient`. Every browser in the room sees the others move and fire: each client keeps its own simulation (and its own bots), sends its player's state at 20 Hz on a lossy channel and its shots, hits and deaths on a reliable channel, and draws each remote player on an existing actor slot.
+
+Responsibilities are split so the game holds no connection logic:
+
+- `bridge.mjs` holds the administrator token. On first use it registers the game's schemas (`gogh-strike.state@1`, `gogh-strike.event@1`) and the hub's `state` (lossy) and `event` (reliable) channels, plus `auth` when `GOGH_HUB_AUTH` is set. It exposes thin routes over `HubClient.discover`, `pair` and `renewal`, and serves `lib/live-client.mjs` to the browser at `/liveengine/live-client.mjs`.
+- The game's `src/liveengine-net.js` holds only the DTO and schema definitions, the channel table and the mapping to and from game state (plus a small interpolation of remote positions). The bridge imports its `LIVE_SCHEMAS` and `LIVE_CHANNELS` from the game checkout, so the game stays the one owner of its data. If the file is absent the bridge still serves the older seat-based `join` route but registers no schemas or channels.
+- Pairing, tickets, retry with backoff, a fresh ticket on every reconnect and WebRTC with relay fallback live in `lib/live-client.mjs` (`connectLive`, `LiveClient`).
+
+A remote player takes over the bot that holds the same team and role (or any free teammate); the bots then leave that actor alone. Bots on each client are local and do not hurt remote players: damage between players comes only from the shooter's `hit` event. Scores are tallied per client.
 
 The upstream checkout used here is `https://github.com/petergpt/gogh-strike` at commit `2285e640097d9b12bcc42af72d5e8d0b37082f51`, cloned beside this repository at `../gogh-strike`. The game changes are captured in `gogh-strike.patch`. Apply it once to that clean upstream checkout; the command below also accepts a checkout where the patch is already applied:
 
@@ -23,7 +31,18 @@ GOGH_STRIKE_ROOT=../gogh-strike \
 node integrations/gogh-strike/bridge.mjs
 ```
 
-Open `http://127.0.0.1:8967/`, select **Find a LiveEngine match**, then press **Play**. The bridge checks `/v1/contract`, creates the configured internal hub if it is missing, registers a 12-seat Gogh Strike room, upserts the player and calls `autoJoin`. Hub ids and server ids are configurable with `LIVEENGINE_HUB_ID` and `GOGH_MATCH_SERVER_ID`.
+Open `http://127.0.0.1:8967/` in two browsers (or two tabs: each tab gets its own player id), select **Find a LiveEngine match** in both, then press **Play**. The bridge checks `/v1/contract`, publishes the schemas, creates the configured internal hub with its channels if it is missing, and pairs each player into the hub's shared room (`pair:hub:<hub id>`, up to 64 players). Pairing targets the hub by id, so another hub with the same scopes cannot be matched by mistake. The hub must advertise a WebSocket address the browser can reach (`LIVEENGINE_PUBLIC_URL`) and accept the page's origin (`LIVEENGINE_LIVE_ALLOWED_ORIGINS`). Browsers behind strict NAT need TURN for WebRTC; relayed play works without it.
+
+Bridge routes, all `POST` with an allowed Origin and JSON bodies:
+
+| Route | Purpose |
+| --- | --- |
+| `/api/liveengine/pair` | `{userId, team, role, credential?}`: returns the descriptor `{link, room, userId, ticket, url, transports}` |
+| `/api/liveengine/renew` | `{userId, credential?}`: a fresh descriptor for a player who paired; `404` for anyone else |
+| `/api/liveengine/discover` | `{kind?, depth?, requirements?}`: candidates under the configured hub path, without scopes or secrets |
+| `/api/liveengine/join`, `/leave`, `/heartbeat` | The seat routes: `leave` and `heartbeat` apply to paired players too; `join` is the older matchmaking-only call the game no longer uses |
+
+A hub `4xx` answer (for example `403 credential refused`) reaches the browser with its status. Credentials are never stored by the bridge: a player pairing again presents it again. `GOGH_REQUEST_LIMIT` (default 10 per minute per client address, shared by all routes) can be raised for a LAN. Set `GOGH_HUB_AUTH` to the JSON of a hub `auth` verifier (see `docs/hosting.md`) to require a credential; the game reads one from `localStorage['gogh-strike-liveengine-credential']`. The hub is registered with its channels and `auth` only when the bridge creates it; an existing hub keeps its own settings, and external hubs own theirs.
 
 Set `LIVEENGINE_HUB_PATH=region/games` to register and call the configured hub under those central IDs. Omit it for the root registry.
 
@@ -55,13 +74,13 @@ node integrations/gogh-strike/bridge.mjs
 
 The bridge has no player authentication. Expose it only on a trusted LAN, or put your own authenticated proxy in front of it. Do not publish it directly to the Internet.
 
-Run the bridge adapter test without installing dependencies:
+Run the bridge tests without installing dependencies:
 
 ```sh
-node --test integrations/gogh-strike/bridge.test.mjs
+npm run test:integration
 ```
 
-The test uses a local fake HTTP hub and verifies the contract handshake, internal and external registration, matchmaking call sequence, and rejection of hostile Host and Origin headers.
+`bridge.test.mjs` uses a local fake HTTP hub and verifies the contract handshake, internal and external registration, matchmaking call sequence, and rejection of hostile Host and Origin headers. `bridge-live.test.mjs` starts a real `liveengine-hub` (`npm run build:hub` first) and real WebSockets and checks schema and channel registration, serving of `LiveClient`, two players pairing into one room and exchanging both channels, schema enforcement by the hub, renewal and reconnect, discovery, hub auth (good, missing, wrong and mismatched credentials) and that the administrator token never appears in a response. The game side is covered in the Gogh Strike repository by `tests/liveengine-net.test.js`.
 
 ## Service validation
 
@@ -82,6 +101,6 @@ For the Compose services, set `LIVEENGINE_REMOTE_ADDRESS=http://remote:8787` as 
 
 For optional headless browser coverage, set `PLAYWRIGHT_PATH` to a Playwright `index.mjs` and optionally set `CHROMIUM_PATH` to the browser executable. The runner checks the lobby checkbox, starts a match, verifies the LiveEngine toast and browser user pairing, then saves `/tmp/liveengine-gogh-lobby.png` (override with `GOGH_SCREENSHOT`). It does not install Playwright into either project.
 
-The lobby generates client IDs with `crypto.getRandomValues`, so matchmaking also works over plain HTTP on a LAN where `crypto.randomUUID` is unavailable.
+The lobby generates client IDs with `crypto.getRandomValues`, so matchmaking also works over plain HTTP on a LAN where `crypto.randomUUID` is unavailable. The id is kept per tab in `sessionStorage`.
 
-Validated on upstream commit `2285e640097d9b12bcc42af72d5e8d0b37082f51`. `npm test` passed all 168 upstream tests, `npm run build` passed, and `node --test integrations/gogh-strike/bridge.test.mjs` passed. The live external-hub run reported `service join ok`, and optional Playwright reported `phase playing` with zero page errors; the screenshot was saved to `/tmp/liveengine-gogh-lobby.png`. A wrong local bearer returned HTTP 401 with a generic message and no token reflection. The test ran against local central and remote HTTP services, not a remote device.
+Recorded for the earlier matchmaking-only version, on upstream commit `2285e640097d9b12bcc42af72d5e8d0b37082f51`. The multiplayer version is covered by the Node tests above and a scripted pairing against a real hub; it has not yet been run in two real browsers. `npm test` passed all 168 upstream tests, `npm run build` passed, and `node --test integrations/gogh-strike/bridge.test.mjs` passed. The live external-hub run reported `service join ok`, and optional Playwright reported `phase playing` with zero page errors; the screenshot was saved to `/tmp/liveengine-gogh-lobby.png`. A wrong local bearer returned HTTP 401 with a generic message and no token reflection. The test ran against local central and remote HTTP services, not a remote device.

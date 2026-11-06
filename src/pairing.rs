@@ -371,6 +371,12 @@ pub(crate) async fn pair(
     {
         return error(StatusCode::BAD_REQUEST, "invalid pairing request");
     }
+    // `target.id` narrows the match to one named hub or peer, so hubs that share scopes stay distinct.
+    let wanted = match target.get("id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(wanted)) if !wanted.is_empty() => Some(wanted.as_str()),
+        Some(_) => return error(StatusCode::BAD_REQUEST, "invalid target"),
+    };
     let depth = state
         .config
         .max_depth
@@ -395,6 +401,9 @@ pub(crate) async fn pair(
     if let Some(candidates) = found["candidates"].as_array() {
         for candidate in candidates {
             if candidate["kind"] == kind && candidate["id"] == id {
+                continue;
+            }
+            if wanted.is_some_and(|wanted| candidate["id"] != wanted) {
                 continue;
             }
             if candidate["kind"] == "hub" {

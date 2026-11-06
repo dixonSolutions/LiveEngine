@@ -8,7 +8,8 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { after, before, describe, test } from 'node:test';
-import { LiveClient, connectPeer } from '../lib/live-client.mjs';
+import http from 'node:http';
+import { LiveClient, connectLive, connectPeer } from '../lib/live-client.mjs';
 import { FakeNet } from './support/fake-rtc.mjs';
 import { ADMIN_TOKEN, startHub, startProxy } from './support/hub-process.mjs';
 
@@ -636,5 +637,89 @@ describe('LiveClient direct path over a real hub (injected RTCPeerConnection)', 
     await bob.connect();
     await quiet(bob);
     assert.equal(net.pcs.size, 0);
+  });
+});
+
+describe('connectLive', () => {
+  let app;
+  let base;
+  const seen = [];
+  before(async () => {
+    await admin.register({
+      id: 'secure-bridge', mode: 'internal', scopes: { tier: 'secure-bridge' },
+      auth: { kind: 'token', tokens: [{ token: 'yan-credential-0123456789abcdef-aaaa', identity: 'yan' }] },
+    });
+    // A stand-in application bridge: it holds the administrator token, the caller never does.
+    app = http.createServer(async (req, res) => {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      const request = JSON.parse(raw || '{}');
+      seen.push({ url: req.url, request });
+      const reply = (status, value) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
+      try {
+        const target = { kind: 'hub', requirements: { tier: request.tier } };
+        const pairing = { subject: { id: request.userId, scopes: {} }, target, credential: request.credential };
+        if (req.url === '/pair') return reply(200, await admin.pair(pairing));
+        if (req.url === '/renew') return reply(200, await admin.renewal(pairing)({ credential: request.credential }));
+        if (req.url === '/busy') return reply(503, { error: 'try later' });
+        return reply(404, { error: 'unknown route' });
+      } catch (error) {
+        return reply(error.status || 502, { error: error.message });
+      }
+    });
+    await new Promise(resolve => app.listen(0, '127.0.0.1', resolve));
+    base = `http://127.0.0.1:${app.address().port}`;
+  });
+  after(async () => { await new Promise(resolve => app.close(resolve)); });
+
+  test('pairs through the application routes and exchanges frames without an administrator token', async () => {
+    const a = track(await connectLive({ pairUrl: `${base}/pair`, body: { userId: `cl-a-${++counter}`, tier: 'open' } }));
+    const b = track(await connectLive({ pairUrl: `${base}/pair`, body: { userId: `cl-b-${counter}`, tier: 'open' } }));
+    assert.equal(a.state, 'open');
+    const heard = [];
+    a.on('message', frame => heard.push(frame));
+    await until(() => b.peers().includes(a.id));
+    b.send({ hello: 'a' });
+    await until(() => heard.length === 1);
+    assert.deepEqual(heard[0].payload, { hello: 'a' });
+    assert.ok(!JSON.stringify(seen).includes(ADMIN_TOKEN));
+  });
+
+  test('a reconnect asks renewUrl for a fresh ticket', async () => {
+    const before = seen.filter(entry => entry.url === '/renew').length;
+    const client = track(await connectLive({ pairUrl: `${base}/pair`, renewUrl: `${base}/renew`, body: { userId: `cl-r-${++counter}`, tier: 'open' } }));
+    const reopened = new Promise(resolve => client.once('open', resolve));
+    client.reconnect();
+    assert.equal((await reopened).reconnected, true);
+    assert.equal(seen.filter(entry => entry.url === '/renew').length, before + 1);
+  });
+
+  test('a refused credential rejects with the status and is not retried', async () => {
+    const before = seen.length;
+    await assert.rejects(
+      connectLive({ pairUrl: `${base}/pair`, body: { userId: 'yan', tier: 'secure-bridge' }, credential: 'wrong-credential-0123456789abcdef-zzzz' }),
+      error => error.status === 403 && error.fatal === true,
+    );
+    assert.equal(seen.length, before + 1);
+  });
+
+  test('a credential refused on renewal ends the reconnect without a retry loop', async () => {
+    const credentials = ['yan-credential-0123456789abcdef-aaaa', 'wrong-credential-0123456789abcdef-zzzz'];
+    const client = track(await connectLive({
+      pairUrl: `${base}/pair`, renewUrl: `${base}/renew`, body: { userId: 'yan', tier: 'secure-bridge' },
+      credential: () => credentials.shift(), retryBaseMs: 10,
+    }));
+    const before = seen.filter(entry => entry.url === '/renew').length;
+    const closed = new Promise(resolve => client.once('close', resolve));
+    await assert.rejects(client.reconnect(), error => error.status === 403);
+    const event = await closed;
+    assert.equal(event.reconnecting, false);
+    assert.equal(seen.filter(entry => entry.url === '/renew').length, before + 1);
+    assert.equal(client.state, 'closed');
+  });
+
+  test('a server error is not fatal, so the caller may retry', async () => {
+    await assert.rejects(connectLive({ pairUrl: `${base}/busy` }), error => error.status === 503 && !error.fatal);
+    await assert.rejects(connectLive({}), TypeError);
   });
 });

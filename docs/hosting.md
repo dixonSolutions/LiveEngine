@@ -98,6 +98,13 @@ The Rust `HubClient` exposes `route`, `tree`, `export_registry`, and a general `
 
 Set `LIVEENGINE_PUBLIC_URL` to the direct live endpoint advertised by this service and optionally set `LIVEENGINE_TICKET_TTL_SECONDS` (default 60). An administrator can request `POST /v1/hubs/{id}/tickets` with `userId`, `serverId`, and optional `role` (`peer` or `service`); the user must already be paired in that server. The response contains `ticket`, `url`, and the Unix-seconds `expiresAt`. For nested hubs, use the `ticket` route operation with the hub `id` in the body. The owning service issues the ticket. Tickets are single-use and bound to the hub path and room. The signing key is stored in the private state file; used-ticket tracking is in memory and resets on restart.
 
+### Pairing a named target
+
+`POST /v1/pair` takes `target: {kind, requirements?, id?}`. Without `id`, the first candidate in id
+order that matches `requirements` is used. With `id`, only the hub or peer of that id can match, so
+two hubs that share scopes stay distinct. A non-string or empty `id` answers `400`; an `id` that
+matches nothing answers `404`.
+
 ### Hub auth
 
 A hub may carry `auth`, a verifier that resolves the credential a user presents

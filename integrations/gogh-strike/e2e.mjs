@@ -119,9 +119,9 @@ try {
     const browserState = await page.evaluate(() => ({
       phase: window.vanGoghStrike.state.phase,
       toast: document.querySelector('#toast')?.textContent || '',
-      userId: localStorage.getItem('gogh-strike-liveengine-user'),
+      userId: sessionStorage.getItem('gogh-strike-liveengine-user'),
     }));
-    assert.match(browserState.toast, /Matched to .*Local simulation only/);
+    assert.match(browserState.toast, /Joined .* with \d+ other players?\./);
     assert.equal(pageErrors.length, 0, `Browser errors: ${pageErrors.join('; ')}`);
     const browserUser = await remote.call(remoteHubId, 'getUser', [browserState.userId]);
     assert.equal(browserUser?.status, 'paired');

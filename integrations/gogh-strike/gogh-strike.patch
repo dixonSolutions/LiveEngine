@@ -11,19 +11,51 @@ index 3d9d4e7..292cb2e 100644
        </section>
        <div class="rival-preview"><div id="enemy-portraits" class="enemy-portraits" aria-hidden="true"></div><p>Against <strong id="enemy-faction-name">The Independents</strong><span>Real artists. An entirely imagined paint fight.</span></p></div>
      </main>
+diff --git a/src/bots.js b/src/bots.js
+index 21fbb2b..5458f04 100644
+--- a/src/bots.js
++++ b/src/bots.js
+@@ -72,7 +72,7 @@ export class BotDirector {
+   // Create all state first: decisions for the first bot cannot accidentally
+   // reserve every route before its teammates have a known role.
+   for(const actor of game.actors){
+-   if(actor.isPlayer)continue;
++   if(actor.isPlayer||actor.remote)continue;
+    const roster=game.actors.filter(a=>a.team===actor.team);
+    let s=this.states.get(actor.id);
+    if(!s||(!s.wasAlive&&living(actor))){s=this.makeState(actor,now,roster.indexOf(actor));this.states.set(actor.id,s);}
+@@ -81,7 +81,7 @@ export class BotDirector {
+   }
+   this.assignTeams(game,now);
+   for(const actor of game.actors){
+-   if(actor.isPlayer||!living(actor))continue;
++   if(actor.isPlayer||actor.remote||!living(actor))continue;
+    const s=this.states.get(actor.id);
+    if((actor.sprayUntil||0)>now||(actor.tauntUntil||0)>now){actor.ads=actor.aiming=actor.sprinting=false;this.physics.move(actor,V(),dt,{braking:100,crouch:actor.crouched});continue;}
+    if(game.tactical?.stage==='staging'){
+@@ -105,7 +105,7 @@ export class BotDirector {
+    if(now<plan.nextPlan&&key===plan.key)continue;
+    plan.key=key;plan.nextPlan=now+1.25;
+    const allies=game.actors.filter(a=>a.team===team&&living(a));
+-   const bots=allies.filter(a=>!a.isPlayer);
++   const bots=allies.filter(a=>!a.isPlayer&&!a.remote);
+    const info=this.intel.get(team);
+    plan.responders.clear();
+    if(info&&now-info.at<5.5){
 diff --git a/src/game.js b/src/game.js
-index 22dacf2..f061ace 100644
+index 22dacf2..b5afeb5 100644
 --- a/src/game.js
 +++ b/src/game.js
-@@ -21,6 +21,7 @@ import {bodyProfile} from './actor-profile.js';
+@@ -21,6 +21,8 @@ import {bodyProfile} from './actor-profile.js';
  import {actorPose,bodyPoint,intersectActorBody} from './actor-body.js';
  import {UtilitySystem} from './utility.js';
  import {initEquipment,equip,stashMagazine,absorbDamage} from './loadout.js';
-+import {joinLiveEngineMatch,leaveLiveEngineMatch} from './liveengine-matchmaking.js';
++import {joinLiveEngineMatch,leaveLiveEngineMatch,getLiveSession} from './liveengine-matchmaking.js';
++import {STATE_HZ,RemoteTrack,encodeState,decodeState,encodeShot,encodeHit,encodeDown,decodeEvent,pickRemoteSlot,applyRemoteState} from './liveengine-net.js';
  
  const V=(x=0,y=0,z=0)=>new THREE.Vector3(x,y,z),clamp=THREE.MathUtils.clamp,lerp=THREE.MathUtils.lerp;
  const teamColors=FACTIONS.map(f=>new THREE.Color(f.color).getHex());
-@@ -51,7 +52,7 @@ const classicSpawns=[
+@@ -51,7 +53,7 @@ const classicSpawns=[
   [[-14,-32],[20,-37],[37,-7],[58,14],[81,-8],[6,15],[47,-23],[-30,17],[70,25],[89,-4]],
  ];
  const objectives=[];
@@ -32,24 +64,118 @@ index 22dacf2..f061ace 100644
   onWeaponSelect:value=>{if(controlsReady())switchWeapon(typeof value==='number'?player?.carriedWeapons[value]:value);}});
  const pointerCapture=new PointerCapture({element:renderer.domElement,document,
   canCapture:()=>phase==='playing'&&!paused&&!document.hidden&&document.hasFocus(),
-@@ -111,7 +112,7 @@ function simulationReady(){return phase==='playing'&&!paused&&!input.suspended&&
+@@ -59,6 +61,44 @@ const pointerCapture=new PointerCapture({element:renderer.domElement,document,
+  onLost:()=>{if(phase==='playing'&&!paused)setPause(true);}});
+ applySettings(settings);
+ const roleWeapon=Object.fromEntries(Object.entries(ROLE_LOADOUTS).map(([role,kit])=>[role,kit.weaponId]));
++
++// LiveEngine: another player stands in for an existing actor, which the bots then leave alone.
++// Each client keeps its own simulation; positions and events arrive as the DTOs in liveengine-net.js.
++const remotes=new Map(),tracks=new Map();let liveClient,liveOff=[],stateCounter=0,stateClock=0;
++function liveSend(payload,channel='event'){if(liveClient?.state!=='open')return;try{liveClient.send(payload,{channel});}catch{}}
++function releaseRemote(id){const a=remotes.get(id);if(a)a.remote=a.remoteId=false;remotes.delete(id);tracks.delete(id);}
++function detachLive(){liveOff.forEach(off=>off());liveOff=[];liveClient=undefined;[...remotes.keys()].forEach(releaseRemote);}
++function attachLive(){
++ detachLive();liveClient=getLiveSession();if(!liveClient)return;
++ liveOff=[liveClient.on('message',onLiveMessage),liveClient.on('presence',e=>{if(e.event==='leave')releaseRemote(e.peer);}),liveClient.on('close',detachLive)];
++}
++function claimRemote(id,state){
++ let a=remotes.get(id);if(a)return a;a=pickRemoteSlot(actors,state);if(!a)return null;
++ a.remote=true;a.remoteId=id;remotes.set(id,a);tracks.set(id,new RemoteTrack());return a;
++}
++function onLiveMessage(frame){
++ if(!rules||typeof frame.from!=='string')return;
++ if(frame.channel==='state'){const state=decodeState(frame.payload);if(state&&claimRemote(frame.from,state))tracks.get(frame.from).push(state,performance.now()/1000);return;}
++ const event=frame.channel==='event'?decodeEvent(frame.payload):null,actor=remotes.get(frame.from);if(!event||!actor)return;
++ if(event.kind==='shot'){
++  const w=WEAPON_BY_ID[event.weapon];if(!w)return;
++  const origin=V(...event.origin),dir=V(...event.dir).normalize(),dist=physics.raycast(origin,dir,w.range)?.distance??w.range;
++  effects.tracer(origin.clone().addScaledVector(dir,.65),origin.clone().addScaledVector(dir,dist),actor.team);effects.muzzle(origin.clone().addScaledVector(dir,.85),actor.team);
++  audio.shot(w,origin,false,{occluded:player&&!physics.lineOfSight(origin,eye(player)),suppressed:false,lowAmmo:false});actor.lastShotAt=time;
++ }else if(event.kind==='hit'){
++  if(event.target!==liveClient?.id||!player?.alive)return;
++  damageActor(player,event.damage,actor,event.headshot,{penetration:WEAPON_BY_ID[event.weapon]?.armorPenetration,kind:event.weapon});
++  if(!player.alive)liveSend(encodeDown(frame.from));
++ }else if(event.kind==='down'){
++  actor.deaths++;const killer=event.by===liveClient?.id?player:remotes.get(event.by);
++  if(killer&&killer!==actor){killer.kills++;rules.recordKill(killer,actor);}
++ }
++}
++function updateRemotes(dt){
++ const now=performance.now()/1000;
++ for(const [id,a] of remotes){const state=tracks.get(id)?.sample(now);if(state)applyRemoteState(a,state,weapon=>WEAPON_BY_ID[weapon]);a.protectedUntil=0;}
++ if(liveClient?.state==='open'&&player&&(stateClock+=dt)>=1/STATE_HZ){stateClock=0;liveSend(encodeState(player,stateCounter++),'state');}
++}
+ function newActor(team,i){
+  const identity=FACTIONS[team].roster[i],isPlayer=team===config.team&&identity.role===config.role,profile=bodyProfile(identity.look);
+  const a={id:team*6+i,name:isPlayer?'You':identity.shortName,artistName:identity.name,identity,team,role:identity.role,personality:identity.personality,isPlayer,
+@@ -91,7 +131,7 @@ function startMatch(next={}){
+  intro.cancel();ui.endIntro?.();
+  config={team:0,role:'vanguard',...next,mode:'tdm',scoreLimit:CLASH.scoreLimit,timeLimit:CLASH.timeLimit};if(!ROLES.includes(config.role))config.role='vanguard';config.team=config.team===1?1:0;config.weapon=roleWeapon[config.role];applySettings(config.settings||settings);
+  actors.forEach(a=>a.model.dispose());actors.length=0;utility.clear();sprays.clear();sprayFeedback='';sprayFeedbackUntil=0;effects.clear?.();spots.clear();pings.length=0;squadOrder=null;
+- time=0;shotCount=hitCount=respawnCount=0;phase='playing';paused=false;awaitingLock=false;rules=new MatchRules(config);director.reset();
++ time=0;shotCount=hitCount=respawnCount=0;phase='playing';paused=false;awaitingLock=false;rules=new MatchRules(config);director.reset();remotes.clear();tracks.clear();attachLive();
+  for(let t=0;t<2;t++)for(let i=0;i<6;i++)newActor(t,i);
+  for(const a of actors)spawn(a,{initial:true});
+  rules.update(0,actors);syncView();clearInput({shortcuts:true});killRecap=null;ui.beginMatch(config);audio.unlock();
+@@ -111,7 +151,7 @@ function simulationReady(){return phase==='playing'&&!paused&&!input.suspended&&
  function controlsReady(){return simulationReady()&&!intro.active&&rules?.phase==='playing'&&player?.alive;}
  function clearInput(options){input.clear(options);fireHeld=fireLatch=ads=false;audio.cancelReload?.();ui.showScoreboard(false);if(player){player.burstRemaining=0;cancelActorTaunt(player);}}
  function releaseLock(){pointerCapture.release();}
 -function showMenu(){intro.cancel();ui.endIntro?.();phase='menu';paused=false;awaitingLock=false;clearInput();releaseLock();actors.forEach(a=>a.model.setVisible(false));utility.clear();sprays.clear();effects.clear?.();view.setVisible(false);town.setView(1);ui.showMenu();}
-+function showMenu(){leaveLiveEngineMatch();intro.cancel();ui.endIntro?.();phase='menu';paused=false;awaitingLock=false;clearInput();releaseLock();actors.forEach(a=>a.model.setVisible(false));utility.clear();sprays.clear();effects.clear?.();view.setVisible(false);town.setView(1);ui.showMenu();}
++function showMenu(){detachLive();leaveLiveEngineMatch();intro.cancel();ui.endIntro?.();phase='menu';paused=false;awaitingLock=false;clearInput();releaseLock();actors.forEach(a=>a.model.setVisible(false));utility.clear();sprays.clear();effects.clear?.();view.setVisible(false);town.setView(1);ui.showMenu();}
  function requestLock(){return pointerCapture.request();}
  function setPause(value){if(phase!=='playing')return;paused=!!value;clearInput();if(value){releaseLock();ui.showPause();}else{ui.hidePause();audio.unlock();requestLock();}}
  function applySettings(next){Object.assign(settings,next);settings.volume=clamp(Number(settings.volume)||0,0,1);settings.sensitivity=clamp(Number(settings.sensitivity)||1,.25,2.5);try{localStorage.setItem('vgs-settings',JSON.stringify(settings));}catch{}audio.setVolume(settings.volume);const q=settings.graphics;town.setQuality(q==='full'?1:q==='performance'?.48:.73);renderer.setPixelRatio(Math.min(devicePixelRatio,q==='full'?1.7:q==='performance'?1:1.25));renderer.setSize(innerWidth,innerHeight);}
+@@ -135,6 +175,7 @@ function requestFire(a,direction){
+   if(hit){if(hit.actor.team!==a.team&&hit.actor.protectedUntil<=time){const damage=w.damage*(hit.headshot?w.headMultiplier:1)*lerp(1,w.damageFalloff,clamp(dist/w.range,0,1))*(suppressed?.97:1);damageActor(hit.actor,damage,a,hit.headshot,{penetration:w.armorPenetration,kind:a.weaponId,distance:dist});didHit=true;headshot ||=hit.headshot;killed ||= !hit.actor.alive;effects.impact(end,null,true);}else effects.impact(end,null,false);}else if(wall)effects.impact(end,wall.normal,false);
+  }
+  a.bloom=Math.min(w.maxSpreadBloom||.04,(a.bloom||0)+(w.spreadBloom||.002));
++ if(a.isPlayer)liveSend(encodeShot(a.weaponId,origin,direction));
+  audio.shot(w,origin,a.isPlayer,{occluded:player&&!a.isPlayer&&!physics.lineOfSight(origin,eye(player)),suppressed,lowAmmo:a.ammo<=3});
+  if(!a.isPlayer){effects.muzzle(origin.clone().addScaledVector(direction,.85),a.team);effects.shell?.(origin.clone().add(V(.25,-.15,0)),V(1.7,1.6,.4),w);}
+  if(a.isPlayer){shotCount++;view.fire({heat:a.bloom,empty:a.ammo===0,suppressed});const pattern=w.recoilPattern?.[a.recoilIndex%w.recoilPattern.length]||{x:0,y:w.recoil};recoilPitch+=pattern.y*(aimed?.64:1)*(a.crouched?.82:1);recoilYaw+=pattern.x*(aimed?.64:1);if(didHit){hitCount++;ui.showHit({headshot,killed});audio.hit(headshot);}}
+@@ -142,6 +183,7 @@ function requestFire(a,direction){
+ }
+ function damageActor(victim,amount,attacker,headshot=false,meta={}){
+  if(intro.active||!victim.alive||victim.protectedUntil>time||rules?.phase!=='playing')return;
++ if(victim.remote){if(attacker?.isPlayer)liveSend(encodeHit(victim.remoteId,amount,headshot,attacker.weaponId));return;}
+  const before=victim.health,{healthDamage}=absorbDamage(victim,amount,meta.penetration??.6,{headshot,bypassArmor:meta.kind==='melee'});victim.health=Math.max(0,before-healthDamage);const actual=before-victim.health;
+  cancelActorTaunt(victim);victim.lastAttacker=attacker?.id;victim.lastDamageAt=time;victim.suppression=Math.min(1,victim.suppression+.3);victim.healUntil=0;victim.sprayUntil=0;
+  if(attacker&&attacker.team!==victim.team){attacker.damage+=actual;victim.damageHits.set(attacker.id,(victim.damageHits.get(attacker.id)||0)+1);victim.damageContributors.set(attacker.id,{damage:(victim.damageContributors.get(attacker.id)?.damage||0)+actual,time});rules.recordDamage?.(attacker,victim,actual);}
+@@ -187,7 +229,7 @@ function requestSpray(a=player,direction){
+ }
+ function botStreetArt(){
+  for(const a of actors){
+-  if(a.isPlayer||!a.alive||time<a.nextBotSprayAt)continue;a.nextBotSprayAt=time+13+(a.id%5)*2;
++  if(a.isPlayer||a.remote||!a.alive||time<a.nextBotSprayAt)continue;a.nextBotSprayAt=time+13+(a.id%5)*2;
+   if(a.botState?.targetId!=null||time-a.lastDamageAt<6||time-a.lastShotAt<6||Math.hypot(a.velocity.x,a.velocity.z)>.9||a.reloadUntil>time)continue;
+   const origin=eye(a);
+   for(const offset of[0,.75,-.75,1.5,-1.5,Math.PI]){const yaw=a.yaw+offset,dir=V(-Math.sin(yaw),0,-Math.cos(yaw));if(!sprays.surface(origin,dir))continue;if(requestSpray(a,dir)){a.yaw=yaw;break;}}
+@@ -233,10 +275,10 @@ function updateSimulation(dt){
+   const w=WEAPON_BY_ID[a.weaponId];a.bloom=Math.max(0,(a.bloom||0)-dt*(w.spreadRecovery||.025));a.suppression=Math.max(0,a.suppression-dt*.3);if(time-a.lastShotAt>.42)a.recoilIndex=0;
+   if(a.alive&&a.reloadUntil&&time>=a.reloadUntil){const n=Math.min(w.magSize-a.ammo,a.reserve);a.ammo+=n;a.reserve-=n;a.reloadUntil=0;}
+   if(a.alive&&a.health<a.maxHealth&&time-a.lastDamageAt>4.5)a.health=Math.min(a.maxHealth,a.health+dt*10);
+-  if(!a.alive&&time>=a.respawnAt&&rules.phase==='playing')spawn(a);
++  if(!a.alive&&!a.remote&&time>=a.respawnAt&&rules.phase==='playing')spawn(a);
+   const speed=Math.hypot(a.velocity.x,a.velocity.z);if(a.alive&&a.grounded&&speed>1&&time>(a.footstepAt||0)&&(!player||a.position.distanceTo(player.position)<26)){audio.footstep(a.isPlayer?null:a.position,a.sprinting);a.footstepAt=time+(a.crouched?.66:a.sprinting?.30:.43);a.noiseUntil=a.crouched?0:time+.35;}
+  }
+- if(rules.phase==='playing'){if(!awaitingLock||diagnostic)updatePlayer(dt);director.update(dt,game);separateActors();utility.update(dt,time,actors);botStreetArt();sprays.update(time);}
++ if(rules.phase==='playing'){if(!awaitingLock||diagnostic)updatePlayer(dt);updateRemotes(dt);director.update(dt,game);separateActors();utility.update(dt,time,actors);botStreetArt();sprays.update(time);}
+  rules.update(dt,actors);if(rules.phase==='ended')finishMatch();
+  spotTick+=dt;if(spotTick>.25){spotTick=0;updateSpots();}
+ }
 diff --git a/src/liveengine-matchmaking.js b/src/liveengine-matchmaking.js
 new file mode 100644
-index 0000000..aa8d8df
+index 0000000..99077a5
 --- /dev/null
 +++ b/src/liveengine-matchmaking.js
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,74 @@
 +const USER_KEY = 'gogh-strike-liveengine-user';
++const CREDENTIAL_KEY = 'gogh-strike-liveengine-credential';
 +let activeUser;
 +let heartbeat;
++let session;
 +
 +function randomToken() {
 +  try {
@@ -61,12 +187,13 @@ index 0000000..aa8d8df
 +  }
 +}
 +
++// One id per tab, so two tabs of the same browser are two players.
 +function localUserId() {
 +  try {
-+    let id = localStorage.getItem(USER_KEY);
++    let id = sessionStorage.getItem(USER_KEY);
 +    if (!id) {
 +      id = `gogh-${randomToken()}`;
-+      localStorage.setItem(USER_KEY, id);
++      sessionStorage.setItem(USER_KEY, id);
 +    }
 +    return id;
 +  } catch {
@@ -80,25 +207,35 @@ index 0000000..aa8d8df
 +  return response.json();
 +}
 +
++// A credential for a hub that sets `auth`, if the player has one.
++function storedCredential() {
++  try { return localStorage.getItem(CREDENTIAL_KEY) || undefined; }
++  catch { return undefined; }
++}
++
 +export async function joinLiveEngineMatch(config) {
 +  const userId = localUserId();
-+  const response = await fetch('/api/liveengine/join', {
-+    method: 'POST',
-+    headers: {'Content-Type': 'application/json', Accept: 'application/json'},
-+    body: JSON.stringify({userId, team: config.team, role: config.role}),
++  if (session?.state === 'open') return {ok: true, userId, serverId: session.room, peers: session.peers().length};
++  // The bridge serves LiveClient. Pairing, tickets, retry and reconnect all happen inside it.
++  const {connectLive} = await import('/liveengine/live-client.mjs');
++  const client = await connectLive({
++    pairUrl: '/api/liveengine/pair', renewUrl: '/api/liveengine/renew',
++    body: {userId, team: config.team, role: config.role}, credential: storedCredential(),
 +  });
-+  const result = await response.json().catch(() => ({}));
-+  if (!response.ok) throw new Error(result.error || result.reason || `Matchmaking failed (${response.status})`);
++  session = client;
 +  activeUser = userId;
-+  clearInterval(heartbeat);
 +  heartbeat = setInterval(() => {
 +    fetch('/api/liveengine/heartbeat', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({userId})}).catch(() => {});
 +  }, 60_000);
-+  return result;
++  return {ok: true, userId, serverId: client.room, peers: client.peers().length};
 +}
++
++export function getLiveSession() { return session; }
 +
 +export function leaveLiveEngineMatch() {
 +  clearInterval(heartbeat);
++  session?.close();
++  session = undefined;
 +  if (!activeUser) return;
 +  const body = JSON.stringify({userId: activeUser});
 +  activeUser = undefined;
@@ -121,7 +258,7 @@ index b41b102..c8ff47e 100644
  #crosshair>i{transition:left .1s ease-out,right .1s ease-out,top .1s ease-out,bottom .1s ease-out,color .1s}
  .killer-avatar{width:76px;height:88px}.killer-avatar .portrait img{transform:scale(1.35);transform-origin:center 20%}.death-credit{gap:15px}.death-credit>span{display:flex;flex-direction:column;align-items:flex-start;gap:4px;font-size:12px}.death-credit b{font-size:24px;line-height:1.15;font-weight:600}.respawn-message>p{margin-bottom:16px}.kill-entry .portrait{width:30px;height:34px}.is-dead #cosmetic-hud{display:none!important}
 diff --git a/src/ui.js b/src/ui.js
-index cf1f87b..19e2716 100644
+index cf1f87b..8dd6ee5 100644
 --- a/src/ui.js
 +++ b/src/ui.js
 @@ -112,7 +112,7 @@ export class GameUI{
@@ -129,7 +266,293 @@ index cf1f87b..19e2716 100644
   }
   changeSettings(next){Object.assign(this.settings,next);this.config.settings={...this.settings};this.syncSettings();try{localStorage.setItem('vgs-settings',JSON.stringify(this.settings));}catch{}this.options.onSettings?.({...this.settings});}
 - launch(restart=false){if(!this.isReady)return;this.config.settings={...this.settings};const callback=restart?(this.options.onRestart||this.options.onStart):this.options.onStart;try{const result=callback?.({...this.config,mode:'tdm',attachments:{...this.config.attachments},settings:{...this.settings}});result?.catch?.(error=>this.showError(error));}catch(error){this.showError(error);}}
-+ async launch(restart=false){if(!this.isReady)return;this.config.settings={...this.settings};const callback=restart?(this.options.onRestart||this.options.onStart):this.options.onStart;const config={...this.config,mode:'tdm',attachments:{...this.config.attachments},settings:{...this.settings}};const deploy=$('deploy-button');try{if($('liveengine-matchmaking')?.checked&&this.options.onMatchmaking){deploy.disabled=true;const match=await this.options.onMatchmaking(config);this.showToast(`Matched to ${match.serverId}. Local simulation only.`,3600);}const result=callback?.(config);result?.catch?.(error=>this.showError(error));}catch(error){this.showError(error);}finally{if(this.isReady)deploy.disabled=false;}}
++ async launch(restart=false){if(!this.isReady)return;this.config.settings={...this.settings};const callback=restart?(this.options.onRestart||this.options.onStart):this.options.onStart;const config={...this.config,mode:'tdm',attachments:{...this.config.attachments},settings:{...this.settings}};const deploy=$('deploy-button');try{if($('liveengine-matchmaking')?.checked&&this.options.onMatchmaking){deploy.disabled=true;const match=await this.options.onMatchmaking(config);this.showToast(`Joined ${match.serverId} with ${match.peers} other ${match.peers===1?'player':'players'}.`,3600);}const result=callback?.(config);result?.catch?.(error=>this.showError(error));}catch(error){this.showError(error);}finally{if(this.isReady)deploy.disabled=false;}}
   async ready(){
    const images=[...$('main-menu').querySelectorAll('img[src]')];
    await Promise.allSettled(images.map(image=>image.decode()));
+diff --git a/src/liveengine-net.js b/src/liveengine-net.js
+new file mode 100644
+index 0000000..622c8a8
+--- /dev/null
++++ b/src/liveengine-net.js
+@@ -0,0 +1,149 @@
++// Gogh Strike's LiveEngine data: the DTOs it registers as schemas, the channels that carry them,
++// and the mapping between those DTOs and game state. No connection, retry or pairing logic is
++// here: LiveClient owns that. This file has no DOM or three.js dependency.
++
++export const STATE_HZ = 20;
++export const INTERPOLATION_DELAY = .1;
++const MAX_EXTRAPOLATION = .25;
++const TELEPORT_DISTANCE = 8;
++
++const number = {type: 'number'};
++const vector = {type: 'array', items: number, minItems: 3, maxItems: 3};
++const text = {type: 'string', minLength: 1, maxLength: 64};
++
++// Registered by the bridge. The hub rejects frames that do not match.
++export const LIVE_SCHEMAS = [
++  {id: 'gogh-strike.state', version: '1', schema: {
++    type: 'object', additionalProperties: false,
++    required: ['n', 'team', 'role', 'x', 'y', 'z', 'yaw', 'pitch', 'alive'],
++    properties: {
++      n: {type: 'integer', minimum: 0}, team: {enum: [0, 1]}, role: text,
++      x: number, y: number, z: number, yaw: number, pitch: number, vx: number, vz: number,
++      health: {type: 'number', minimum: 0, maximum: 1000}, alive: {type: 'boolean'},
++      crouched: {type: 'boolean'}, sprinting: {type: 'boolean'}, weapon: text,
++    },
++  }},
++  {id: 'gogh-strike.event', version: '1', schema: {
++    oneOf: [
++      {type: 'object', additionalProperties: false, required: ['kind', 'weapon', 'origin', 'dir'],
++        properties: {kind: {const: 'shot'}, weapon: text, origin: vector, dir: vector}},
++      {type: 'object', additionalProperties: false, required: ['kind', 'target', 'damage', 'headshot', 'weapon'],
++        properties: {kind: {const: 'hit'}, target: text, damage: {type: 'number', minimum: 0, maximum: 1000}, headshot: {type: 'boolean'}, weapon: text}},
++      {type: 'object', additionalProperties: false, required: ['kind', 'by'],
++        properties: {kind: {const: 'down'}, by: {type: ['string', 'null'], maxLength: 64}}},
++    ],
++  }},
++];
++
++// Player state is lossy: a newer snapshot replaces a lost one. Events must all arrive.
++export const LIVE_CHANNELS = {
++  state: {schemaRef: 'gogh-strike.state@1', delivery: 'lossy', maxRate: 40},
++  event: {schemaRef: 'gogh-strike.event@1', delivery: 'reliable', maxRate: 120},
++};
++
++const finite = value => typeof value === 'number' && Number.isFinite(value);
++const round = (value, places = 3) => Math.round(value * 10 ** places) / 10 ** places;
++const triple = value => Array.isArray(value) && value.length === 3 && value.every(finite);
++const flag = value => value === true;
++
++export function encodeState(actor, n) {
++  return {
++    n, team: actor.team, role: actor.role,
++    x: round(actor.position.x), y: round(actor.position.y), z: round(actor.position.z),
++    yaw: round(actor.yaw), pitch: round(actor.pitch), vx: round(actor.velocity.x), vz: round(actor.velocity.z),
++    health: Math.max(0, round(actor.health, 1)), alive: !!actor.alive,
++    crouched: !!actor.crouched, sprinting: !!actor.sprinting, weapon: actor.weaponId,
++  };
++}
++
++// Anything arriving from a peer is checked again here: the hub validates, but a direct
++// WebRTC frame never touches the hub.
++export function decodeState(payload) {
++  if (!payload || typeof payload !== 'object') return null;
++  const {n, team, role, x, y, z, yaw, pitch, alive} = payload;
++  if (!Number.isInteger(n) || n < 0 || (team !== 0 && team !== 1) || typeof role !== 'string' || !role || role.length > 64) return null;
++  if (![x, y, z, yaw, pitch].every(finite) || typeof alive !== 'boolean') return null;
++  return {
++    n, team, role, x, y, z, yaw, pitch, alive,
++    vx: finite(payload.vx) ? payload.vx : 0, vz: finite(payload.vz) ? payload.vz : 0,
++    health: finite(payload.health) ? Math.min(1000, Math.max(0, payload.health)) : undefined,
++    crouched: flag(payload.crouched), sprinting: flag(payload.sprinting),
++    weapon: typeof payload.weapon === 'string' ? payload.weapon : undefined,
++  };
++}
++
++export const encodeShot = (weapon, origin, dir) => ({kind: 'shot', weapon, origin: [origin.x, origin.y, origin.z].map(v => round(v)), dir: [dir.x, dir.y, dir.z].map(v => round(v, 4))});
++export const encodeHit = (target, damage, headshot, weapon) => ({kind: 'hit', target, damage: round(damage, 2), headshot: !!headshot, weapon});
++export const encodeDown = by => ({kind: 'down', by: by ?? null});
++
++export function decodeEvent(payload) {
++  if (!payload || typeof payload !== 'object') return null;
++  if (payload.kind === 'shot') {
++    return typeof payload.weapon === 'string' && triple(payload.origin) && triple(payload.dir)
++      ? {kind: 'shot', weapon: payload.weapon, origin: payload.origin, dir: payload.dir} : null;
++  }
++  if (payload.kind === 'hit') {
++    return typeof payload.target === 'string' && finite(payload.damage) && payload.damage >= 0 && payload.damage <= 1000 && typeof payload.weapon === 'string'
++      ? {kind: 'hit', target: payload.target, damage: payload.damage, headshot: flag(payload.headshot), weapon: payload.weapon} : null;
++  }
++  if (payload.kind === 'down') {
++    return payload.by === null || typeof payload.by === 'string' ? {kind: 'down', by: payload.by} : null;
++  }
++  return null;
++}
++
++const wrap = angle => Math.atan2(Math.sin(angle), Math.cos(angle));
++
++// Remote players arrive at an uneven rate, so draw them slightly in the past between two
++// snapshots. Out-of-order snapshots are dropped; a large jump (a respawn) snaps instead of sliding.
++export class RemoteTrack {
++  constructor() { this.snapshots = []; this.last = -1; }
++
++  push(state, now) {
++    if (state.n <= this.last) return false;
++    this.last = state.n;
++    this.snapshots.push({...state, at: now});
++    if (this.snapshots.length > 8) this.snapshots.shift();
++    return true;
++  }
++
++  sample(now) {
++    const list = this.snapshots, target = now - INTERPOLATION_DELAY;
++    if (!list.length) return null;
++    const newest = list.at(-1);
++    if (target >= newest.at) {
++      const ahead = Math.min(MAX_EXTRAPOLATION, target - newest.at);
++      return {...newest, x: newest.x + newest.vx * ahead, z: newest.z + newest.vz * ahead};
++    }
++    if (target <= list[0].at) return {...list[0]};
++    let index = 1;
++    while (list[index].at < target) index++;
++    const from = list[index - 1], to = list[index];
++    if (Math.hypot(to.x - from.x, to.z - from.z) > TELEPORT_DISTANCE) return {...to};
++    const k = (target - from.at) / (to.at - from.at), mix = (a, b) => a + (b - a) * k;
++    return {
++      ...to, x: mix(from.x, to.x), y: mix(from.y, to.y), z: mix(from.z, to.z),
++      yaw: from.yaw + wrap(to.yaw - from.yaw) * k, pitch: mix(from.pitch, to.pitch),
++    };
++  }
++}
++
++// An existing actor stands in for the remote player: same team and role if one is free,
++// otherwise any teammate that is neither the local player nor already taken.
++export function pickRemoteSlot(actors, state) {
++  const free = actors.filter(a => a.team === state.team && !a.isPlayer && !a.remote);
++  return free.find(a => a.role === state.role) || free[0] || null;
++}
++
++// Copy a sampled state onto the stand-in actor. `knownWeapon` tells which weapon ids exist.
++export function applyRemoteState(actor, state, knownWeapon = () => true) {
++  actor.position.set(state.x, state.y, state.z);
++  actor.velocity.set(state.vx, 0, state.vz);
++  actor.yaw = state.yaw;
++  actor.pitch = state.pitch;
++  actor.alive = state.alive;
++  if (state.health !== undefined) actor.health = state.health;
++  actor.crouched = state.crouched;
++  actor.sprinting = state.sprinting;
++  if (state.weapon && state.weapon !== actor.weaponId && knownWeapon(state.weapon)) actor.weaponId = state.weapon;
++}
+diff --git a/tests/liveengine-net.test.js b/tests/liveengine-net.test.js
+new file mode 100644
+index 0000000..9c13877
+--- /dev/null
++++ b/tests/liveengine-net.test.js
+@@ -0,0 +1,125 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {
++  INTERPOLATION_DELAY, LIVE_CHANNELS, LIVE_SCHEMAS, RemoteTrack, applyRemoteState, decodeEvent, decodeState,
++  encodeDown, encodeHit, encodeShot, encodeState, pickRemoteSlot,
++} from '../src/liveengine-net.js';
++
++const vec = (x = 0, y = 0, z = 0) => ({x, y, z, set(a, b, c) { this.x = a; this.y = b; this.z = c; }});
++const actor = (extra = {}) => ({
++  team: 1, role: 'vanguard', position: vec(1.23456, 2, -3.5), velocity: vec(1, 0, -2), yaw: .5, pitch: -.25,
++  health: 120.04, alive: true, crouched: false, sprinting: true, weaponId: 'rifle', ...extra,
++});
++const schemaOf = id => LIVE_SCHEMAS.find(entry => entry.id === id).schema;
++// The hub validates the real JSON Schema; this checks the DTO and the schema name the same keys.
++const keysMatch = (schema, dto) => {
++  assert.deepEqual(schema.required.filter(key => !(key in dto)), []);
++  assert.deepEqual(Object.keys(dto).filter(key => !(key in schema.properties)), []);
++};
++
++test('schemas and channels name each other and use unique versioned ids', () => {
++  const refs = LIVE_SCHEMAS.map(entry => `${entry.id}@${entry.version}`);
++  assert.equal(new Set(refs).size, refs.length);
++  for (const channel of Object.values(LIVE_CHANNELS)) assert.ok(refs.includes(channel.schemaRef));
++  assert.equal(LIVE_CHANNELS.state.delivery, 'lossy');
++  assert.equal(LIVE_CHANNELS.event.delivery, 'reliable');
++});
++
++test('player state encodes to the schema keys, rounds, and survives a decode', () => {
++  const dto = encodeState(actor(), 7);
++  keysMatch(schemaOf('gogh-strike.state'), dto);
++  assert.equal(dto.x, 1.235);
++  assert.equal(dto.health, 120);
++  assert.equal(dto.weapon, 'rifle');
++  assert.deepEqual(decodeState(JSON.parse(JSON.stringify(dto))), {...dto});
++});
++
++test('state decoding refuses malformed or hostile payloads', () => {
++  const good = encodeState(actor(), 1);
++  for (const bad of [null, 'x', {}, {...good, n: -1}, {...good, n: 1.5}, {...good, team: 2}, {...good, x: NaN}, {...good, x: '1'}, {...good, alive: 1}, {...good, role: ''}]) {
++    assert.equal(decodeState(bad), null);
++  }
++  const clamped = decodeState({...good, health: 99999, vx: 'fast', crouched: 'yes', weapon: 5});
++  assert.equal(clamped.health, 1000);
++  assert.equal(clamped.vx, 0);
++  assert.equal(clamped.crouched, false);
++  assert.equal(clamped.weapon, undefined);
++});
++
++test('events encode to the schema and decode back; unknown kinds and bad fields are refused', () => {
++  const shot = encodeShot('rifle', vec(1, 2, 3), vec(0, 0, -1));
++  const hit = encodeHit('gogh-abc', 31.456, true, 'rifle');
++  const down = encodeDown(undefined);
++  assert.deepEqual(shot, {kind: 'shot', weapon: 'rifle', origin: [1, 2, 3], dir: [0, 0, -1]});
++  assert.deepEqual(hit, {kind: 'hit', target: 'gogh-abc', damage: 31.46, headshot: true, weapon: 'rifle'});
++  assert.deepEqual(down, {kind: 'down', by: null});
++  const branches = schemaOf('gogh-strike.event').oneOf;
++  for (const dto of [shot, hit, down]) {
++    const branch = branches.find(entry => entry.properties.kind.const === dto.kind);
++    keysMatch(branch, dto);
++    assert.deepEqual(decodeEvent(JSON.parse(JSON.stringify(dto))), dto);
++  }
++  for (const bad of [null, {}, {kind: 'nuke'}, {...shot, origin: [1, 2]}, {...shot, dir: [0, 0, NaN]}, {...hit, damage: -1}, {...hit, damage: 5000}, {...hit, target: 1}, {kind: 'down', by: 3}]) {
++    assert.equal(decodeEvent(bad), null);
++  }
++});
++
++const snapshot = (n, x, extra = {}) => ({...decodeState(encodeState(actor({position: vec(x, 0, 0), velocity: vec(0, 0, 0), yaw: 0}), n)), ...extra});
++
++test('a remote track is drawn slightly in the past, between two snapshots', () => {
++  const track = new RemoteTrack();
++  track.push(snapshot(1, 0), 10);
++  track.push(snapshot(2, 4), 10.1);
++  const mid = track.sample(10.05 + INTERPOLATION_DELAY);
++  assert.ok(Math.abs(mid.x - 2) < 1e-9);
++  assert.equal(track.sample(9 + INTERPOLATION_DELAY).x, 0);
++});
++
++test('out-of-order and repeated snapshots are dropped', () => {
++  const track = new RemoteTrack();
++  assert.equal(track.push(snapshot(5, 1), 1), true);
++  assert.equal(track.push(snapshot(4, 9), 1.1), false);
++  assert.equal(track.push(snapshot(5, 9), 1.1), false);
++  assert.equal(track.sample(2).x, 1);
++});
++
++test('extrapolation is capped and a respawn jump snaps instead of sliding', () => {
++  const track = new RemoteTrack();
++  track.push(snapshot(1, 0, {vx: 10}), 0);
++  assert.ok(Math.abs(track.sample(0 + INTERPOLATION_DELAY + 5).x - 2.5) < 1e-9);
++  track.push(snapshot(2, 50), 1);
++  assert.equal(track.sample(.5 + INTERPOLATION_DELAY).x, 50);
++  assert.equal(new RemoteTrack().sample(1), null);
++});
++
++test('yaw turns the short way round', () => {
++  const track = new RemoteTrack();
++  track.push(snapshot(1, 0, {yaw: 3.1}), 0);
++  track.push(snapshot(2, 0, {yaw: -3.1}), 1);
++  const yaw = track.sample(.5 + INTERPOLATION_DELAY).yaw;
++  assert.ok(Math.abs(Math.abs(yaw) - Math.PI) < .05);
++});
++
++test('a remote player takes a free teammate with its role, else any free teammate', () => {
++  const roster = [actor({id: 0, role: 'vanguard', isPlayer: true}), actor({id: 1, role: 'anchor'}), actor({id: 2, role: 'marksman'}), actor({id: 3, role: 'anchor', team: 0})];
++  assert.equal(pickRemoteSlot(roster, {team: 1, role: 'marksman'}).id, 2);
++  assert.equal(pickRemoteSlot(roster, {team: 1, role: 'vanguard'}).id, 1);
++  roster[1].remote = true;
++  assert.equal(pickRemoteSlot(roster, {team: 1, role: 'anchor'}).id, 2);
++  roster[2].remote = true;
++  assert.equal(pickRemoteSlot(roster, {team: 1, role: 'anchor'}), null);
++});
++
++test('applying a state moves the stand-in actor and ignores unknown weapons', () => {
++  const stand = actor({weaponId: 'pistol', alive: false});
++  const state = decodeState({...encodeState(actor(), 3), health: 55});
++  applyRemoteState(stand, state, id => id === 'rifle');
++  assert.deepEqual([stand.position.x, stand.position.y, stand.position.z], [1.235, 2, -3.5]);
++  assert.deepEqual([stand.velocity.x, stand.velocity.z], [1, -2]);
++  assert.equal(stand.alive, true);
++  assert.equal(stand.health, 55);
++  assert.equal(stand.sprinting, true);
++  assert.equal(stand.weaponId, 'rifle');
++  applyRemoteState(stand, {...state, weapon: 'laser'}, id => id === 'rifle');
++  assert.equal(stand.weaponId, 'rifle');
++});
