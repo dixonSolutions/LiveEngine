@@ -43,7 +43,7 @@ Set them programmatically when embedding. See [Rust configuration](/rust/config)
 - Integer limit variables are parsed as `usize`. A non-integer value fails startup with `<NAME> must be a positive integer`.
 - `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` must parse as an integer; otherwise `<NAME> must be an integer`.
 - `LIVEENGINE_SEED` must be an unsigned integer.
-- For the limit and window variables, a parseable zero is accepted by parsing but rejected by validation: `hub limits and timeouts must be greater than zero`. `LIVEENGINE_SEED=0` is valid.
+- For most limit and window variables, a parseable zero is accepted by parsing but rejected by validation (`LIVEENGINE_MAX_PAIR_WAIT_MS=0` disables waiting): `hub limits and timeouts must be greater than zero`. `LIVEENGINE_SEED=0` is valid.
 - The token length check uses bytes. A token shorter than 24 bytes fails startup.
 - `LIVEENGINE_ALLOWED_REMOTE_HOSTS` entries are trimmed, lowercased, and empty entries are discarded.
 - `LIVEENGINE_BIND` parse or bind failures are fatal.
@@ -145,3 +145,29 @@ See [Gogh Strike integration](/guides/gogh-strike) for commands and behavior.
 | `LIVEENGINE_INSTANCE_ID` | Stable unique service ID for loop detection |
 | `LIVEENGINE_STATE_FILE` | Durable definitions snapshot, containing plaintext remote credentials; protect with mode 0600 |
 | `LIVEENGINE_HUB_PATH` | Gogh Strike bridge path of central IDs separated by `/` |
+
+## Live and links
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `LIVEENGINE_PUBLIC_URL` | unset | Direct room WebSocket URL advertised in tickets |
+| `LIVEENGINE_TICKET_TTL_SECONDS` | 60 | Ticket lifetime |
+| `LIVEENGINE_LIVE_ALLOWED_ORIGINS` | empty | Comma-separated exact browser origins |
+| `LIVEENGINE_ICE_SERVERS` | `[]` | JSON ICE server array |
+| `LIVEENGINE_TURN_SECRET` | unset | coturn REST shared secret |
+| `LIVEENGINE_LIVE_TREE_DEPTH` | 3 | Default live registry depth |
+| `LIVEENGINE_LIVE_MAX_FRAME_BYTES` | 65536 | Frame byte limit |
+| `LIVEENGINE_LIVE_MESSAGES_PER_SECOND` | 100 | Messages per peer per second |
+| `LIVEENGINE_LIVE_BYTES_PER_SECOND` | 1048576 | Bytes per peer per second |
+| `LIVEENGINE_LIVE_SEND_QUEUE` | 64 | Per-peer send queue |
+| `LIVEENGINE_LIVE_MAX_CONNECTIONS` | 4096 | Global connection cap |
+| `LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM` | 256 | Room connection cap |
+| `LIVEENGINE_LIVE_IDLE_SECONDS` | 60 | Idle timeout |
+| `LIVEENGINE_LIVE_PING_SECONDS` | 20 | Ping interval |
+| `LIVEENGINE_LIVE_RESUME_MILLIS` | 500 | Presence resume window |
+| `LIVEENGINE_SIGNAL_MAX_BYTES` | 16384 | Signalling frame cap |
+| `LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND` | 2000 | Link message budget |
+| `LIVEENGINE_LINK_MAX_BYTES_PER_SECOND` | 16777216 | Link byte budget |
+| `LIVEENGINE_INSTANCE_ID_FILE` | derived | File for generated service instance ID when no explicit ID is set |
+
+Browsers behind strict NAT need a reachable TURN server. See [peer-to-peer](/guides/peer-to-peer).

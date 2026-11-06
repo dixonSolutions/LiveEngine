@@ -1,0 +1,16 @@
+---
+title: "Peer-to-peer"
+---
+
+`LiveClient` uses the room socket for `signal.offer`, `signal.answer` and `signal.ice`, then negotiates a WebRTC data channel. A peer-targeted `send` uses the direct channel when open and automatically falls back to the hub relay. Broadcast defaults to the relay. The hub does not terminate WebRTC or carry media.
+
+```js
+import { LiveClient } from '@dixonsolutions/liveengine/live-client';
+const client = new LiveClient(descriptor, { renew: getFreshDescriptor });
+client.on('message', frame => console.log(frame.from, frame.via, frame.payload));
+await client.connect();
+client.connectPeer('bob');
+client.send({ text: 'hello' }, { to: 'bob' });
+```
+
+`descriptor` is the result of `HubClient.pair`, obtained from your own authenticated application backend; `getFreshDescriptor` is your renewal function. Set `LIVEENGINE_ICE_SERVERS` to a JSON array of ICE server objects. For coturn REST credentials configure `LIVEENGINE_TURN_SECRET` on the hub and TURN URLs in that array. Browsers behind strict NAT need a reachable TURN server.

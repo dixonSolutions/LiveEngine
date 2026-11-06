@@ -1,0 +1,7 @@
+---
+title: "Hub links"
+---
+
+A remote administrator issues a link credential with `POST /v1/hubs/{id}/link-credentials`. Save the returned `token` securely: it is returned once and can request only service-role tickets on that hub. `DELETE` on the same route revokes all its link credentials.
+
+Create a link using `POST /v1/links` with `id`, remote `address`, `remoteToken` (the link credential), remote `hubId`, `userId` and `serverId`. The service user must be paired in the remote room. To bridge a local room, also set both `localHubId` and `localRoom`. Remote hosts must pass `LIVEENGINE_ALLOWED_REMOTE_HOSTS`; use HTTPS. Links reconnect, propagate presence and room frames, and enforce channel schemas at both ends. `GET /v1/links` and `GET /v1/links/{id}` report status without secrets; delete by ID or `DELETE /v1/links?id=...`. Definitions persist in the private state file. See [hosting](https://github.com/dixonSolutions/LiveEngine/blob/main/docs/hosting.md) for budgets and details.

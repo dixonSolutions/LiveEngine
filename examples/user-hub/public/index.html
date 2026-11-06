@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LiveEngine User Hub</title>
   <link rel="stylesheet" href="/style.css">
-  <script src="/app.js" defer></script>
+  <script type="module" src="/app.js"></script>
 </head>
 <body>
   <header class="topbar">
@@ -105,6 +105,18 @@
       </div>
     </section>
 
+    <section class="panel">
+      <h2>Live hub tree</h2><pre id="tree">Connecting…</pre>
+    </section>
+    <section class="panel">
+      <h2>Room messages</h2>
+      <p>Join the same room in two browser contexts with different IDs, then connect both.</p>
+      <div class="actions"><button id="live-connect">Connect live</button><button id="live-disconnect">Disconnect</button></div>
+      <p id="live-status">Disconnected</p>
+      <label class="field">Message <input id="live-message" value="Hello from LiveEngine"></label>
+      <div class="actions"><button id="send-relay">Broadcast via relay</button><button id="send-direct">Send to first peer (direct when available)</button></div>
+      <ol id="messages" class="log"></ol>
+    </section>
     <section class="panel log-panel" aria-labelledby="log-title">
       <div class="panel-head">
         <h2 id="log-title">Event log</h2>

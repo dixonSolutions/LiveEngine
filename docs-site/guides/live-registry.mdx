@@ -1,0 +1,9 @@
+---
+title: "Live registry"
+---
+
+An admin issues `POST /v1/tickets/watch` with `{ "path": [], "depth": 3 }`. Connect to `/v1/live/registry` and send `{ "type": "auth", "ticket": "...", "path": [], "depth": 3 }` as the first frame. Server clients may send `token` instead of `ticket`; browsers should never receive the admin token. Configure `LIVEENGINE_LIVE_ALLOWED_ORIGINS` for browser origins.
+
+The first frame is a snapshot with `seq`, `effectiveDepth` and `hubs`. Subsequent `added`, `removed`, `updated` and `status` frames have ordered sequence numbers. On a gap send `{ "type": "resnapshot" }`. Nodes below the live depth have `childrenLive: false` and remain available through `/v1/tree`. Depth is clamped by the central's `liveDepth` and `LIVEENGINE_MAX_DEPTH`; the default is `LIVEENGINE_LIVE_TREE_DEPTH=3`. Remote failures affect their branch. Watches omit addresses and credentials.
+
+Node clients can use `hub.watchRegistry({path: [], depth: 3})`; its watch stores `snapshot`, emits diffs and requests a resnapshot on a gap. Call `close()` when finished.

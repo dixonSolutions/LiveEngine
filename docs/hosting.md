@@ -274,7 +274,7 @@ remote connections. `GET /v1/links` and `GET /v1/links/{id}` report
 address and credential. Definitions and credentials are stored in the private
 state file, while connection status is rebuilt on startup. Links retry with
 bounded exponential backoff and enforce per-link frame and inbound rate limits.
-This link lifecycle does not yet forward room messages between services.
+A link bridges room messages when both `localHubId` and `localRoom` are supplied.
 
 Adding `localHubId` and `localRoom` bridges that local room to the remote room
 over the same socket. Frames from peers on either side reach the other side

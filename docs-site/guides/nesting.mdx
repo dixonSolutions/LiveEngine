@@ -15,6 +15,6 @@ await hub.route(['eu', 'games'], 'call', { id: 'chess', method: 'stats', args: [
 console.log(await hub.tree(3));
 ```
 
-`route` supports `list`, `get`, `register`, `delete`, `call`, and `tree`; an empty path selects the current service. `get`, `delete`, and `call` identify the target in `body.id`. Tree branches report `ok` or `error` independently. Discovery and forwarding are bounded. `LIVEENGINE_MAX_DEPTH` defaults to 8, maximum 16. Forwarding uses a trace of service instance IDs to detect loops; repeated IDs return 508. Set `LIVEENGINE_INSTANCE_ID` to a unique stable value per service or use the persisted generated identity.
+`route` supports `list`, `get`, `register`, `delete`, `call`, `tree`, `ticket`, `watchTicket`, `authorize`, `discover`, and `pair`; an empty path selects the current service. `get`, `delete`, and `call` identify the target in `body.id`. Tree branches report `ok` or `error` independently. Discovery and forwarding are bounded. `LIVEENGINE_MAX_DEPTH` defaults to 8, maximum 16. Forwarding uses a trace of service instance IDs to detect loops; repeated IDs return 508. Set `LIVEENGINE_INSTANCE_ID` to a unique stable value per service or use the persisted generated identity.
 
 Flat routes still address immediate children. Templates, schema inheritance, `ifAbsent`, TTL expiry and central `maxHubs` quotas also apply to nested registration. See [schemas](/guides/schemas) and [remote hubs](/guides/remote-hubs).

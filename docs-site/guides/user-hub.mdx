@@ -22,7 +22,10 @@ Start a hub, or use the Compose services:
 
 ```sh
 export LIVEENGINE_TOKEN="$(openssl rand -hex 32)"
-LIVEENGINE_BIND=127.0.0.1:8787 liveengine-hub &
+LIVEENGINE_BIND=127.0.0.1:8787 \
+LIVEENGINE_PUBLIC_URL=ws://127.0.0.1:8787/v1/live \
+LIVEENGINE_LIVE_ALLOWED_ORIGINS=http://127.0.0.1:8970 \
+liveengine-hub
 ```
 
 ```sh
@@ -86,9 +89,15 @@ println!("{:.3} ms average", stats.avg_ms);
 | `POST /api/join-room` | Join a specific room |
 | `POST /api/leave` | Leave the current room |
 | `POST /api/rooms` | Create a demo room |
+| `POST /api/ticket` | Issue a room ticket for a paired user |
+| `POST /api/watch` | Issue a registry watch ticket |
 
-`POST` routes validate `Host` and `Origin`, enforce a 64 KiB body limit, and map hub failures to `409` for matchmaking conflicts and `503` for upstream failures.
+API routes validate `Host` and any `Origin` header; POST bodies are limited to 64 KiB. Matchmaking conflicts return `409` and upstream failures return `503`.
 
 ## Reuse the pattern
 
 The same client connection shape works in [Next.js](/frameworks/nextjs), [Nitro](/frameworks/nitro), and [SvelteKit](/frameworks/sveltekit). For a multi-instance deployment, point every frontend at one central hub instead of running a process-local `LiveEngine`.
+
+## Live tree and two-peer messages
+
+Open two browser contexts with different IDs. Create a room, register and join each user, then select **Connect live** in both. Broadcast uses the relay; targeted messages use a data channel when available and the relay otherwise. The interface displays the transport and updates the live tree. The bridge issues short-lived tickets and must stay on a trusted loopback interface. Set the hub's allowed origins and direct public URL as shown above. Strict NAT can require a reachable TURN server; see [peer-to-peer](/guides/peer-to-peer).

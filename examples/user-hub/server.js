@@ -130,6 +130,7 @@ async function stateFor(userId) {
 
 function routeApi(request, response, url) {
   return (async () => {
+    checkRequest(request);
     if (request.method === 'GET' && url.pathname === '/api/config') {
       return sendJson(response, 200, {
         hubId,
@@ -155,6 +156,22 @@ function routeApi(request, response, url) {
 
     checkRequest(request);
     const body = await readJson(request);
+
+    if (url.pathname === '/api/watch') {
+      await ensureReady();
+      const watch = await hub.watchTicket({ path: [], depth: 3 });
+      const socket = new URL('/v1/live/registry', hubUrl);
+      socket.protocol = socket.protocol === 'https:' ? 'wss:' : 'ws:';
+      return sendJson(response, 200, { ...watch, url: socket.href });
+    }
+    if (url.pathname === '/api/ticket') {
+      const userId = String(body.userId || '');
+      if (!userIdPattern.test(userId)) return fail(response, 400, 'invalid userId');
+      const current = await stateFor(userId);
+      if (!current.user?.serverId) return fail(response, 409, 'join a room first');
+      const ticket = await hub.ticket(hubId, { userId, serverId: current.user.serverId });
+      return sendJson(response, 200, { ...ticket, userId, room: current.user.serverId, link: 'peer-peer' });
+    }
 
     if (url.pathname === '/api/join') {
       const userId = String(body.userId || '');
@@ -220,6 +237,10 @@ function routeApi(request, response, url) {
 }
 
 function serveStatic(request, response, url) {
+  if (url.pathname === '/live-client.mjs') {
+    response.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' });
+    return fs.createReadStream(path.join(__dirname, '../../lib/live-client.mjs')).pipe(response);
+  }
   const file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
   const resolved = path.resolve(publicDir, file);
   if (!resolved.startsWith(publicDir + path.sep)) {

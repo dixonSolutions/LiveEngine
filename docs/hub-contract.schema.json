@@ -106,6 +106,15 @@
           "minimum": 1,
           "maximum": 16,
           "description": "Maximum live registry depth for a central, bounded by the service maximum."
+        },
+        "channels": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/LiveChannel"
+          }
         }
       },
       "allOf": [
@@ -263,6 +272,15 @@
         "stale": {
           "type": "boolean",
           "description": "True when a refreshed registry no longer lists this imported hub."
+        },
+        "channels": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/LiveChannel"
+          }
         }
       }
     },
@@ -640,7 +658,12 @@
             "register",
             "delete",
             "call",
-            "tree"
+            "tree",
+            "ticket",
+            "watchTicket",
+            "authorize",
+            "discover",
+            "pair"
           ]
         },
         "body": {
@@ -842,6 +865,332 @@
           ]
         }
       }
+    },
+    "DiscoverRequest": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "kind": {
+          "enum": [
+            "hub",
+            "peer",
+            "any"
+          ]
+        },
+        "requirements": {
+          "type": [
+            "object",
+            "array",
+            "null"
+          ]
+        }
+      }
+    },
+    "PairRequest": {
+      "type": "object",
+      "required": [
+        "subject",
+        "target"
+      ],
+      "properties": {
+        "path": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16
+        },
+        "subject": {
+          "type": "object",
+          "required": [
+            "kind",
+            "id",
+            "scopes"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "peer",
+                "hub"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "scopes": {
+              "type": "object"
+            },
+            "credential": {
+              "type": "string",
+              "writeOnly": true
+            }
+          }
+        },
+        "target": {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "peer",
+                "hub",
+                "any"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "requirements": {
+              "type": [
+                "object",
+                "array",
+                "null"
+              ]
+            }
+          }
+        },
+        "waitMs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For peer subjects targeting peer or any; capped by LIVEENGINE_MAX_PAIR_WAIT_MS."
+        }
+      }
+    },
+    "LinkCredentialResponse": {
+      "type": "object",
+      "required": [
+        "token"
+      ],
+      "properties": {
+        "token": {
+          "type": "string",
+          "writeOnly": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "TicketRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "userId",
+        "serverId"
+      ],
+      "properties": {
+        "userId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "serverId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "enum": [
+            "peer",
+            "service"
+          ],
+          "default": "peer"
+        },
+        "credential": {
+          "type": "string",
+          "writeOnly": true
+        }
+      }
+    },
+    "TicketResponse": {
+      "type": "object",
+      "required": [
+        "ticket",
+        "url",
+        "expiresAt"
+      ],
+      "properties": {
+        "ticket": {
+          "type": "string",
+          "writeOnly": true
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "expiresAt": {
+          "type": "integer"
+        }
+      }
+    },
+    "WatchTicketResponse": {
+      "type": "object",
+      "required": [
+        "ticket",
+        "expiresAt"
+      ],
+      "properties": {
+        "ticket": {
+          "type": "string",
+          "writeOnly": true
+        },
+        "expiresAt": {
+          "type": "integer"
+        }
+      }
+    },
+    "LiveEnvelope": {
+      "type": "object",
+      "required": [
+        "v",
+        "type",
+        "channel",
+        "seq",
+        "payload"
+      ],
+      "properties": {
+        "v": {
+          "type": "number",
+          "description": "LiveClient sends 1."
+        },
+        "type": {
+          "type": "string",
+          "description": "Application type; auth, welcome, presence, error, link.* and signal.* are reserved."
+        },
+        "channel": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        },
+        "from": {
+          "type": "string",
+          "readOnly": true
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "payload": {}
+      }
+    },
+    "LiveChannel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "delivery"
+      ],
+      "properties": {
+        "schemaRef": {
+          "type": "string"
+        },
+        "delivery": {
+          "enum": [
+            "reliable",
+            "lossy"
+          ]
+        },
+        "maxRate": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
     }
+  },
+  "x-routes": {
+    "/health": [
+      "GET"
+    ],
+    "/v1/ping": [
+      "GET"
+    ],
+    "/v1/contract": [
+      "GET"
+    ],
+    "/v1/contract/schema": [
+      "GET"
+    ],
+    "/v1/schemas": [
+      "GET",
+      "POST"
+    ],
+    "/v1/schemas/{id}": [
+      "GET",
+      "DELETE"
+    ],
+    "/v1/templates": [
+      "GET",
+      "POST"
+    ],
+    "/v1/templates/{name}": [
+      "GET",
+      "DELETE"
+    ],
+    "/v1/tickets/watch": [
+      "POST"
+    ],
+    "/v1/route": [
+      "POST"
+    ],
+    "/v1/discover": [
+      "POST"
+    ],
+    "/v1/pair": [
+      "POST"
+    ],
+    "/v1/links": [
+      "GET",
+      "POST",
+      "DELETE"
+    ],
+    "/v1/links/{id}": [
+      "GET",
+      "DELETE"
+    ],
+    "/v1/tree": [
+      "GET"
+    ],
+    "/v1/hubs": [
+      "GET",
+      "POST"
+    ],
+    "/v1/hubs/{id}": [
+      "GET",
+      "DELETE"
+    ],
+    "/v1/hubs/{id}/call": [
+      "POST"
+    ],
+    "/v1/hubs/{id}/tickets": [
+      "POST"
+    ],
+    "/v1/hubs/{id}/link-credentials": [
+      "POST",
+      "DELETE"
+    ],
+    "/v1/registries/import": [
+      "POST"
+    ],
+    "/v1/registry/export": [
+      "GET"
+    ],
+    "/v1/live": [
+      "GET (WebSocket)"
+    ],
+    "/v1/live/registry": [
+      "GET (WebSocket)"
+    ]
   }
 }

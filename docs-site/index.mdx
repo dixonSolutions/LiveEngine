@@ -73,7 +73,7 @@ LiveEngine is deliberately small and explicit about what it does not do:
 - **Request timeouts do not roll back work.** An internal handler that already started continues on a blocking worker. Capacity stays occupied until it finishes. Reconcile state before retrying a mutation.
 - **Schemas use JSON Schema 2020-12.** References must be local JSON pointers and are bounded.
 - **Remote imports can refresh.** Set `refreshSeconds` to discover changes and mark missing entries stale.
-- **Gogh Strike integration validates matchmaking and connectivity.** Gameplay remains locally simulated; it does not synchronize multiplayer state.
+- **Gogh Strike integration exchanges player state and events** using LiveClient with direct and relay transports.
 - **Ping is a latency probe, not a matchmaking input.** Use `HubClient.ping()` or `liveengine-hub ping` to measure a hub; add your own scope/requirement rules if you want ping to influence matching.
 
 ## Where to go next

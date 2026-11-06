@@ -1,0 +1,7 @@
+---
+title: "Custom auth and provider hosting"
+---
+
+Register a hub with `auth` to verify a presented credential before issuing a ticket. Built-in kinds are `token`, `hmac`, `jwt` and `webhook`; the schema reference describes their fields. JWT uses a configured `HS256` or `EdDSA` algorithm, never an algorithm selected by the token. Webhook hosts must be allowlisted and failures are closed. The verifier resolves identity and user-defined claims; identity must match the requested user ID. Embedded Rust services can register a compiled verifier through `HubService::register_verifier` and use `{ "kind": "custom", "name": "..." }`.
+
+A central registration with `hosting: "provider"` creates the hub on the same service and returns a scoped `credential` once. It is used as bearer on `/v1/route` for that hub and its subtree, not its parent or siblings. Store it securely. The state snapshot contains secrets and must be mode 0600. See [hosting](https://github.com/dixonSolutions/LiveEngine/blob/main/docs/hosting.md) for verifier formats and scoped operations.

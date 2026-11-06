@@ -16,7 +16,10 @@ Start a hub, or use the local Compose services:
 
 ```sh
 export LIVEENGINE_TOKEN="$(openssl rand -hex 32)"
-LIVEENGINE_BIND=127.0.0.1:8787 liveengine-hub &
+LIVEENGINE_BIND=127.0.0.1:8787 \
+LIVEENGINE_PUBLIC_URL=ws://127.0.0.1:8787/v1/live \
+LIVEENGINE_LIVE_ALLOWED_ORIGINS=http://127.0.0.1:8970 \
+liveengine-hub
 ```
 
 ```sh
@@ -60,5 +63,13 @@ The bridge creates the configured internal hub if it does not exist. Binding to 
 | `POST /api/join-room` | Join a specific room |
 | `POST /api/leave` | Leave the current room |
 | `POST /api/rooms` | Create a demo room |
+| `POST /api/ticket` | Issue a room ticket for a paired user |
+| `POST /api/watch` | Issue a registry watch ticket |
 
-`POST` routes validate the `Host` and `Origin` headers and limit request bodies to 64 KiB.
+API routes validate `Host` and any `Origin` header; POST bodies are limited to 64 KiB.
+
+## Live tree and messaging
+
+Open two separate browser contexts, choose different user IDs, create a room, and register each user with auto-match disabled before joining that room. Select **Connect live** in each. Broadcast uses the relay; the targeted button uses WebRTC when a data channel is open and otherwise the relay. Transport and incoming message paths are shown in the interface. The live tree uses a scoped watch ticket and resnapshots after changes. The bridge obtains fresh room tickets on reconnect.
+
+The hub's public URL must be reachable by each browser and its origin must be allowed. Configure `LIVEENGINE_ICE_SERVERS` and a reachable TURN server for browsers behind strict NAT. The demo bridge has no application authentication and is suitable only for trusted local use.

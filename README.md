@@ -250,7 +250,7 @@ See [hosting configuration](docs/hosting.md) for environment settings and deploy
 
 The integration clones [petergpt/gogh-strike](https://github.com/petergpt/gogh-strike), adds an optional lobby, and sends matchmaking requests through a server bridge to the same internal/external hub contract. See [integration instructions](integrations/gogh-strike/README.md).
 
-Gogh Strike's gameplay is locally simulated. The integration validates registration, remote connectivity and matchmaking; it does not add multiplayer state synchronization.
+The Gogh Strike integration exchanges player state and events through LiveClient, using a direct data channel when available and the hub relay as fallback.
 
 ## Verification and releases
 
@@ -274,3 +274,7 @@ MIT licensed. See [LICENSE](LICENSE).
 Register a local or remote `central` hub and use `HubClient.route(["region"], "register", {id: "game", mode: "internal"})` to create a child. `tree(depth)` lists branches, including errors. Depth defaults to 8 and is capped at 16; repeated instance IDs return 508. Use `LIVEENGINE_INSTANCE_ID` for a stable unique service identity.
 
 Publish immutable JSON Schema 2020-12 definitions with `createSchema`, bind them using `schemaRef`, or supply inline `scopeSchema`, `userSchema`, and `serverSchema`. Children inherit the nearest schemas. Templates support on-demand creation, `ifAbsent`, TTLs and quotas. See [hosting](docs/hosting.md). The CLI can access all authenticated routes with `liveengine-hub request <url> <method> <route> [json-body]`, reading its token from `LIVEENGINE_TOKEN`.
+
+### Live rooms and the user hub demo
+
+The [user hub example](examples/user-hub/README.md) displays the live registry and exchanges messages between two room peers, with relay and direct paths. Set `LIVEENGINE_PUBLIC_URL` and `LIVEENGINE_LIVE_ALLOWED_ORIGINS` on the hub; browser clients receive short-lived tickets from the local bridge, never the admin token. Strict NAT can require a reachable TURN server. See [hosting](docs/hosting.md) for discovery, pairing, scoped provider credentials, link credentials and authentication.

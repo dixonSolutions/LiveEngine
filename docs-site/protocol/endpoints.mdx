@@ -10,7 +10,7 @@ export HUB=http://127.0.0.1:8787
 export TOKEN="$LIVEENGINE_TOKEN"
 ```
 
-Every route except `/health` and `/v1/ping` requires:
+HTTP routes except `/health` and `/v1/ping` require:
 
 ```http
 Authorization: Bearer <token>
@@ -70,7 +70,7 @@ curl --fail --silent "$HUB/v1/ping"
 
 ## GET /v1/contract
 
-Capability handshake.
+Capability handshake. The router also exposes discovery, pairing, room WebSockets and individual link routes; see the full route table below.
 
 ```sh
 curl --silent -H "Authorization: Bearer $TOKEN" "$HUB/v1/contract"
@@ -81,13 +81,11 @@ curl --silent -H "Authorization: Bearer $TOKEN" "$HUB/v1/contract"
   "protocol": "liveengine.hub/v1",
   "version": 1,
   "endpoints": [
-    "/health",
-    "/v1/ping",
-    "/v1/contract",
-    "/v1/hubs",
-    "/v1/hubs/{id}",
-    "/v1/hubs/{id}/call",
-    "/v1/registries/import"
+    "/health", "/v1/ping", "/v1/contract", "/v1/hubs", "/v1/hubs/{id}",
+    "/v1/hubs/{id}/call", "/v1/hubs/{id}/tickets", "/v1/hubs/{id}/link-credentials",
+    "/v1/tickets/watch", "/v1/live/registry", "/v1/links", "/v1/registries/import",
+    "/v1/registry/export", "/v1/schemas", "/v1/schemas/{id}", "/v1/templates",
+    "/v1/templates/{name}", "/v1/route", "/v1/tree"
   ],
   "schema": "/v1/contract/schema"
 }
@@ -371,7 +369,7 @@ All routes below require the admin bearer token.
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| POST | `/v1/route` | `{path, op, body}`; op is `get`, `list`, `register`, `delete`, `call`, or `tree` |
+| POST | `/v1/route` | `{path, op, body}`; op is `get`, `list`, `register`, `delete`, `call`, `tree`, `ticket`, `watchTicket`, `authorize`, `discover`, or `pair` |
 | GET | `/v1/tree?depth=2` | Bounded recursive discovery with per-branch status |
 | GET, POST | `/v1/schemas` | List or create immutable `{id, version, schema}` definitions |
 | GET, DELETE | `/v1/schemas/{id@version}` | Read or delete a schema; in-use deletion returns 409 |
@@ -380,3 +378,19 @@ All routes below require the admin bearer token.
 | GET | `/v1/registry/export` | Export hub and schema definitions without credentials |
 
 For route `get`, `delete` and `call`, provide `body.id`; calls also require `method` and optional `args`. A path selects central namespaces, and an empty path targets the root. A registration accepts `template`, `ifAbsent`, `schemaRef`, `userSchema`, `serverSchema`, and `maxHubs`. Registry import accepts `refreshSeconds`. See [nesting](/guides/nesting) and [schemas](/guides/schemas).
+
+## Live, pairing and links
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| POST | `/v1/discover` | Find matching hubs and peers |
+| POST | `/v1/pair` | Pair a subject and return a connection descriptor; optional `waitMs` |
+| POST | `/v1/hubs/{id}/tickets` | Issue a single-use room ticket to a paired participant |
+| POST | `/v1/tickets/watch` | Issue a path- and depth-scoped registry watch ticket |
+| GET (WebSocket) | `/v1/live` | Authenticate in the first frame with a room ticket |
+| GET (WebSocket) | `/v1/live/registry` | Authenticate in the first frame with an admin token or watch ticket |
+| GET, POST, DELETE | `/v1/links` | List, create, or delete by `?id=` |
+| GET, DELETE | `/v1/links/{id}` | Inspect or delete a link |
+| POST, DELETE | `/v1/hubs/{id}/link-credentials` | Issue a link token once or revoke all link tokens for the hub |
+
+WebSocket browser origins must be allowed. Link tokens can request only service-role tickets on their own hub. See [live rooms](/guides/live-rooms) and [hub links](/guides/hub-links).

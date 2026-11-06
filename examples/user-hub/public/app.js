@@ -1,3 +1,5 @@
+import { LiveClient } from '/live-client.mjs';
+
 'use strict';
 
 const $ = id => document.getElementById(id);
@@ -260,6 +262,7 @@ async function joinRoom(serverId) {
 async function leave() {
   try {
     state.userId = currentUserId();
+    live?.close();
     await api('/api/leave', { method: 'POST', body: JSON.stringify({ userId: state.userId }) });
     log(`Left the room as ${state.userId}`);
     setMessage('Left the room.', 'good');
@@ -285,8 +288,54 @@ async function createRoom() {
   }
 }
 
+
+let live;
+async function ticket() {
+  return api('/api/ticket', { method: 'POST', body: JSON.stringify({ userId: state.userId }) });
+}
+async function connectLive() {
+  try {
+    state.userId = currentUserId();
+    live?.close();
+    live = new LiveClient(await ticket(), { renew: ticket });
+    live.on('message', frame => {
+      const item = document.createElement('li');
+      item.textContent = `${frame.from} via ${frame.via}: ${JSON.stringify(frame.payload)}`;
+      $('messages').prepend(item);
+    });
+    const update = () => { $('live-status').textContent = `Peers: ${live.peers().map(p => `${p} (${live.transportOf(p)})`).join(', ') || 'none'}`; };
+    live.on('presence', update); live.on('transport', update); live.on('welcome', update);
+    live.on('close', () => { $('live-status').textContent = 'Disconnected'; });
+    await live.connect(); update();
+  } catch (error) { reportError(error); }
+}
+async function watchTree() {
+  try {
+    const watch = await api('/api/watch', { method: 'POST', body: '{}' });
+    const socket = new WebSocket(watch.url);
+    let seq = -1;
+    socket.onopen = () => socket.send(JSON.stringify({ type: 'auth', ticket: watch.ticket, path: [], depth: 3 }));
+    socket.onmessage = event => {
+      const frame = JSON.parse(event.data);
+      if (frame.type === 'snapshot') { seq = frame.seq; $('tree').textContent = JSON.stringify(frame, null, 2); }
+      else if (typeof frame.seq === 'number') {
+        if (frame.seq !== seq + 1) { socket.send(JSON.stringify({ type: 'resnapshot' })); return; }
+        seq = frame.seq;
+        // Refresh the displayed tree after an ordered diff.
+        socket.send(JSON.stringify({ type: 'resnapshot' }));
+      }
+    };
+    socket.onclose = () => { $('tree').textContent = 'Watch disconnected; retrying…'; setTimeout(watchTree, 3000); };
+  } catch (error) { $('tree').textContent = String(error.message); setTimeout(watchTree, 3000); }
+}
+
 function init() {
   $('user-id').value = state.userId;
+  $('live-connect').onclick = connectLive;
+  $('live-disconnect').onclick = () => live?.close();
+  $('send-relay').onclick = () => live?.send({ text: $('live-message').value });
+  $('send-direct').onclick = () => { const peer = live?.peers()[0]; if (peer) live.send({ text: $('live-message').value }, { to: peer }); };
+  watchTree();
   $('find-match').addEventListener('click', join);
   $('leave').addEventListener('click', leave);
   $('refresh').addEventListener('click', () => { refreshState(); pingNow(); });

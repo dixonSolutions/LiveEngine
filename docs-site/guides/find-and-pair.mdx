@@ -1,0 +1,11 @@
+---
+title: "Find and pair"
+---
+
+Use `POST /v1/discover` with `{ "path": [], "depth": 2, "kind": "hub", "requirements": {} }` to search bounded nested hubs. `kind` can be `hub`, `peer` or `any`. Discovery returns candidates without credentials or private addresses.
+
+`POST /v1/pair` accepts `path`, a `subject` with `kind`, `id` and user-defined `scopes`, and a `target` with `kind`, optional `id` and `requirements`. The descriptor contains `link`, `room`, `userId`, `ticket`, `url` and `transports`. Pass it to `LiveClient`. The same operations are available through `/v1/route` and `HubClient.discover` / `HubClient.pair`.
+
+For a peer subject targeting `peer` or `any`, `waitMs` waits for a matching peer without polling. It is capped by `LIVEENGINE_MAX_PAIR_WAIT_MS` (30000 by default); expiry returns 408. `LIVEENGINE_MAX_PENDING_PAIRS` bounds waiting peers. Calls themselves queue for up to `LIVEENGINE_CALL_QUEUE_MS` (1000 by default), with at most `LIVEENGINE_MAX_QUEUED_CALLS` (1024) waiting.
+
+A waiting peer must already be registered as a user of a hub so other peers can discover it.

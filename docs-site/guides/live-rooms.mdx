@@ -1,0 +1,9 @@
+---
+title: "Live rooms"
+---
+
+An administrator pairs a user into a room, then requests `POST /v1/hubs/{id}/tickets` with `{ "userId": "alice", "serverId": "room-1", "role": "peer" }`. For nested hubs use the `ticket` operation on `/v1/route` with the hub ID in `body`. A hub with auth also needs `credential`. The response contains `ticket`, `url` and `expiresAt`; the service that holds the room supplies the URL. Set `LIVEENGINE_PUBLIC_URL` to its reachable WebSocket endpoint, for example `ws://127.0.0.1:9000/v1/live`.
+
+The browser sends `{ "type": "auth", "ticket": "..." }` as its first WebSocket frame within five seconds. Tickets are single-use and short-lived; a reconnect needs a fresh one. Set `LIVEENGINE_LIVE_ALLOWED_ORIGINS` to exact comma-separated browser origins. Keep administrator tokens on the application server. The [user hub example](/guides/user-hub) demonstrates this flow.
+
+Application frames use `v`, `type`, `channel`, optional `to`, `seq` and `payload`. The server stamps `from`; it rejects spoofing. `presence`, `welcome`, `error`, `auth`, `link.*` and `signal.*` are reserved for the protocol. Declare custom channels and optional payload schema references on the hub. Reliable queues disconnect slow consumers; lossy queues may drop frames. See [limits](/reference/limits).
