@@ -1,5 +1,11 @@
 //! Discovery of hosted hubs and their peers.
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use crate::{
     hub::{
@@ -15,6 +21,160 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::oneshot;
+
+/// What a waiting peer is told when another peer pairs with it.
+pub(crate) struct Matched {
+    path: Vec<String>,
+    hub_id: String,
+    room: String,
+}
+
+struct Waiting {
+    token: u64,
+    kind: Value,
+    id: Value,
+    requirements: Value,
+    wake: oneshot::Sender<Matched>,
+}
+
+/// Peers whose `pair` request is waiting for a partner, by id. Guarded by one mutex that is
+/// never held across an await, so a claim removes the waiter and the claimer together.
+#[derive(Default)]
+pub(crate) struct PendingPairs {
+    state: Mutex<(u64, HashMap<String, Waiting>)>,
+}
+
+pub(crate) enum Claim {
+    /// The caller was itself claimed meanwhile and will be woken.
+    Lost,
+    /// The candidate waits but does not accept the caller.
+    Skip,
+    /// The candidate is not waiting in a request.
+    Direct,
+    /// The candidate was removed from the queue; wake it once the pairing holds.
+    Taken(oneshot::Sender<Matched>),
+}
+
+pub(crate) enum Enter {
+    Duplicate,
+    Full,
+}
+
+/// A queue entry that leaves the queue when dropped, so a disconnected request frees its seat.
+pub(crate) struct Seat {
+    state: Arc<Inner>,
+    id: String,
+    token: u64,
+}
+
+impl Seat {
+    fn holds(&self) -> bool {
+        self.state
+            .pending
+            .lock()
+            .1
+            .get(&self.id)
+            .is_some_and(|w| w.token == self.token)
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        self.state.pending.remove(&self.id, self.token);
+    }
+}
+
+impl PendingPairs {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (u64, HashMap<String, Waiting>)> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn remove(&self, id: &str, token: u64) -> bool {
+        let mut guard = self.lock();
+        if guard.1.get(id).is_some_and(|w| w.token == token) {
+            guard.1.remove(id);
+            return true;
+        }
+        false
+    }
+
+    fn enter(
+        &self,
+        state: &Arc<Inner>,
+        id: &str,
+        target: &serde_json::Map<String, Value>,
+        requirements: Value,
+    ) -> Result<(Seat, oneshot::Receiver<Matched>), Enter> {
+        let mut guard = self.lock();
+        if guard.1.contains_key(id) {
+            return Err(Enter::Duplicate);
+        }
+        if guard.1.len() >= state.config.max_pending_pairs {
+            return Err(Enter::Full);
+        }
+        guard.0 += 1;
+        let token = guard.0;
+        let (wake, receiver) = oneshot::channel();
+        guard.1.insert(
+            id.to_owned(),
+            Waiting {
+                token,
+                kind: target.get("kind").cloned().unwrap_or(Value::Null),
+                id: target.get("id").cloned().unwrap_or(Value::Null),
+                requirements,
+                wake,
+            },
+        );
+        Ok((
+            Seat {
+                state: state.clone(),
+                id: id.to_owned(),
+                token,
+            },
+            receiver,
+        ))
+    }
+
+    /// Take `candidate` out of the queue for a caller with these `scopes`. When the caller
+    /// waits too (`seat`), both leave the queue in this one step, or neither does.
+    fn claim(
+        &self,
+        seat: Option<&Seat>,
+        subject_id: &str,
+        scopes: &Value,
+        candidate: &str,
+    ) -> Claim {
+        let mut guard = self.lock();
+        if let Some(seat) = seat {
+            if !guard.1.get(&seat.id).is_some_and(|w| w.token == seat.token) {
+                return Claim::Lost;
+            }
+        }
+        let Some(waiting) = guard.1.get(candidate) else {
+            return Claim::Direct;
+        };
+        let accepts = matches!(waiting.kind.as_str(), Some("peer" | "any"))
+            && waiting
+                .id
+                .as_str()
+                .is_none_or(|wanted| wanted == subject_id)
+            && rules::evaluate(&waiting.requirements, scopes);
+        if !accepts {
+            return Claim::Skip;
+        }
+        let taken = guard.1.remove(candidate).unwrap();
+        if let Some(seat) = seat {
+            guard.1.remove(&seat.id);
+        }
+        Claim::Taken(taken.wake)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().1.len()
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -138,17 +298,31 @@ fn search<'a>(
             }
             if kind != "hub" {
                 let users = if let Some(handler) = record.handler.clone() {
-                    if let Ok(permit) = state.inflight_calls.clone().try_acquire_owned() {
-                        tokio::task::spawn_blocking(move || {
+                    let mut users = None;
+                    // A hub busy with another call or short of capacity is asked again shortly.
+                    for attempt in 0..BUSY_RETRIES {
+                        let Ok(permit) = state.inflight_calls.clone().try_acquire_owned() else {
+                            busy_pause(attempt).await;
+                            continue;
+                        };
+                        let handler = handler.clone();
+                        let listed = tokio::task::spawn_blocking(move || {
                             let _permit = permit;
-                            handler.try_lock().ok()?.call("listUsers", vec![]).ok()
+                            handler
+                                .try_lock()
+                                .ok()
+                                .map(|mut h| h.call("listUsers", vec![]).ok())
                         })
                         .await
                         .ok()
-                        .flatten()
-                    } else {
-                        None
+                        .flatten();
+                        if let Some(listed) = listed {
+                            users = listed;
+                            break;
+                        }
+                        busy_pause(attempt).await;
                     }
+                    users
                 } else if record.info.mode == HubMode::External && base < state.config.max_depth {
                     if let Some(address) = record.info.address.as_deref() {
                         let request = RouteRequest {
@@ -302,6 +476,14 @@ pub(crate) async fn pair_endpoint(
     .await
 }
 
+const BUSY_RETRIES: u32 = 16;
+
+/// A short, jittered pause so peers that collided on a busy hub do not collide again together.
+async fn busy_pause(attempt: u32) {
+    let ceiling = 10 + 5 * u64::from(attempt);
+    tokio::time::sleep(Duration::from_millis(1 + rand::random::<u64>() % ceiling)).await;
+}
+
 async fn routed(
     state: Arc<Inner>,
     headers: HeaderMap,
@@ -322,18 +504,36 @@ async fn routed_with_channels(
     inherited: [Option<Value>; 3],
     inherited_channels: Option<crate::live::ChannelPolicy>,
 ) -> Result<Value, Box<Response>> {
-    let response = Box::pin(route_hub(
-        State(state.clone()),
-        headers,
-        Ok(Json(RouteRequest {
-            path,
-            op: op.into(),
-            body,
-            inherited_schemas: Some(inherited),
-            inherited_channels,
-        })),
-    ))
-    .await;
+    let request = RouteRequest {
+        path,
+        op: op.into(),
+        body,
+        inherited_schemas: Some(inherited),
+        inherited_channels,
+    };
+    let mut attempt = 0;
+    let response = loop {
+        let response = Box::pin(route_hub(
+            State(state.clone()),
+            headers.clone(),
+            Ok(Json(request.clone())),
+        ))
+        .await;
+        // Hub calls fail fast when the hub is busy with a concurrent call or at capacity.
+        // Pairing is concurrent by design, so those two outcomes are asked again briefly.
+        if matches!(op, "call" | "ticket")
+            && matches!(
+                response.status(),
+                StatusCode::CONFLICT | StatusCode::SERVICE_UNAVAILABLE
+            )
+            && attempt + 1 < BUSY_RETRIES
+        {
+            busy_pause(attempt).await;
+            attempt += 1;
+            continue;
+        }
+        break response;
+    };
     if !response.status().is_success() {
         return Err(Box::new(response));
     }
@@ -344,12 +544,259 @@ async fn routed_with_channels(
         .map_err(|_| Box::new(error(StatusCode::BAD_GATEWAY, "invalid pairing response")))
 }
 
+/// Pair, and with `waitMs` stay queued until a partner arrives. Waiting never polls: the peer
+/// that pairs with a queued one wakes it. The wait ends at `waitMs` (at most the configured
+/// maximum) with `408`, and a request dropped by its caller leaves the queue at once.
 pub(crate) async fn pair(
     state: Arc<Inner>,
     headers: HeaderMap,
     body: Value,
     inherited: [Option<Value>; 3],
     inherited_channels: Option<crate::live::ChannelPolicy>,
+) -> Response {
+    let wait = match body.get("waitMs") {
+        None | Some(Value::Null) => Duration::ZERO,
+        Some(value) => match value.as_u64() {
+            Some(_) => crate::hub::pair_wait(&state.config, &body),
+            None => return error(StatusCode::BAD_REQUEST, "invalid waitMs"),
+        },
+    };
+    if wait.is_zero() {
+        return pair_once(state, headers, &body, inherited, inherited_channels, None).await;
+    }
+    let (Some(id), Some(target)) = (
+        body["subject"]
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && body["subject"]["kind"] == "peer"),
+        body["target"]
+            .as_object()
+            .filter(|t| matches!(t.get("kind").and_then(Value::as_str), Some("peer" | "any"))),
+    ) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "waitMs needs a peer subject and a peer or any target",
+        );
+    };
+    let id = id.to_owned();
+    let Ok(requirements) = rules::parse_requirements(target.get("requirements")) else {
+        return error(StatusCode::BAD_REQUEST, "invalid requirements");
+    };
+    let credential = body["subject"]["credential"].clone();
+    let deadline = Instant::now() + wait;
+    loop {
+        let (seat, mut wake) = match state
+            .pending
+            .enter(&state, &id, target, requirements.clone())
+        {
+            Ok(entered) => entered,
+            Err(Enter::Duplicate) => {
+                return error(StatusCode::CONFLICT, "peer is already waiting to pair")
+            }
+            Err(Enter::Full) => {
+                return error(StatusCode::SERVICE_UNAVAILABLE, "pairing queue is full")
+            }
+        };
+        let mut races = 0;
+        let response = loop {
+            let response = pair_once(
+                state.clone(),
+                headers.clone(),
+                &body,
+                inherited.clone(),
+                inherited_channels.clone(),
+                Some(&seat),
+            )
+            .await;
+            // Losing a race for a partner is not "no partner": look again at once.
+            if response.status() == StatusCode::CONFLICT && seat.holds() && races < BUSY_RETRIES {
+                busy_pause(races).await;
+                races += 1;
+                continue;
+            }
+            break response;
+        };
+        let retry = matches!(
+            response.status(),
+            StatusCode::NOT_FOUND | StatusCode::CONFLICT
+        );
+        if !seat.holds() || retry {
+            // Either no partner exists yet, or another peer took this seat and will wake it.
+            // A peer taken after a failed attempt of its own is still matched.
+            let woken = match wake.try_recv() {
+                Ok(matched) => Woken::Matched(matched),
+                Err(oneshot::error::TryRecvError::Closed) => Woken::Dropped,
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    wait_for(&mut wake, deadline, &seat, state.config.request_timeout).await
+                }
+            };
+            match woken {
+                Woken::Matched(matched) => {
+                    return deliver(
+                        state,
+                        headers,
+                        matched,
+                        &id,
+                        &credential,
+                        inherited,
+                        inherited_channels,
+                    )
+                    .await
+                }
+                // The claimer failed before the pairing held: queue again while time remains.
+                Woken::Dropped if Instant::now() < deadline => continue,
+                Woken::Dropped | Woken::TimedOut => {
+                    return error(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "no matching peer arrived in time",
+                    )
+                }
+            }
+        }
+        return response;
+    }
+}
+
+enum Woken {
+    Matched(Matched),
+    /// The peer that claimed this one failed before the pairing held.
+    Dropped,
+    TimedOut,
+}
+
+/// Sleep until woken or the deadline. A seat claimed as the deadline passes is still woken by
+/// its claimer, which finishes within the request timeout (`grace`).
+async fn wait_for(
+    wake: &mut oneshot::Receiver<Matched>,
+    deadline: Instant,
+    seat: &Seat,
+    grace: Duration,
+) -> Woken {
+    let settle = |result: Result<Matched, oneshot::error::RecvError>| match result {
+        Ok(matched) => Woken::Matched(matched),
+        Err(_) => Woken::Dropped,
+    };
+    match tokio::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        &mut *wake,
+    )
+    .await
+    {
+        Ok(result) => settle(result),
+        Err(_) if seat.holds() => Woken::TimedOut,
+        Err(_) => match tokio::time::timeout(grace, wake).await {
+            Ok(result) => settle(result),
+            Err(_) => Woken::TimedOut,
+        },
+    }
+}
+
+/// A peer that is already paired in an open system room of its hub.
+async fn seated_room(
+    state: &Arc<Inner>,
+    headers: &HeaderMap,
+    candidate: &Value,
+    inherited: &[Option<Value>; 3],
+) -> Option<Matched> {
+    let mut path: Vec<String> = candidate["path"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    let hub_id = path.pop()?;
+    let user = routed(
+        state.clone(),
+        headers.clone(),
+        path.clone(),
+        "call",
+        call_for(&hub_id, "getUser", vec![candidate["id"].clone()]),
+        inherited.clone(),
+    )
+    .await
+    .ok()?;
+    if user["result"]["status"] != "paired" {
+        return None;
+    }
+    let room = user["result"]["serverId"].as_str()?.to_owned();
+    let server = routed(
+        state.clone(),
+        headers.clone(),
+        path.clone(),
+        "call",
+        call_for(&hub_id, "getServer", vec![json!(room)]),
+        inherited.clone(),
+    )
+    .await
+    .ok()?;
+    (server["result"]["system"] == true && server["result"]["status"] == "open")
+        .then_some(Matched { path, hub_id, room })
+}
+
+/// The waiting peer's own half of a pairing another peer made: authorize and issue its ticket.
+/// If that fails the peer leaves the room it was seated in.
+async fn deliver(
+    state: Arc<Inner>,
+    headers: HeaderMap,
+    matched: Matched,
+    id: &str,
+    credential: &Value,
+    inherited: [Option<Value>; 3],
+    inherited_channels: Option<crate::live::ChannelPolicy>,
+) -> Response {
+    let Matched { path, hub_id, room } = matched;
+    let issued = async {
+        let proof = authorize_proof(
+            &state, &headers, &path, &hub_id, id, &room, "peer", credential, &inherited,
+        )
+        .await?;
+        let response = ticket_descriptor(
+            state.clone(),
+            headers.clone(),
+            path.clone(),
+            &hub_id,
+            id,
+            &room,
+            "peer",
+            &proof,
+            "peer-peer",
+            inherited.clone(),
+            inherited_channels,
+        )
+        .await;
+        if response.status().is_success() {
+            Ok(response)
+        } else {
+            Err(Box::new(response))
+        }
+    }
+    .await;
+    match issued {
+        Ok(response) => response,
+        Err(refused) => {
+            let _ = routed(
+                state,
+                headers,
+                path,
+                "call",
+                call_for(&hub_id, "leave", vec![json!(id)]),
+                inherited,
+            )
+            .await;
+            *refused
+        }
+    }
+}
+
+/// One attempt to pair. With a `seat` the caller also waits in the queue, so a peer already
+/// waiting there is claimed atomically and woken once the pairing holds.
+async fn pair_once(
+    state: Arc<Inner>,
+    headers: HeaderMap,
+    body: &Value,
+    inherited: [Option<Value>; 3],
+    inherited_channels: Option<crate::live::ChannelPolicy>,
+    seat: Option<&Seat>,
 ) -> Response {
     let Some(subject) = body.get("subject").and_then(Value::as_object) else {
         return error(StatusCode::BAD_REQUEST, "invalid subject");
@@ -397,7 +844,29 @@ pub(crate) async fn pair(
     let Ok(found) = serde_json::from_slice::<Value>(&bytes) else {
         return error(StatusCode::BAD_GATEWAY, "invalid discovery response");
     };
+    // A waiting peer another peer paired before this request began is already seated.
+    if seat.is_some() {
+        let mine = found["candidates"]
+            .as_array()
+            .and_then(|all| all.iter().find(|c| c["kind"] == "peer" && c["id"] == id));
+        if let Some(mine) = mine {
+            if let Some(seated) = seated_room(&state, &headers, mine, &inherited).await {
+                let credential = subject.get("credential").cloned().unwrap_or(Value::Null);
+                return deliver(
+                    state,
+                    headers,
+                    seated,
+                    id,
+                    &credential,
+                    inherited,
+                    inherited_channels,
+                )
+                .await;
+            }
+        }
+    }
     let mut selected = None;
+    let mut taken = None;
     if let Some(candidates) = found["candidates"].as_array() {
         for candidate in candidates {
             if candidate["kind"] == kind && candidate["id"] == id {
@@ -484,6 +953,19 @@ pub(crate) async fn pair(
                     }
                 }
             }
+            if candidate["kind"] == "peer" {
+                match state.pending.claim(
+                    seat,
+                    id,
+                    &subject["scopes"],
+                    candidate["id"].as_str().unwrap_or(""),
+                ) {
+                    Claim::Lost => break,
+                    Claim::Skip => continue,
+                    Claim::Direct => {}
+                    Claim::Taken(wake) => taken = Some(wake),
+                }
+            }
             selected = Some(candidate);
             break;
         }
@@ -565,24 +1047,21 @@ pub(crate) async fn pair(
     // A hub that sets `auth` must accept the subject's credential before membership changes.
     let role = if kind == "hub" { "service" } else { "peer" };
     let credential = subject.get("credential").cloned().unwrap_or(Value::Null);
-    // The credential is checked here once. A hub that verified it returns a receipt, which
-    // the ticket step uses in place of the credential, so a single-use credential works.
-    let checked = match routed(
-        state.clone(),
-        headers.clone(),
-        path.clone(),
-        "authorize",
-        json!({"id":hub_id,"userId":id,"serverId":room,"role":role,"credential":credential}),
-        inherited.clone(),
+    let proof = match authorize_proof(
+        &state,
+        &headers,
+        &path,
+        &hub_id,
+        id,
+        &room,
+        role,
+        &credential,
+        &inherited,
     )
     .await
     {
         Ok(v) => v,
         Err(e) => return *e,
-    };
-    let proof = match checked.get("receipt").and_then(Value::as_str) {
-        Some(receipt) => json!({"verified":receipt}),
-        None => json!({"credential":credential}),
     };
     if peer {
         let result = routed(
@@ -601,7 +1080,37 @@ pub(crate) async fn pair(
         )
         .await;
         if let Err(e) = result {
+            // A waiting caller that lost a race for a partner who was paired meanwhile asks again.
+            if seat.is_some() && e.status() == StatusCode::BAD_REQUEST {
+                let text = axum::body::to_bytes(e.into_body(), 4096)
+                    .await
+                    .unwrap_or_default();
+                if String::from_utf8_lossy(&text).contains("already paired") {
+                    return error(StatusCode::CONFLICT, "peer already paired");
+                }
+                return error(StatusCode::BAD_REQUEST, "pairing refused");
+            }
             return *e;
+        }
+        // The waiter is told as soon as the engine holds the pairing; if it already left, the
+        // pairing is undone for it.
+        if let Some(wake) = taken.take() {
+            let matched = Matched {
+                path: path.clone(),
+                hub_id: hub_id.clone(),
+                room: room.clone(),
+            };
+            if wake.send(matched).is_err() {
+                let _ = routed(
+                    state.clone(),
+                    headers.clone(),
+                    path.clone(),
+                    "call",
+                    call("leave", vec![json!(target_id)]),
+                    inherited.clone(),
+                )
+                .await;
+            }
         }
     } else {
         if existing.is_none() {
@@ -665,18 +1174,80 @@ pub(crate) async fn pair(
             }
         }
     }
+    let link = match (kind, peer) {
+        ("peer", true) => "peer-peer",
+        ("hub", false) => "hub-hub",
+        _ => "peer-hub",
+    };
+    ticket_descriptor(
+        state,
+        headers,
+        path,
+        &hub_id,
+        id,
+        &room,
+        role,
+        &proof,
+        link,
+        inherited,
+        inherited_channels,
+    )
+    .await
+}
+
+/// The credential is checked once. A hub that verified it returns a receipt, which the
+/// ticket step uses in place of the credential, so a single-use credential works.
+#[allow(clippy::too_many_arguments)]
+async fn authorize_proof(
+    state: &Arc<Inner>,
+    headers: &HeaderMap,
+    path: &[String],
+    hub_id: &str,
+    id: &str,
+    room: &str,
+    role: &str,
+    credential: &Value,
+    inherited: &[Option<Value>; 3],
+) -> Result<Value, Box<Response>> {
+    let checked = routed(
+        state.clone(),
+        headers.clone(),
+        path.to_vec(),
+        "authorize",
+        json!({"id":hub_id,"userId":id,"serverId":room,"role":role,"credential":credential}),
+        inherited.clone(),
+    )
+    .await?;
+    Ok(match checked.get("receipt").and_then(Value::as_str) {
+        Some(receipt) => json!({"verified":receipt}),
+        None => json!({"credential":credential}),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ticket_descriptor(
+    state: Arc<Inner>,
+    headers: HeaderMap,
+    path: Vec<String>,
+    hub_id: &str,
+    id: &str,
+    room: &str,
+    role: &str,
+    proof: &Value,
+    link: &str,
+    inherited: [Option<Value>; 3],
+    inherited_channels: Option<crate::live::ChannelPolicy>,
+) -> Response {
+    let mut body = json!({"id":hub_id,"userId":id,"serverId":room,"role":role});
+    body.as_object_mut()
+        .unwrap()
+        .extend(proof.as_object().cloned().unwrap_or_default());
     let ticket = match routed_with_channels(
         state,
         headers,
         path,
         "ticket",
-        {
-            let mut body = json!({"id":hub_id,"userId":id,"serverId":room,"role":role});
-            body.as_object_mut()
-                .unwrap()
-                .extend(proof.as_object().cloned().unwrap_or_default());
-            body
-        },
+        body,
         inherited,
         inherited_channels,
     )
@@ -685,14 +1256,127 @@ pub(crate) async fn pair(
         Ok(v) => v,
         Err(e) => return *e,
     };
-    let link = match (kind, peer) {
-        ("peer", true) => "peer-peer",
-        ("hub", false) => "hub-hub",
-        _ => "peer-hub",
-    };
     Json(json!({"link":link,"room":room,"userId":id,"ticket":ticket["ticket"],"url":ticket["url"],"transports":["webrtc","websocket"]})).into_response()
 }
 
 fn call_for(id: &str, method: &str, args: Vec<Value>) -> Value {
     json!({"id":id,"method":method,"args":args})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::{HubConfig, HubService};
+
+    fn state(max_pending_pairs: usize) -> Arc<Inner> {
+        HubService::new(HubConfig {
+            token: "pending-queue-unit-test-token-123".into(),
+            max_pending_pairs,
+            ..HubConfig::default()
+        })
+        .unwrap()
+        .inner
+    }
+
+    fn target(value: Value) -> serde_json::Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn a_peer_waits_once_and_the_queue_is_bounded() {
+        let state = state(2);
+        let any = target(json!({"kind":"peer"}));
+        let (a, _a) = state
+            .pending
+            .enter(&state, "a", &any, Value::Null)
+            .ok()
+            .unwrap();
+        assert!(matches!(
+            state.pending.enter(&state, "a", &any, Value::Null),
+            Err(Enter::Duplicate)
+        ));
+        let (_b, _b_wake) = state
+            .pending
+            .enter(&state, "b", &any, Value::Null)
+            .ok()
+            .unwrap();
+        assert!(matches!(
+            state.pending.enter(&state, "c", &any, Value::Null),
+            Err(Enter::Full)
+        ));
+        drop(a);
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.pending.enter(&state, "c", &any, Value::Null).is_ok());
+    }
+
+    #[test]
+    fn a_dropped_seat_leaves_and_a_stale_seat_removes_nothing() {
+        let state = state(4);
+        let any = target(json!({"kind":"peer"}));
+        let (seat, _wake) = state
+            .pending
+            .enter(&state, "a", &any, Value::Null)
+            .ok()
+            .unwrap();
+        let stale = Seat {
+            state: state.clone(),
+            id: "a".into(),
+            token: seat.token + 100,
+        };
+        drop(stale);
+        assert!(seat.holds());
+        drop(seat);
+        assert_eq!(state.pending.len(), 0);
+    }
+
+    #[test]
+    fn a_claim_removes_both_peers_once() {
+        let state = state(4);
+        let any = target(json!({"kind":"peer"}));
+        let (a, mut a_wake) = state
+            .pending
+            .enter(&state, "a", &any, Value::Null)
+            .ok()
+            .unwrap();
+        let (b, _b_wake) = state
+            .pending
+            .enter(&state, "b", &any, Value::Null)
+            .ok()
+            .unwrap();
+        let scopes = json!({});
+        let first = state.pending.claim(Some(&a), "a", &scopes, "b");
+        assert!(matches!(first, Claim::Taken(_)));
+        assert_eq!(state.pending.len(), 0);
+        // `b` was claimed, so its own claim of `a` finds nobody and does not pair twice.
+        assert!(matches!(
+            state.pending.claim(Some(&b), "b", &scopes, "a"),
+            Claim::Lost
+        ));
+        assert!(a_wake.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_claim_respects_what_the_waiter_asked_for() {
+        let state = state(4);
+        let picky = target(json!({"kind":"peer","id":"z"}));
+        let rank = rules::parse_requirements(Some(&json!({"rank":3}))).unwrap();
+        let (_seat, _wake) = state.pending.enter(&state, "w", &picky, rank).ok().unwrap();
+        assert!(matches!(
+            state.pending.claim(None, "y", &json!({"rank":3}), "w"),
+            Claim::Skip
+        ));
+        assert!(matches!(
+            state.pending.claim(None, "z", &json!({"rank":1}), "w"),
+            Claim::Skip
+        ));
+        assert!(matches!(
+            state.pending.claim(None, "z", &json!({"rank":3}), "nobody"),
+            Claim::Direct
+        ));
+        assert!(matches!(
+            state.pending.claim(None, "z", &json!({"rank":3}), "w"),
+            Claim::Taken(_)
+        ));
+        assert_eq!(state.pending.len(), 0);
+    }
 }

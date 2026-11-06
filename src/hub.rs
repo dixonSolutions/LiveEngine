@@ -93,6 +93,10 @@ pub struct HubConfig {
     pub max_generates_per_call: usize,
     pub max_inflight_calls: usize,
     pub request_timeout: Duration,
+    /// Longest a `pair` request may wait for a partner (`waitMs` is clamped to it).
+    pub max_pair_wait: Duration,
+    /// Most peers waiting in `pair` requests at once on one hub.
+    pub max_pending_pairs: usize,
     pub rate_limit_requests: usize,
     pub rate_limit_window: Duration,
     pub rate_limit_peers: usize,
@@ -127,6 +131,8 @@ impl Default for HubConfig {
             max_generates_per_call: 10_000,
             max_inflight_calls: 16,
             request_timeout: Duration::from_secs(5),
+            max_pair_wait: Duration::from_secs(30),
+            max_pending_pairs: 1024,
             rate_limit_requests: 120,
             rate_limit_window: Duration::from_secs(60),
             rate_limit_peers: 4096,
@@ -191,6 +197,12 @@ impl HubConfig {
             env_limit("LIVEENGINE_MAX_GENERATE", config.max_generates_per_call)?;
         config.max_inflight_calls =
             env_limit("LIVEENGINE_MAX_INFLIGHT_CALLS", config.max_inflight_calls)?;
+        config.max_pair_wait = Duration::from_millis(env_limit(
+            "LIVEENGINE_MAX_PAIR_WAIT_MS",
+            config.max_pair_wait.as_millis() as usize,
+        )? as u64);
+        config.max_pending_pairs =
+            env_limit("LIVEENGINE_MAX_PENDING_PAIRS", config.max_pending_pairs)?;
         config.rate_limit_requests =
             env_limit("LIVEENGINE_RATE_LIMIT_REQUESTS", config.rate_limit_requests)?;
         config.rate_limit_peers =
@@ -257,6 +269,7 @@ impl HubConfig {
             || self.max_events == 0
             || self.max_generates_per_call == 0
             || self.max_inflight_calls == 0
+            || self.max_pending_pairs == 0
             || self.rate_limit_requests == 0
             || self.rate_limit_peers == 0
             || self.rate_limit_window.is_zero()
@@ -537,12 +550,13 @@ pub(crate) struct Inner {
     pub(crate) registry_upstreams: Arc<crate::live_registry::Upstreams>,
     pub(crate) links: Arc<crate::links::Links>,
     pub(crate) verifiers: crate::auth::Verifiers,
+    pub(crate) pending: crate::pairing::PendingPairs,
 }
 
 /// Cloneable state for a hosted hub registry.
 #[derive(Clone)]
 pub struct HubService {
-    inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
 }
 
 impl Inner {
@@ -610,6 +624,7 @@ impl HubService {
                 registry_upstreams: Default::default(),
                 links: Default::default(),
                 verifiers: Default::default(),
+                pending: Default::default(),
             }),
         };
         if let Some(snapshot) = snapshot {
@@ -1298,7 +1313,8 @@ async fn persist_request(
     let mutation = (request.method() == axum::http::Method::POST
         || request.method() == axum::http::Method::DELETE)
         && path != "/v1/ping"
-        && !(path.starts_with("/v1/hubs/") && path.ends_with("/call"));
+        && !(path.starts_with("/v1/hubs/") && path.ends_with("/call"))
+        && request.extensions().get::<PairWait>().is_none();
     if !mutation || state.config.state_file.is_none() {
         return next.run(request).await;
     }
@@ -1398,6 +1414,19 @@ fn start_reaper(state: &Arc<Inner>) {
     }
 }
 
+/// Marks a request whose `pair` waits for a partner; it holds no persistence lock while it waits.
+#[derive(Clone, Copy)]
+struct PairWait;
+
+/// How long a `pair` body asks to wait for a partner, within the configured maximum.
+pub(crate) fn pair_wait(config: &HubConfig, body: &Value) -> Duration {
+    body.get("waitMs")
+        .and_then(Value::as_u64)
+        .map(Duration::from_millis)
+        .unwrap_or_default()
+        .min(config.max_pair_wait)
+}
+
 async fn secure_request(
     State(state): State<Arc<Inner>>,
     request: Request<Body>,
@@ -1454,7 +1483,58 @@ async fn secure_request(
     if let Err(status) = trace(&state, request.headers()) {
         return error(status, "invalid or repeated forwarding trace");
     }
-    match tokio::time::timeout(state.config.request_timeout, next.run(request)).await {
+    // Only a `pair` request that asks to wait gets longer than the request timeout, and only
+    // by its own bounded `waitMs`. The body is read first, under the normal timeout.
+    let mut request = request;
+    let mut allowed = state.config.request_timeout;
+    if request.method() == axum::http::Method::POST
+        && matches!(request.uri().path(), "/v1/pair" | "/v1/route")
+    {
+        let routed = request.uri().path() == "/v1/route";
+        let (parts, body) = request.into_parts();
+        let buffered = tokio::time::timeout(
+            state.config.request_timeout,
+            axum::body::to_bytes(body, state.config.max_request_bytes),
+        )
+        .await;
+        let bytes = match buffered {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(_)) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    if routed {
+                        "invalid route request"
+                    } else {
+                        "invalid pairing request"
+                    },
+                )
+            }
+            Err(_) => {
+                return error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "request exceeded configured timeout",
+                )
+            }
+        };
+        let wait = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .map(|value| {
+                if !routed {
+                    pair_wait(&state.config, &value)
+                } else if value.get("op").and_then(Value::as_str) == Some("pair") {
+                    pair_wait(&state.config, &value["body"])
+                } else {
+                    Duration::ZERO
+                }
+            })
+            .unwrap_or_default();
+        request = Request::from_parts(parts, Body::from(bytes));
+        if !wait.is_zero() {
+            allowed += wait;
+            request.extensions_mut().insert(PairWait);
+        }
+    }
+    match tokio::time::timeout(allowed, next.run(request)).await {
         Ok(response) => response,
         Err(_) => error(
             StatusCode::GATEWAY_TIMEOUT,
@@ -1683,7 +1763,7 @@ fn valid_max_hubs(value: Option<&Value>, object: &Map<String, Value>, global: us
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RouteRequest {
     pub(crate) path: Vec<String>,
@@ -2004,16 +2084,21 @@ pub(crate) async fn forward_route(
             Ok(url) => url,
             Err(_) => return error(StatusCode::BAD_GATEWAY, "invalid remote address"),
         };
-    let response = match state
+    let mut builder = state
         .client
         .post(url)
         .bearer_auth(token)
         .header("x-liveengine-trace", outgoing_trace(state, headers))
         .header("x-liveengine-depth", depth.to_string())
-        .json(request)
-        .send()
-        .await
-    {
+        .json(request);
+    // A forwarded `pair` that waits outlives the client's default timeout by its own wait.
+    if request.op == "pair" {
+        let wait = pair_wait(&state.config, &request.body);
+        if !wait.is_zero() {
+            builder = builder.timeout(state.config.request_timeout + wait);
+        }
+    }
+    let response = match builder.send().await {
         Ok(response) => response,
         Err(_) => return error(StatusCode::BAD_GATEWAY, "remote request failed"),
     };

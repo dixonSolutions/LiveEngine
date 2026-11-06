@@ -19,6 +19,8 @@ Limits fall into four groups: host configuration, per-engine budgets, protocol/f
 | Events per engine | `max_events` | `LIVEENGINE_MAX_EVENTS` | `100000` |
 | Generated per call | `max_generates_per_call` | `LIVEENGINE_MAX_GENERATE` | `10000` |
 | In-flight calls | `max_inflight_calls` | `LIVEENGINE_MAX_INFLIGHT_CALLS` | `16` |
+| Longest `pair` wait | `max_pair_wait` | `LIVEENGINE_MAX_PAIR_WAIT_MS` | 30 seconds |
+| Waiting `pair` peers | `max_pending_pairs` | `LIVEENGINE_MAX_PENDING_PAIRS` | `1024` |
 | Requests per window | `rate_limit_requests` | `LIVEENGINE_RATE_LIMIT_REQUESTS` | `120` |
 | Rate window | `rate_limit_window` | `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` | `60` seconds |
 | Tracked peers | `rate_limit_peers` | `LIVEENGINE_RATE_LIMIT_PEERS` | `4096` |
@@ -115,7 +117,7 @@ Everything else is bounded only by process memory.
 
 ## Timeout semantics
 
-- `request_timeout` applies to the whole request, including handler execution and remote forwarding.
+- `request_timeout` applies to the whole request, including handler execution and remote forwarding. A `pair` request with `waitMs` gets it plus its own wait (at most `max_pair_wait`); no other route does.
 - A timed-out internal handler is **not** cancelled. It keeps its in-flight permit and handler lock until it returns.
 - Capacity stays occupied, and a retry may get `503` or `409` until the first call finishes.
 - A timed-out remote request is cancelled at the HTTP client, but the remote service may still be processing it.

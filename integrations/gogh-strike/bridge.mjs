@@ -39,7 +39,6 @@ const hubScopes = {game: 'gogh-strike'};
 // "hub" pairs every player with the hub's shared room. "peer" pairs players with each other
 // (the hub is still the signalling and fallback path); the first player waits for the next.
 const linkKind = process.env.GOGH_LIVE_LINK === 'peer' ? 'peer' : 'hub';
-const PEER_POLL_MS = 500;
 const peerWaitMs = Number(process.env.GOGH_PEER_WAIT_MS) > 0 ? Number(process.env.GOGH_PEER_WAIT_MS) : 30_000;
 // Where the browser opens the live registry; the hub's own address unless it is reached another way.
 const watchUrl = process.env.LIVEENGINE_WATCH_URL || `${(process.env.LIVEENGINE_URL || '').replace(/^http/, 'ws').replace(/\/$/, '')}/v1/live/registry`;
@@ -161,30 +160,20 @@ class LiveEngineClient {
     return descriptor;
   }
 
-  // Peer pairing: register as a candidate, then take the first peer found or wait to be taken.
+  // Peer pairing: register as a candidate, then ask LiveEngine to pair, which holds the request
+  // until another player arrives or `waitMs` passes. The wait itself belongs to the engine.
   async pairPeer(userId, player) {
     // `arena` keeps these players to this hub: other players on the service are never candidates.
     const scopes = {game: 'gogh-strike', mode: 'tdm', team: player.team, artist: player.role, arena: hubId};
-    const request = {subject: {id: userId, kind: 'peer', scopes}, target: {kind: 'peer', requirements: {...hubScopes, arena: hubId}}, path: hubPath};
-    const known = await this.call('getUser', userId);
-    if (!known) await this.call('upsertUser', {id: userId, scopes});
+    const request = {subject: {id: userId, kind: 'peer', scopes}, target: {kind: 'peer', requirements: {...hubScopes, arena: hubId}}, path: hubPath, waitMs: peerWaitMs};
+    if (!await this.call('getUser', userId)) await this.call('upsertUser', {id: userId, scopes});
     pairings.set(userId, {peer: true});
-    const deadline = Date.now() + peerWaitMs;
-    // Registered first, so of two players arriving together the later one finds the earlier.
-    // The pairing itself costs several hub requests, so a waiting player only polls its own seat.
-    for (let attempt = 0; ; attempt++) {
-      const current = attempt ? await this.call('getUser', userId) : known;
-      if (current?.status === 'paired' && current.serverId) return this.peerDescriptor(userId, current.serverId);
-      if (attempt === 0) {
-        try { return await this.client.pair(request); }
-        catch (error) { if (error.status !== 404 && error.status !== 409) throw error; }
-      }
-      if (Date.now() >= deadline) {
-        pairings.delete(userId);
-        await this.call('leave', userId).catch(() => {});
-        throw Object.assign(new Error('No other player arrived in time'), {status: 408});
-      }
-      await new Promise(resolve => setTimeout(resolve, PEER_POLL_MS));
+    try { return await this.client.pair(request); }
+    catch (error) {
+      pairings.delete(userId);
+      await this.call('leave', userId).catch(() => {});
+      if (error.status === 408) throw Object.assign(new Error('No other player arrived in time'), {status: 408});
+      throw error;
     }
   }
 

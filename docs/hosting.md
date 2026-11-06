@@ -25,6 +25,8 @@ Limits are configurable through `HubConfig` when embedding the router. The stand
 | `LIVEENGINE_MAX_EVENTS` | 100000 |
 | `LIVEENGINE_MAX_GENERATE` | 10000 |
 | `LIVEENGINE_MAX_INFLIGHT_CALLS` | 16 |
+| `LIVEENGINE_MAX_PAIR_WAIT_MS` | 30000 |
+| `LIVEENGINE_MAX_PENDING_PAIRS` | 1024 |
 | `LIVEENGINE_RATE_LIMIT_REQUESTS` | 120 |
 | `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` | 60 |
 | `LIVEENGINE_RATE_LIMIT_PEERS` | 4096 |
@@ -104,6 +106,18 @@ Set `LIVEENGINE_PUBLIC_URL` to the direct live endpoint advertised by this servi
 order that matches `requirements` is used. With `id`, only the hub or peer of that id can match, so
 two hubs that share scopes stay distinct. A non-string or empty `id` answers `400`; an `id` that
 matches nothing answers `404`.
+
+### Waiting for a partner
+
+`POST /v1/pair` and the `pair` route operation accept `waitMs`, for a peer subject with a `peer` or
+`any` target. A peer with no candidate yet stays queued, per hub, and the next peer that pairs with it
+wakes it with its own ticket; nothing polls. The wait ends with `408` after `waitMs`, capped by
+`LIVEENGINE_MAX_PAIR_WAIT_MS` (`0` turns waiting off), and a request its caller drops leaves the queue at
+once. A peer is queued once (`409` for a second request), at most `LIVEENGINE_MAX_PENDING_PAIRS` wait at a
+time (`503` beyond that), and a match removes both peers from the queue in one step. The waiting peer must
+already be a user of a hub, so that other peers can find it. A waiting `pair` gets the request timeout plus
+its own wait, also when forwarded through a nest; every other route keeps the plain request timeout. A
+busy hub (`409`) or one at call capacity (`503`) is asked again briefly during pairing.
 
 ### Hub auth
 

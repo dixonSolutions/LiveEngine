@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `waitMs` to `POST /v1/pair` and the `pair` route operation (`HubClient.pair`): a peer with no partner waits in a bounded per-hub queue and is woken by the peer that pairs with it, with `408` on timeout. Bounded by `LIVEENGINE_MAX_PAIR_WAIT_MS` (default 30000) and `LIVEENGINE_MAX_PENDING_PAIRS`. The Gogh Strike bridge no longer polls.
+
 - Expose the engine's system-room flag and use it when selecting peer rooms.
 
 - Reject forged server event types and linked frames claiming a sender announced on another link.

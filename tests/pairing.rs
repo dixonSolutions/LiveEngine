@@ -535,3 +535,311 @@ async fn pairing_uses_room_flag_instead_of_room_name() {
     assert_eq!(body["room"], "unusual-name");
     task.abort();
 }
+
+fn waiting_config(token: &str) -> HubConfig {
+    HubConfig {
+        token: token.into(),
+        allowed_remote_hosts: vec!["127.0.0.1".into()],
+        public_url: Some("ws://live.example.test/v1/live".into()),
+        request_timeout: std::time::Duration::from_secs(1),
+        max_pair_wait: std::time::Duration::from_secs(3),
+        max_inflight_calls: 512,
+        ..HubConfig::default()
+    }
+}
+
+async fn server_with(config: HubConfig) -> (String, tokio::task::JoinHandle<()>) {
+    let service = HubService::new(config).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            service
+                .router()
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    (format!("http://{address}"), task)
+}
+
+async fn arena(c: &reqwest::Client, base: &str, token: &str) {
+    let (status, body) = post(
+        c,
+        base,
+        token,
+        "/v1/hubs",
+        json!({"id":"arena","mode":"internal","scopes":{"game":"g"}}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+}
+
+/// A peer registers as a candidate, as a game's bridge does before it asks to pair.
+async fn register(c: &reqwest::Client, base: &str, token: &str, id: &str) {
+    let (status, body) = post(
+        c,
+        base,
+        token,
+        "/v1/hubs/arena/call",
+        json!({"method":"upsertUser","args":[{"id":id,"scopes":{"game":"g"}}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+}
+
+fn wait_request(id: &str, wait_ms: u64) -> Value {
+    json!({
+        "subject":{"kind":"peer","id":id,"scopes":{"game":"g"}},
+        "target":{"kind":"peer","requirements":{"game":"g"}},
+        "waitMs":wait_ms
+    })
+}
+
+fn spawn_pair(
+    c: &reqwest::Client,
+    base: &str,
+    token: &'static str,
+    body: Value,
+) -> tokio::task::JoinHandle<(u16, Value)> {
+    let (c, base) = (c.clone(), base.to_owned());
+    tokio::spawn(async move { post(&c, &base, token, "/v1/pair", body).await })
+}
+
+async fn users(c: &reqwest::Client, base: &str, token: &str) -> Vec<Value> {
+    let (status, body) = post(
+        c,
+        base,
+        token,
+        "/v1/hubs/arena/call",
+        json!({"method":"listUsers","args":[]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    body["result"].as_array().unwrap().clone()
+}
+
+#[tokio::test]
+async fn a_waiting_peer_is_woken_by_the_later_arrival() {
+    let (base, task) = server_with(waiting_config(TOKEN)).await;
+    let c = reqwest::Client::new();
+    arena(&c, &base, TOKEN).await;
+    register(&c, &base, TOKEN, "early").await;
+    let started = std::time::Instant::now();
+    let early = spawn_pair(&c, &base, TOKEN, wait_request("early", 3000));
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(!early.is_finished(), "the first peer must wait");
+    // A second request for the same peer cannot queue it twice.
+    let (status, _) = post(&c, &base, TOKEN, "/v1/pair", wait_request("early", 500)).await;
+    assert_eq!(status, 409);
+    register(&c, &base, TOKEN, "late").await;
+    let (status, late) = post(&c, &base, TOKEN, "/v1/pair", wait_request("late", 0)).await;
+    assert_eq!(status, 200, "{late}");
+    let woken_after = std::time::Instant::now();
+    let (status, early) = early.await.unwrap();
+    assert_eq!(status, 200, "{early}");
+    assert!(woken_after.elapsed() < std::time::Duration::from_millis(500));
+    assert!(started.elapsed() >= std::time::Duration::from_millis(400));
+    assert_eq!(early["room"], late["room"]);
+    assert_eq!(early["link"], "peer-peer");
+    assert_eq!(early["userId"], "early");
+    assert_ne!(early["ticket"], late["ticket"]);
+    for user in users(&c, &base, TOKEN).await {
+        assert_eq!(user["status"], "paired");
+        assert_eq!(user["serverId"], early["room"]);
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_wait_that_times_out_leaves_no_state_behind() {
+    let (base, task) = server_with(waiting_config(TOKEN)).await;
+    let c = reqwest::Client::new();
+    arena(&c, &base, TOKEN).await;
+    register(&c, &base, TOKEN, "lonely").await;
+    let started = std::time::Instant::now();
+    let (status, body) = post(&c, &base, TOKEN, "/v1/pair", wait_request("lonely", 600)).await;
+    assert_eq!(status, 408, "{body}");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(550));
+    // The seat is free again, and the user was not paired by the failed wait.
+    let (status, _) = post(&c, &base, TOKEN, "/v1/pair", wait_request("lonely", 200)).await;
+    assert_eq!(status, 408);
+    let seated = users(&c, &base, TOKEN).await;
+    assert_eq!(seated[0]["status"], "waiting");
+    let (status, body) = post(&c, &base, TOKEN, "/v1/pair", wait_request("lonely", 0)).await;
+    assert_eq!(status, 404, "{body}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn the_wait_is_capped_and_outlives_the_request_timeout() {
+    // The service answers other requests within one second, and a wait is capped at three.
+    let (base, task) = server_with(waiting_config(TOKEN)).await;
+    let c = reqwest::Client::new();
+    arena(&c, &base, TOKEN).await;
+    register(&c, &base, TOKEN, "capped").await;
+    let started = std::time::Instant::now();
+    let (status, body) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/pair",
+        wait_request("capped", 600_000),
+    )
+    .await;
+    let waited = started.elapsed();
+    assert_eq!(status, 408, "{body}");
+    assert!(
+        waited >= std::time::Duration::from_millis(2900),
+        "{waited:?}"
+    );
+    assert!(
+        waited < std::time::Duration::from_millis(3900),
+        "{waited:?}"
+    );
+    let (status, _) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/pair",
+        wait_request("capped", u64::MAX),
+    )
+    .await;
+    assert_eq!(status, 408);
+    let mut bad = wait_request("capped", 1);
+    bad["waitMs"] = json!("soon");
+    let (status, _) = post(&c, &base, TOKEN, "/v1/pair", bad).await;
+    assert_eq!(status, 400);
+    let mut hub = wait_request("capped", 100);
+    hub["target"] = json!({"kind":"hub"});
+    let (status, _) = post(&c, &base, TOKEN, "/v1/pair", hub).await;
+    assert_eq!(status, 400);
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_dropped_request_leaves_the_queue() {
+    let (base, task) = server_with(waiting_config(TOKEN)).await;
+    let c = reqwest::Client::new();
+    arena(&c, &base, TOKEN).await;
+    register(&c, &base, TOKEN, "gone").await;
+    let waiting = spawn_pair(&c, &base, TOKEN, wait_request("gone", 3000));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let (status, _) = post(&c, &base, TOKEN, "/v1/pair", wait_request("gone", 100)).await;
+    assert_eq!(status, 409);
+    waiting.abort();
+    let _ = waiting.await;
+    // The seat frees as soon as the server notices the closed connection.
+    let mut freed = false;
+    for _ in 0..40 {
+        let (status, _) = post(&c, &base, TOKEN, "/v1/pair", wait_request("gone", 50)).await;
+        if status == 408 {
+            freed = true;
+            break;
+        }
+        assert_eq!(status, 409);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(freed, "a dropped waiting request must free its seat");
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_wait_through_a_remote_nest_uses_its_own_deadline() {
+    let (remote, remote_task) = server_with(waiting_config(REMOTE)).await;
+    let (root, root_task) = server_with(waiting_config(TOKEN)).await;
+    let c = reqwest::Client::new();
+    arena(&c, &remote, REMOTE).await;
+    register(&c, &remote, REMOTE, "far").await;
+    let (status, body) = post(
+        &c,
+        &root,
+        TOKEN,
+        "/v1/hubs",
+        json!({"id":"nest","mode":"central","address":remote,"remoteToken":REMOTE}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let route = |id: &str, wait_ms: u64| json!({"path":["nest"],"op":"pair","body":wait_request(id, wait_ms)});
+    let waiting = {
+        let (c, root, body) = (c.clone(), root.clone(), route("far", 3000));
+        tokio::spawn(async move { post(&c, &root, TOKEN, "/v1/route", body).await })
+    };
+    // Past the one-second request timeout of both services.
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+    assert!(!waiting.is_finished());
+    register(&c, &remote, REMOTE, "near").await;
+    let (status, near) = post(&c, &root, TOKEN, "/v1/route", route("near", 0)).await;
+    assert_eq!(status, 200, "{near}");
+    let (status, far) = waiting.await.unwrap();
+    assert_eq!(status, 200, "{far}");
+    assert_eq!(far["room"], near["room"]);
+    // A nested wait that nobody answers ends in 408 at its own deadline.
+    let (status, body) = post(
+        &c,
+        &remote,
+        REMOTE,
+        "/v1/hubs/arena/call",
+        json!({"method":"upsertUser","args":[{"id":"alone","scopes":{"game":"other"}}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let mut unanswered = wait_request("alone", 1500);
+    unanswered["subject"]["scopes"] = json!({"game":"other"});
+    unanswered["target"]["requirements"] = json!({"game":"other"});
+    let started = std::time::Instant::now();
+    let (status, _) = post(
+        &c,
+        &root,
+        TOKEN,
+        "/v1/route",
+        json!({"path":["nest"],"op":"pair","body":unanswered}),
+    )
+    .await;
+    assert_eq!(status, 408);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1400));
+    root_task.abort();
+    remote_task.abort();
+}
+
+#[tokio::test]
+async fn simultaneous_peers_pair_exactly_once() {
+    for _ in 0..3 {
+        let (base, task) = server_with(waiting_config(TOKEN)).await;
+        let c = reqwest::Client::new();
+        let ids: Vec<String> = (0..24).map(|n| format!("p{n:02}")).collect();
+        arena(&c, &base, TOKEN).await;
+        for id in &ids {
+            register(&c, &base, TOKEN, id).await;
+        }
+        // Every peer asks to pair at the same instant.
+        let calls: Vec<_> = ids
+            .iter()
+            .map(|id| spawn_pair(&c, &base, TOKEN, wait_request(id, 3000)))
+            .collect();
+        let mut rooms = std::collections::BTreeMap::new();
+        for (id, call) in ids.iter().zip(calls) {
+            let (status, body) = call.await.unwrap();
+            assert_eq!(status, 200, "{id}: {body}");
+            assert_eq!(body["userId"], json!(id));
+            assert!(rooms
+                .insert(id.clone(), body["room"].as_str().unwrap().to_owned())
+                .is_none());
+        }
+        let seated = users(&c, &base, TOKEN).await;
+        assert_eq!(seated.len(), ids.len());
+        let mut members: std::collections::BTreeMap<String, usize> = Default::default();
+        for user in &seated {
+            // Each peer is in the one room its own answer named.
+            assert_eq!(user["status"], "paired");
+            assert_eq!(user["serverId"], json!(rooms[user["id"].as_str().unwrap()]));
+            *members
+                .entry(rooms[user["id"].as_str().unwrap()].clone())
+                .or_default() += 1;
+        }
+        assert!(members.values().all(|n| *n >= 2), "{members:?}");
+        task.abort();
+    }
+}

@@ -261,6 +261,11 @@ export interface PairRequest {
   path?: string[];
   /** The subject's credential for a hub that sets `auth`. Overrides `subject.credential`. */
   credential?: string;
+  /**
+   * Wait this long for a partner when a peer has none yet (the service caps it, 30 seconds by
+   * default). Rejects with status 408 if none arrives. Needs a peer subject and a peer or any target.
+   */
+  waitMs?: number;
 }
 /** What `pair` returns and `LiveClient` consumes. */
 export interface LiveDescriptor {
