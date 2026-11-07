@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Pair rooms default to two peers; `target.capacity` can request a larger room up to `LIVEENGINE_MAX_ROOM_CAPACITY` (default 64). The Gogh Strike bridge defaults to 12.
+
 - Protect browser hub API seats with private, hashed seat tokens; the live client handles renewal, heartbeat and leave.
 
 - Check published TypeScript declarations and documentation samples in CI.

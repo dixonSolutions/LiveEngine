@@ -84,7 +84,7 @@ The descriptor:
 | Subject | Target | `link` | Ticket role | What happens |
 | --- | --- | --- | --- | --- |
 | peer | peer | `peer-peer` | `peer` | Both peers are placed in a system room of the target's hub, named `pair:<target id>`, or in the target's current room if it is an open system room. Capacity 64 |
-| peer | hub | `peer-hub` | `peer` | The subject is added as a user of the hub, with `target.requirements` as its requirements, and joins the hub's room `pair:hub:<hub id>`, which is created with the hub's scopes and capacity 64 |
+| peer | hub | `peer-hub` | `peer` | The subject is added as a user of the hub, with `target.requirements` as its requirements, and joins the hub's room `pair:hub:<hub id>`, which is created with the hub's scopes and requested capacity (default 2) |
 | hub | hub | `hub-hub` | `service` | As peer to hub, with a service-role ticket |
 | hub | peer | `peer-hub` | `service` | As peer to peer, with a service-role ticket |
 | any | `any` | the matching row | | The first qualifying candidate in discovery order |
@@ -193,7 +193,7 @@ The Rust client times out after five seconds, so it cannot wait for a partner fo
 | `LIVEENGINE_MAX_QUEUED_CALLS` | 1024 | Calls queued at once; beyond that a call is refused (`409` handler busy, `503` capacity busy) |
 | `LIVEENGINE_MAX_INFLIGHT_CALLS` | 16 | Concurrent hub calls |
 | `LIVEENGINE_TICKET_TTL_SECONDS` | 60 | Lifetime of the ticket in the descriptor |
-| Pair room capacity | 64 | Members of a `pair:` room |
+| `LIVEENGINE_MAX_ROOM_CAPACITY` | 64 | Maximum requested pair room capacity |
 
 ## Errors
 
@@ -235,3 +235,5 @@ The Rust client times out after five seconds, so it cannot wait for a partner fo
 - No pairing into a central hub, or into an ordinary room of a peer.
 - No reservation or release of the pairing: leaving a room is an engine call (`leave`).
 - No credential for discovery; it is administrator-only.
+
+Pair requests accept `target.capacity`, an integer from 2 through `LIVEENGINE_MAX_ROOM_CAPACITY`. When omitted it defaults to 2, so a plain pair is a pair. A full peer room is excluded from matching; a later peer joins another room or waits. Existing peer rooms retain their original capacity.

@@ -357,3 +357,24 @@ fn pair_peers_is_atomic_and_system_rooms_are_not_server_matches() {
     call(&mut e, "leave", vec![json!("b")]);
     assert!(call(&mut e, "getServer", vec![json!("room")]).is_null());
 }
+
+#[test]
+fn pair_peers_capacity_is_atomic_and_uses_existing_room_limit() {
+    let mut e = Engine::new(0);
+    call(
+        &mut e,
+        "pairPeers",
+        vec![
+            json!({"room":"r","capacity":2,"users":[{"id":"a","scopes":{}},{"id":"b","scopes":{}}]}),
+        ],
+    );
+    assert!(e.dispatch("pairPeers", vec![json!({"room":"r","capacity":64,"users":[{"id":"a","scopes":{}},{"id":"c","scopes":{}}]})]).is_err());
+    assert_eq!(
+        call(&mut e, "getServer", vec![json!("r")])["members"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(call(&mut e, "getUser", vec![json!("c")]), Value::Null);
+}

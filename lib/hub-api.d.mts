@@ -42,6 +42,8 @@ export interface HubApiOptions {
   /** The hub's `auth` verifier. Unset leaves the hub open. */
   auth?: HubAuth;
   peerLink?: HubApiPeerLink;
+  /** Capacity of newly created pair rooms. Default 2. */
+  roomCapacity?: number;
   /** Pages allowed to call the API: a list of origins, or a predicate. A POST without an allowed Origin is refused. */
   allowedOrigins?: Iterable<string> | ((origin: string) => boolean);
   /** When set, a request with another Host header is refused (DNS rebinding). */

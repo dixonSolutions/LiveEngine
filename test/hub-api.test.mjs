@@ -63,7 +63,7 @@ async function serve(options, { mount = '' } = {}) {
   return { api, base, request, server };
 }
 
-before(async () => { hub = await startHub(); admin = new HubClient(hub.address, { token: ADMIN_TOKEN }); });
+before(async () => { hub = await startHub({ LIVEENGINE_RATE_LIMIT_REQUESTS: '10000' }); admin = new HubClient(hub.address, { token: ADMIN_TOKEN }); });
 after(async () => {
   for (const client of clients) client.close();
   for (const api of apis) api.close();
@@ -339,4 +339,15 @@ describe('hub auth', () => {
     assert.equal(accepted.status, 200);
     assert.equal((await app.request('renew', { body: { userId: 'api-player' } })).status, 403);
   });
+});
+
+test('roomCapacity is passed to pairing', async () => {
+  const app = await serve({ hubId: 'api-capacity', roomCapacity: 3, limits: { requestsPerMinute: 100 } });
+  const answers = [];
+  for (const userId of ['capacity-a', 'capacity-b', 'capacity-c']) answers.push(await app.request('pair', { body: { userId } }));
+  assert.ok(answers.every(answer => answer.status === 200), JSON.stringify(answers));
+  assert.ok(answers.every(answer => answer.body.room === answers[0].body.room));
+  const room = await admin.call('api-capacity', 'getServer', [answers[0].body.room]);
+  assert.equal(room.capacity, 3);
+  assert.equal(room.members.length, 3);
 });

@@ -577,6 +577,20 @@ impl Engine {
                 if self.servers.get(room).is_some_and(|s| !s.system) {
                     return Err("room already exists".into());
                 }
+                if let Some(server) = self.servers.get(room) {
+                    let needed = users
+                        .iter()
+                        .filter(|user| {
+                            let id = user["id"].as_str().unwrap();
+                            !server.members.iter().any(|member| member == id)
+                        })
+                        .count();
+                    if server.members.len().saturating_add(needed) > server.capacity as usize {
+                        return Err("room at capacity".into());
+                    }
+                } else if users.len() > capacity as usize {
+                    return Err("room at capacity".into());
+                }
                 let mut next = self.clone();
                 if !next.servers.contains_key(room) {
                     let mut server = next.make_server(&json!({"id":room,"capacity":capacity}))?;

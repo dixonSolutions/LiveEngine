@@ -102,6 +102,8 @@ pub struct HubConfig {
     pub max_pair_wait: Duration,
     /// Most peers waiting in `pair` requests at once on one hub.
     pub max_pending_pairs: usize,
+    /// Maximum requested pair room capacity.
+    pub max_room_capacity: usize,
     pub rate_limit_requests: usize,
     pub rate_limit_window: Duration,
     pub rate_limit_peers: usize,
@@ -141,6 +143,7 @@ impl Default for HubConfig {
             request_timeout: Duration::from_secs(5),
             max_pair_wait: Duration::from_secs(30),
             max_pending_pairs: 1024,
+            max_room_capacity: 64,
             rate_limit_requests: 120,
             rate_limit_window: Duration::from_secs(60),
             rate_limit_peers: 4096,
@@ -217,6 +220,8 @@ impl HubConfig {
         )? as u64);
         config.max_pending_pairs =
             env_limit("LIVEENGINE_MAX_PENDING_PAIRS", config.max_pending_pairs)?;
+        config.max_room_capacity =
+            env_limit("LIVEENGINE_MAX_ROOM_CAPACITY", config.max_room_capacity)?;
         config.call_queue = Duration::from_millis(env_limit(
             "LIVEENGINE_CALL_QUEUE_MS",
             config.call_queue.as_millis() as usize,
@@ -291,6 +296,8 @@ impl HubConfig {
             || self.max_generates_per_call == 0
             || self.max_inflight_calls == 0
             || self.max_pending_pairs == 0
+            || self.max_room_capacity < 2
+            || self.max_room_capacity > u32::MAX as usize
             || self.max_queued_calls == 0
             || self.rate_limit_requests == 0
             || self.rate_limit_peers == 0

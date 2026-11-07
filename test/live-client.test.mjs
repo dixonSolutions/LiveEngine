@@ -54,12 +54,12 @@ after(async () => {
 });
 
 /** Two peers in one room, paired through the hub. Returns both descriptors. */
-async function pairPeers(extra = {}) {
+async function pairPeers(extra = {}, capacity = 2) {
   const group = `g${++counter}`;
   const a = `${group}-a`;
   const b = `${group}-b`;
   await admin.call('game', 'upsertUser', [{ id: a, scopes: { group } }]);
-  const second = await admin.pair({ subject: { id: b, scopes: {} }, target: { kind: 'peer', requirements: { group } } });
+  const second = await admin.pair({ subject: { id: b, scopes: {} }, target: { kind: 'peer', requirements: { group }, capacity } });
   const first = { ...second, userId: a, ...(await admin.ticket('game', { userId: a, serverId: second.room })) };
   return { a: { ...first, ...extra }, b: { ...second, ...extra }, room: second.room };
 }
@@ -681,7 +681,7 @@ describe('LiveClient direct path over a real hub (injected RTCPeerConnection)', 
   test('directBroadcast sends a broadcast over each open channel and relays only to peers without one', async () => {
     const net = new FakeNet();
     const RTCPeerConnection = net.rtc();
-    const { a, b } = await pairPeers();
+    const { a, b } = await pairPeers({}, 3);
     const group = a.userId.split('-')[0];
     const carolId = `${group}-c`;
     const carolPairing = await admin.pair({ subject: { id: carolId, scopes: {} }, target: { kind: 'peer', requirements: { group } } });
@@ -778,7 +778,7 @@ describe('connectLive', () => {
       seen.push({ url: req.url, request });
       const reply = (status, value) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
       try {
-        const target = { kind: 'hub', requirements: { tier: request.tier } };
+        const target = { kind: 'hub', requirements: { tier: request.tier }, capacity: 64 };
         const pairing = { subject: { id: request.userId, scopes: {} }, target, credential: request.credential };
         if (req.url === '/pair') return reply(200, await admin.pair(pairing));
         if (req.url === '/renew') return reply(200, await admin.renewal(pairing)({ credential: request.credential }));

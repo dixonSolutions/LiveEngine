@@ -263,7 +263,7 @@ export interface DiscoveryCandidate { kind: 'hub' | 'peer'; id: string; path: st
 export interface PairRequest {
   subject: { id: string; kind?: 'peer' | 'hub'; scopes?: Record<string, unknown>; credential?: string };
   /** `id` narrows the match to one named hub or peer, for hubs that share scopes. */
-  target?: { kind: 'hub' | 'peer' | 'any'; id?: string; requirements?: Record<string, unknown> };
+  target?: { kind: 'hub' | 'peer' | 'any'; id?: string; requirements?: Record<string, unknown>; capacity?: number };
   path?: string[];
   /** The subject's credential for a hub that sets `auth`. Overrides `subject.credential`. */
   credential?: string;

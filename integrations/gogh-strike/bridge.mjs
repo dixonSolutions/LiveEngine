@@ -43,6 +43,7 @@ const api = createHubApi({
   // "hub" pairs every player with the hub's shared room. "peer" pairs players with each other
   // (the hub is still the signalling and fallback path); the first player waits for the next.
   peerLink: {kind: process.env.GOGH_LIVE_LINK === 'peer' ? 'peer' : 'hub', waitMs: positive(process.env.GOGH_PEER_WAIT_MS, 30_000)},
+  roomCapacity: positive(process.env.GOGH_MATCH_CAPACITY, 12),
   allowedOrigins, basePath: '/api/liveengine',
   limits: {requestsPerMinute: positive(process.env.GOGH_REQUEST_LIMIT, 10), readsPerMinute: positive(process.env.GOGH_REQUEST_LIMIT, 300), idleMs: positive(process.env.GOGH_IDLE_MS, 3 * 60_000)},
   // What a request says about the player, as the scopes the hub matches on.

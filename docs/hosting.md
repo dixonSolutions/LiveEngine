@@ -105,7 +105,7 @@ Set `LIVEENGINE_PUBLIC_URL` to the direct live endpoint advertised by this servi
 
 ### Pairing a named target
 
-`POST /v1/pair` takes `target: {kind, requirements?, id?}`. Without `id`, the first candidate in id
+`POST /v1/pair` takes `target: {kind, requirements?, id?, capacity?}`. Capacity defaults to 2 (a plain pair is a pair), and must be an integer from 2 to `LIVEENGINE_MAX_ROOM_CAPACITY` (default 64). Full peer rooms are excluded; later peers join another room or wait. `createHubApi` passes its `roomCapacity` option (default 2), and the Gogh Strike bridge sets it from `GOGH_MATCH_CAPACITY` (default 12). Without `id`, the first candidate in id
 order that matches `requirements` is used. With `id`, only the hub or peer of that id can match, so
 two hubs that share scopes stay distinct. A non-string or empty `id` answers `400`; an `id` that
 matches nothing answers `404`.

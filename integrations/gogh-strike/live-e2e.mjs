@@ -364,9 +364,9 @@ const once = factory => { let promise; return () => (promise ||= factory()); };
 
 async function main() {
   const chromium = await loadChromium();
-  const ports = await Promise.all(Array.from({length: 18}, () => freePort()));
+  const ports = await Promise.all(Array.from({length: 19}, () => freePort()));
   const [portNested, portPeer, portRelay, portLinkA, portLinkB, portReconnect, portWatch, portSchema,
-    portUi, portFour, portCancel, portPage, portApi, portOther, portWrongPath, portCorrect, portClosed, portSeat] = ports;
+    portUi, portFour, portCancel, portPage, portApi, portOther, portWrongPath, portCorrect, portClosed, portSeat, portCapacity] = ports;
   const origins = ports.map(port => `http://127.0.0.1:${port}`).join(',');
   const common = {LIVEENGINE_LIVE_ALLOWED_ORIGINS: origins, LIVEENGINE_ALLOWED_REMOTE_HOSTS: '127.0.0.1', LIVEENGINE_ICE_SERVERS: '[]',
     // One bridge, the test and every player share the loopback address, so the default budget of 120 requests a minute is too small.
@@ -732,8 +732,10 @@ async function main() {
   });
 
   await scenario('10 four users at once: everyone matched, nobody in two rooms, every pair exchanges data, nobody left waiting', async () => {
-    const bridge = await startBridge(portFour, central.address, centralToken, {LIVEENGINE_HUB_ID: 'gogh-four', GOGH_LIVE_LINK: 'peer'});
-    const users = await Promise.all(['four-a', 'four-b', 'four-c', 'four-d'].map(label => openPlayer(label, bridge.base, {online: true})));
+    // GOGH_E2E_USERS tries a larger crowd.
+    const crowd = Number(process.env.GOGH_E2E_USERS) || 4;
+    const bridge = await startBridge(portFour, central.address, centralToken, {LIVEENGINE_HUB_ID: 'gogh-four', GOGH_LIVE_LINK: 'peer', GOGH_MATCH_CAPACITY: String(crowd)});
+    const users = await Promise.all(Array.from({length: crowd}, (_, index) => `crowd-${index}`).map(label => openPlayer(label, bridge.base, {online: true})));
     await Promise.all(users.map(user => connectPanel(user, bridge.base)));
     await Promise.all(users.map(findMatch));
     await Promise.all(users.map(reachDirect));
@@ -743,8 +745,8 @@ async function main() {
     // may share one room or split into pairs. Either way each is in exactly one room and sees its roommates.
     const rooms = new Map();
     infos.forEach((info, index) => rooms.set(info.room, [...(rooms.get(info.room) || []), index]));
-    assert.equal([...rooms.values()].flat().length, 4, 'a player is in no room or in two');
-    assert.equal(new Set(infos.map(info => info.id)).size, 4, 'two pages share a player id');
+    assert.equal([...rooms.values()].flat().length, crowd, 'a player is in no room or in two');
+    assert.equal(new Set(infos.map(info => info.id)).size, crowd, 'two pages share a player id');
     for (const [room, members] of rooms) {
       assert.ok(members.length >= 2, `room ${room} holds a lone player`);
       const seated = (await adminC.call('gogh-four', 'getServer', [room])).members;
@@ -763,7 +765,7 @@ async function main() {
     }
     assert.ok(via.every(kind => kind === 'direct'), `frames did not travel over the data channel: ${via}`);
     const ping = await apiPing(bridge);
-    assert.deepEqual([ping.waiting, ping.seats], [0, 4], 'players are left waiting or seats are missing');
+    assert.deepEqual([ping.waiting, ping.seats], [0, crowd], 'players are left waiting or seats are missing');
     for (const user of users) assert.match(await matchText(user), /Matched with .*Direct connection/);
     assert.equal(users.reduce((sum, user) => sum + user.errors.length, 0), 0, 'page errors');
     return `rooms ${[...rooms.values()].map(members => members.length).join('+')}, ${via.length} pairwise frames ${[...new Set(via)].join('/')}, waiting ${ping.waiting}, seats ${ping.seats}`;
@@ -900,6 +902,33 @@ async function main() {
     return `LAN ${lan}, hub ${descriptorUrl}, direct on both sides; ${moved}`;
   });
 
+  await scenario('15 capacity two: five users form two rooms and the waiting user pairs with a sixth', async () => {
+    const bridge = await startBridge(portCapacity, central.address, centralToken, {LIVEENGINE_HUB_ID: 'gogh-capacity', GOGH_LIVE_LINK: 'peer', GOGH_MATCH_CAPACITY: '2'});
+    const users = await Promise.all(Array.from({length: 5}, (_, i) => openPlayer(`capacity-${i}`, bridge.base, {online: true})));
+    await Promise.all(users.map(user => connectPanel(user, bridge.base)));
+    await Promise.all(users.map(findMatch));
+    await until(async () => { const ping = await apiPing(bridge); return ping.waiting === 1 && ping.seats === 4; }, 'four matched players and one waiting', 25000);
+    const matched = [], waiting = [];
+    for (const user of users) ((await phaseOf(user)) === 'matched' ? matched : waiting).push(user);
+    assert.equal(matched.length, 4);
+    assert.equal(waiting.length, 1);
+    await Promise.all(matched.map(reachDirect));
+    const infos = await Promise.all(matched.map(sessionInfo));
+    const rooms = new Map();
+    infos.forEach(info => rooms.set(info.room, (rooms.get(info.room) || 0) + 1));
+    assert.deepEqual([...rooms.values()].sort(), [2, 2]);
+    for (const room of rooms.keys()) assert.equal((await adminC.call('gogh-capacity', 'getServer', [room])).members.length, 2);
+    const sixth = await openPlayer('capacity-5', bridge.base, {online: true});
+    await connectPanel(sixth, bridge.base);
+    await findMatch(sixth);
+    await Promise.all([reachDirect(waiting[0]), reachDirect(sixth)]);
+    const [a, b] = await Promise.all([sessionInfo(waiting[0]), sessionInfo(sixth)]);
+    assert.equal(a.room, b.room);
+    assert.ok(!rooms.has(a.room));
+    assert.equal((await adminC.call('gogh-capacity', 'getServer', [a.room])).members.length, 2);
+    return 'three rooms of two; the waiting player matched with the sixth';
+  });
+
 }
 
 for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => closeAll().finally(() => process.exit(130)));
@@ -912,7 +941,7 @@ try {
   await closeAll();
 }
 // A scenario that never ran (its setup broke) is a failure, not a skip.
-for (let number = 1; number <= 14; number++) {
+for (let number = 1; number <= 15; number++) {
   if (results.some(result => result.name.startsWith(`${number} `))) continue;
   results.push({name: `${number}`, ok: false});
   console.log(`FAIL ${number} | did not run: setup failed`);

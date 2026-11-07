@@ -176,7 +176,7 @@ export LIVEENGINE_TURN_SECRET="$(openssl rand -hex 32)"
 | `LIVEENGINE_SIGNAL_MAX_BYTES` | 16384 |
 | `directTimeoutMs` (client) | 10000 |
 | `maxFrameBytes` (client) | 65536 |
-| Room capacity of a pair room | 64 |
+| Default pair room capacity | 2 (maximum controlled by `LIVEENGINE_MAX_ROOM_CAPACITY`, default 64) |
 
 Other room and rate limits are in [live rooms](/guides/live-rooms). Details of `pair` and `waitMs` are in [find and pair](/guides/find-and-pair).
 

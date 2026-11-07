@@ -87,6 +87,7 @@ Fastify (with `@fastify/middie`) and Next route handlers pass Node requests the 
 | --- | --- |
 | `client` | A `HubClient` holding the administrator token. Omit it, with `notConfigured`, to answer `503` until configured. |
 | `hubId`, `hubPath`, `mode`, `remote` | The hub to front, the central namespace that holds it, and for `mode: "external"` the remote `{ address, hubId, token }`. |
+| `roomCapacity` | Capacity for newly created pair rooms, default 2; bounded by the hub service maximum. |
 | `scopes` | The hub's scopes, and what a hub pairing requires. |
 | `schemas`, `channels`, `auth` | What to publish and register. `auth` is the hub's verifier; unset leaves the hub open. |
 | `peerLink` | `{ kind: "hub" \| "peer", waitMs, maxWaitMs }`. Peers are kept to this hub by an `arena` scope. |

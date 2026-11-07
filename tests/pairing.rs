@@ -164,7 +164,7 @@ async fn pairing_returns_each_link_kind_through_a_remote_nest() {
     for (subject, target, link) in [
         (
             json!({"kind":"peer","id":"bob","scopes":{"rank":7,"skill":2}}),
-            json!({"kind":"peer","requirements":{"rank":7}}),
+            json!({"kind":"peer","requirements":{"rank":7},"capacity":3}),
             "peer-peer",
         ),
         (
@@ -243,7 +243,7 @@ async fn peer_pairing_uses_user_schema_and_rolls_back_failures() {
         &base,
         TOKEN,
         "/v1/hubs/game/call",
-        call("listServers", json!([])),
+        json!({"method":"listServers", "args":[]}),
     )
     .await;
     assert_eq!(rooms["result"], json!([]));
@@ -455,7 +455,7 @@ async fn peer_pairing_skips_candidates_seated_in_other_kinds_of_room() {
         "/v1/pair",
         pair(
             "newcomer",
-            json!({"kind":"peer","requirements":{"game":"g"}}),
+            json!({"kind":"peer","requirements":{"game":"g"},"capacity":3}),
         ),
     )
     .await;
@@ -817,7 +817,11 @@ async fn simultaneous_peers_pair_exactly_once() {
                 let (c, base, id) = (c.clone(), base.clone(), id.clone());
                 tokio::spawn(async move {
                     register(&c, &base, TOKEN, &id).await;
-                    post(&c, &base, TOKEN, "/v1/pair", wait_request(&id, 3000)).await
+                    {
+                        let mut request = wait_request(&id, 3000);
+                        request["target"]["capacity"] = json!(24);
+                        post(&c, &base, TOKEN, "/v1/pair", request).await
+                    }
                 })
             })
             .collect();
@@ -1035,5 +1039,136 @@ async fn a_waiter_on_a_hub_with_auth_is_authorized_when_woken() {
     )
     .await;
     assert_ne!(cat["result"]["status"], "paired", "{cat}");
+    task.abort();
+}
+
+async fn capacity_crowd(capacity: u32, count: usize) -> (Vec<Value>, Vec<Value>) {
+    let (base, task) = server(TOKEN).await;
+    let client = reqwest::Client::new();
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            TOKEN,
+            "/v1/hubs",
+            json!({"id":"arena","mode":"internal"})
+        )
+        .await
+        .0,
+        201
+    );
+    for i in 0..count {
+        let (status, body) = post(
+            &client,
+            &base,
+            TOKEN,
+            "/v1/hubs/arena/call",
+            json!({"method":"upsertUser", "args":[{"id":format!("p{i:02}"),"scopes":{"arena":"capacity"}}]}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let mut jobs = Vec::new();
+    for i in 0..count {
+        let c = client.clone();
+        let b = base.clone();
+        jobs.push(tokio::spawn(async move {
+            post(&c, &b, TOKEN, "/v1/pair", json!({"subject":{"kind":"peer","id":format!("p{i:02}"),"scopes":{"arena":"capacity"}},"target":{"kind":"peer","requirements":{"arena":"capacity"},"capacity":capacity},"waitMs":3000})).await
+        }));
+    }
+    if capacity == 2 && count == 5 {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while jobs.iter().filter(|job| job.is_finished()).count() < 4 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            jobs.iter().filter(|job| job.is_finished()).count(),
+            4,
+            "one peer must still be waiting"
+        );
+    }
+    let mut matched = Vec::new();
+    for job in jobs {
+        let (status, body) = job.await.unwrap();
+        assert!(status == 200 || status == 408, "{status}: {body}");
+        if status == 200 {
+            matched.push(body);
+        }
+    }
+    let (status, body) = post(
+        &client,
+        &base,
+        TOKEN,
+        "/v1/hubs/arena/call",
+        json!({"method":"listServers", "args":[]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let rooms = body["result"].as_array().unwrap().clone();
+    task.abort();
+    (matched, rooms)
+}
+
+#[tokio::test]
+async fn capacity_two_five_simultaneous_peers() {
+    let (matched, rooms) = capacity_crowd(2, 5).await;
+    assert_eq!(matched.len(), 4);
+    assert_eq!(rooms.len(), 2);
+    assert!(rooms
+        .iter()
+        .all(|room| room["members"].as_array().unwrap().len() == 2));
+}
+
+#[tokio::test]
+async fn capacity_three_twelve_simultaneous_peers() {
+    let (_, rooms) = capacity_crowd(3, 12).await;
+    assert!(
+        rooms
+            .iter()
+            .map(|r| r["members"].as_array().unwrap().len())
+            .sum::<usize>()
+            >= 10
+    );
+    assert!(rooms
+        .iter()
+        .all(|room| room["members"].as_array().unwrap().len() <= 3));
+}
+
+#[tokio::test]
+async fn capacity_invalid_returns_bad_request() {
+    let (base, task) = server(TOKEN).await;
+    let client = reqwest::Client::new();
+    for capacity in [
+        json!(0),
+        json!(1),
+        json!(65),
+        json!(-1),
+        json!(2.5),
+        json!(null),
+        json!("2"),
+    ] {
+        let body = json!({"subject":{"kind":"peer","id":"a","scopes":{}},"target":{"kind":"peer","capacity":capacity}});
+        assert_eq!(
+            post(&client, &base, TOKEN, "/v1/pair", body.clone())
+                .await
+                .0,
+            400
+        );
+        assert_eq!(
+            post(
+                &client,
+                &base,
+                TOKEN,
+                "/v1/route",
+                json!({"path":[],"op":"pair","body":body})
+            )
+            .await
+            .0,
+            400
+        );
+    }
     task.abort();
 }

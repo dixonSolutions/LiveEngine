@@ -521,6 +521,16 @@ pub(crate) async fn pair(
     inherited: [Option<Value>; 3],
     inherited_channels: Option<crate::live::ChannelPolicy>,
 ) -> Response {
+    let _capacity = match body.pointer("/target/capacity") {
+        None => 2,
+        Some(value) => match value
+            .as_u64()
+            .filter(|n| *n >= 2 && *n <= state.config.max_room_capacity as u64)
+        {
+            Some(n) => n,
+            None => return error(StatusCode::BAD_REQUEST, "invalid target capacity"),
+        },
+    };
     let wait = match body.get("waitMs") {
         None | Some(Value::Null) => Duration::ZERO,
         Some(value) => match value.as_u64() {
@@ -529,7 +539,21 @@ pub(crate) async fn pair(
         },
     };
     if wait.is_zero() {
-        return pair_once(state, headers, &body, inherited, inherited_channels, None).await;
+        for attempt in 0..=RACE_RETRIES {
+            let response = pair_once(
+                state.clone(),
+                headers.clone(),
+                &body,
+                inherited.clone(),
+                inherited_channels.clone(),
+                None,
+            )
+            .await;
+            if response.status() != StatusCode::CONFLICT || attempt == RACE_RETRIES {
+                return response;
+            }
+        }
+        unreachable!();
     }
     let (Some(id), Some(target)) = (
         body["subject"]
@@ -698,8 +722,9 @@ async fn seated_room(
     )
     .await
     .ok()?;
-    (server["result"]["system"] == true && server["result"]["status"] == "open")
-        .then_some(Matched { path, hub_id, room })
+    (server["result"]["system"] == true
+        && matches!(server["result"]["status"].as_str(), Some("open" | "full")))
+    .then_some(Matched { path, hub_id, room })
 }
 
 /// The waiting peer's own half of a pairing another peer made: authorize and issue its ticket.
@@ -767,6 +792,10 @@ async fn pair_once(
     inherited_channels: Option<crate::live::ChannelPolicy>,
     seat: Option<&Seat>,
 ) -> Response {
+    let capacity = body
+        .pointer("/target/capacity")
+        .and_then(Value::as_u64)
+        .unwrap_or(2);
     let Some(subject) = body.get("subject").and_then(Value::as_object) else {
         return error(StatusCode::BAD_REQUEST, "invalid subject");
     };
@@ -919,7 +948,10 @@ async fn pair_once(
                     else {
                         continue;
                     };
-                    if server["result"]["system"] != true || server["result"]["status"] != "open" {
+                    if server["result"]["system"] != true
+                        || server["result"]["status"] != "open"
+                        || server["result"]["free"].as_u64().unwrap_or(0) == 0
+                    {
                         continue;
                     }
                 }
@@ -1042,7 +1074,7 @@ async fn pair_once(
             "call",
             call(
                 "pairPeers",
-                vec![json!({"room":room,"capacity":64,"users":[
+                vec![json!({"room":room,"capacity":capacity,"users":[
                     {"id":target_id,"scopes":target_scopes},
                     {"id":id,"scopes":subject["scopes"]}
                 ]})],
@@ -1052,11 +1084,13 @@ async fn pair_once(
         .await;
         if let Err(e) = result {
             // A waiting caller that lost a race for a partner who was paired meanwhile asks again.
-            if seat.is_some() && e.status() == StatusCode::BAD_REQUEST {
+            if e.status() == StatusCode::BAD_REQUEST {
                 let text = axum::body::to_bytes(e.into_body(), 4096)
                     .await
                     .unwrap_or_default();
-                if String::from_utf8_lossy(&text).contains("already paired") {
+                if String::from_utf8_lossy(&text).contains("already paired")
+                    || String::from_utf8_lossy(&text).contains("room at capacity")
+                {
                     return error(StatusCode::CONFLICT, "peer already paired");
                 }
                 return error(StatusCode::BAD_REQUEST, "pairing refused");
@@ -1085,7 +1119,7 @@ async fn pair_once(
         }
     } else {
         if existing.is_none() {
-            let server = json!({"id":room,"scopes":target_scopes,"capacity":64});
+            let server = json!({"id":room,"scopes":target_scopes,"capacity":capacity});
             if let Err(e) = routed(
                 state.clone(),
                 headers.clone(),
