@@ -144,16 +144,12 @@ describe('bridge with a real hub', () => {
   });
 
   test('renew gives a known player a fresh ticket and refuses a stranger', async () => {
-    await bridge.join('gogh-renew');
-    const renewed = await bridge.post('renew', {userId: 'gogh-renew'});
-    assert.equal(renewed.status, 200);
-    assert.equal(renewed.body.userId, 'gogh-renew');
-    assert.equal(renewed.body.room, 'pair:hub:gogh-live');
-    assert.ok(renewed.body.ticket);
-    assert.equal((await bridge.post('renew', {userId: 'gogh-nobody'})).status, 404);
-    const left = await bridge.post('leave', {userId: 'gogh-renew'});
-    assert.equal(left.status, 200);
-    assert.equal((await bridge.post('renew', {userId: 'gogh-renew'})).status, 404);
+    const client = await bridge.join('gogh-renew');
+    assert.equal((await bridge.post('renew', {userId: 'gogh-renew'})).status, 403);
+    assert.equal((await bridge.post('renew', {userId: 'gogh-nobody'})).status, 403);
+    assert.equal((await client.heartbeat()).ok, true);
+    assert.equal((await client.leave()).ok, true);
+    assert.equal((await bridge.post('renew', {userId: 'gogh-renew'})).status, 403);
   });
 
   test('a dropped connection reconnects through the renew route with a new ticket', async () => {
@@ -201,12 +197,19 @@ describe('bridge with hub auth', () => {
     assert.match(refused.body.error, /credential refused/);
     assert.equal((await bridge.post('pair', {userId: 'gogh-auth-player', credential: 'wrong-credential-0123456789abcdef-zzzz'})).status, 403);
     await assert.rejects(bridge.join('gogh-auth-player', {credential: 'wrong-credential-0123456789abcdef-zzzz'}), error => error.status === 403 && error.fatal === true);
-    const client = await bridge.join('gogh-auth-player', {credential: USER_TOKEN});
+    let seatToken;
+    const client = await connectLive({ pairUrl: `${bridge.base}/api/liveengine/pair`, renewUrl: `${bridge.base}/api/liveengine/renew`, body: {userId: 'gogh-auth-player'}, credential: USER_TOKEN, direct: false, fetch: async (url, init) => {
+      const response = await fetch(url, {...init, headers: {...init.headers, Origin: bridge.base}});
+      if (url.endsWith('/pair') && response.ok) seatToken = (await response.clone().json()).seatToken;
+      return response;
+    }});
+    clients.push(client);
     assert.equal(client.state, 'open');
     assert.deepEqual(client.identity, {identity: 'gogh-auth-player', claims: {tier: 'gold'}});
     // Credentials are not kept: renewing needs the player to present one again.
     assert.equal((await bridge.post('renew', {userId: 'gogh-auth-player'})).status, 403);
-    assert.equal((await bridge.post('renew', {userId: 'gogh-auth-player', credential: USER_TOKEN})).status, 200);
+    assert.equal((await bridge.post('renew', {userId: 'gogh-auth-player', seatToken})).status, 403);
+    assert.equal((await bridge.post('renew', {userId: 'gogh-auth-player', seatToken, credential: USER_TOKEN})).status, 200);
   });
 
   test('a credential cannot mint a ticket for a different player id', async () => {
@@ -215,7 +218,7 @@ describe('bridge with hub auth', () => {
 });
 
 describe('bridge peer pairing and registry watch', () => {
-  let bridge, peerRoom;
+  let bridge, peerRoom, peerSeatToken;
   before(async () => { bridge = await startBridge({LIVEENGINE_HUB_ID: 'gogh-peers', GOGH_LIVE_LINK: 'peer', GOGH_PEER_WAIT_MS: '5000'}); });
 
   test('the first player waits, the second completes the pairing, and both get a peer-peer descriptor for one room', async () => {
@@ -232,6 +235,7 @@ describe('bridge peer pairing and registry watch', () => {
     }
     assert.equal(held.body.room, second.body.room);
     peerRoom = held.body.room;
+    peerSeatToken = second.body.seatToken;
     assert.equal(held.body.userId, 'gogh-peer-a');
     assert.equal(second.body.userId, 'gogh-peer-b');
     // Their tickets work: both connect and see each other.
@@ -244,18 +248,18 @@ describe('bridge peer pairing and registry watch', () => {
   });
 
   test('renew gives a paired peer a fresh ticket without pairing again', async () => {
-    const renewed = await bridge.post('renew', {userId: 'gogh-peer-b'});
+    const renewed = await bridge.post('renew', {userId: 'gogh-peer-b', seatToken: peerSeatToken});
     assert.equal(renewed.status, 200);
     assert.equal(renewed.body.link, 'peer-peer');
     assert.equal(renewed.body.room, peerRoom);
-    assert.equal((await bridge.post('renew', {userId: 'gogh-peer-nobody'})).status, 404);
+    assert.equal((await bridge.post('renew', {userId: 'gogh-peer-nobody'})).status, 403);
   });
 
   test('a lone player is told when no one arrived, and is not left registered', async () => {
     const other = await startBridge({LIVEENGINE_HUB_ID: 'gogh-lonely', GOGH_LIVE_LINK: 'peer', GOGH_PEER_WAIT_MS: '700'});
     const result = await other.post('pair', {userId: 'gogh-lonely-a', team: 0, role: 'vanguard'});
     assert.equal(result.status, 408);
-    assert.equal((await other.post('renew', {userId: 'gogh-lonely-a'})).status, 404);
+    assert.equal((await other.post('renew', {userId: 'gogh-lonely-a'})).status, 403);
   });
 
   test('watch issues a ticket the browser can open the registry with, and shows no token', async () => {

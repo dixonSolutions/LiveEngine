@@ -16,7 +16,7 @@ It is dependency-free ESM (`@dixonsolutions/liveengine/hub-api`), has no knowled
 | Renewal | `renew` gives a paired player a fresh single-use ticket. Credentials are never stored, so a hub with `auth` needs the player to send one again. |
 | Seats | The API tracks each player it paired, serialises operations per player, and caps players at `limits.maxPlayers`. |
 | Idle reaper | A seat with no `heartbeat` for `limits.idleMs` is released on the hub. |
-| Cancel | A page that drops its pairing request, or calls `leave` while it waits, leaves the engine's queue at once. A left player is also removed from the hub: `leave` alone returns a player to "waiting", which would make them a ghost candidate for the next pairing. |
+| Cancel | A page that drops its pairing request, leaves the engine's queue at once. A left player is also removed from the hub: `leave` alone returns a player to "waiting", which would make them a ghost candidate for the next pairing. |
 | Watch tickets | `watch` issues a read-only registry ticket and the registry URL, so a page can show a live hub list without the token. |
 | Browser access | Origin checks, CORS for `allowedOrigins`, preflight with the private-network opt-in, optional Host checks, body and rate limits. |
 
@@ -30,9 +30,9 @@ Paths are relative to where you mount the handler.
 | `ping` | GET | `{ ok, hubId, hubPingMs, serverTimeMs, waiting, seats }`. `hubPingMs` is the hub's own ping from this API; the page times its round trip to get its own. `waiting` counts pairing requests currently held. |
 | `live-client.mjs` | GET | `LiveClient` and `connectLive`, with CORS, so a page on another origin can load them from the API. |
 | `pair` | POST | `{ userId, waitMs?, credential?, ...yours }`: the descriptor for `LiveClient`. `waitMs` is clamped to `peerLink.maxWaitMs`. |
-| `renew` | POST | `{ userId, credential? }`: a fresh descriptor, or `404` for a stranger. |
-| `heartbeat` | POST | `{ userId }`: keeps the seat; `404` if there is none. |
-| `leave` | POST | `{ userId }`: releases the seat, also while a pairing is still waiting. |
+| `renew` | POST | `{ userId, seatToken, credential? }`: a fresh descriptor; invalid or missing seat tokens receive `403`. |
+| `heartbeat` | POST | `{ userId, seatToken }`: keeps the seat; invalid or missing tokens receive `403`. |
+| `leave` | POST | `{ userId, seatToken }`: releases the seat. |
 | `discover` | POST | `{ kind?, depth?, requirements? }`: public candidates under the hub path. |
 | `watch` | POST | `{ depth? }`: `{ url, ticket, expiresAt, path, depth }`. |
 | `join` | POST | Only with the `join` option: the older seat-based matchmaking. |
@@ -114,7 +114,7 @@ const hubs = await watchHubs({ watchUrl: 'https://api.example.net/api/live/watch
 hubs.on('change', list => render(list));
 ```
 
-To cancel a search, abort the `fetch` you gave `connectLive` and `POST` to `leave`. The page's origin must be in `allowedOrigins`, and the hub's `LIVEENGINE_LIVE_ALLOWED_ORIGINS` must list it too for the room socket and the registry socket.
+To cancel a search, abort the `fetch` you gave `connectLive`. A successful `pair` or legacy `join` returns a random `seatToken`; keep it private and send it in the body on repeat pair, renew, heartbeat and leave. `connectLive` retains it internally and exposes `client.heartbeat()` and `client.leave()`. The API stores only its hash. The page's origin must be in `allowedOrigins`, and the hub's `LIVEENGINE_LIVE_ALLOWED_ORIGINS` must list it too for the room socket and the registry socket.
 
 <Warning>
   The API has no player authentication of its own. Use the hub's `auth` and pass the player's `credential` through, or put an authenticated proxy in front of it. Rate limits are per client address: behind a proxy, put the real address in front of the handler.

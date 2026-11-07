@@ -177,18 +177,16 @@ index 22dacf2..dec3c57 100644
  }
 diff --git a/src/liveengine-matchmaking.js b/src/liveengine-matchmaking.js
 new file mode 100644
-index 0000000..110033f
+index 0000000..0f481ac
 --- /dev/null
 +++ b/src/liveengine-matchmaking.js
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,267 @@
 +const USER_KEY = 'gogh-strike-liveengine-user';
 +const CREDENTIAL_KEY = 'gogh-strike-liveengine-credential';
 +const HUB_KEY = 'gogh-strike-liveengine-hub-api';
 +const DEFAULT_API = '/api/liveengine';
 +const FIND_WAIT_MS = 30_000;
 +const PING_EVERY_MS = 5_000;
-+let activeUser;
-+let activeBase = DEFAULT_API;
 +let heartbeat;
 +let session;
 +
@@ -240,9 +238,8 @@ index 0000000..110033f
 +    directBroadcast: true,
 +  });
 +  session = client;
-+  activeUser = userId;
 +  heartbeat = setInterval(() => {
-+    fetch(`${activeBase}/heartbeat`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({userId})}).catch(() => {});
++    client.heartbeat().catch(() => {});
 +  }, 60_000);
 +  return {ok: true, userId, serverId: client.room, peers: client.peers().length};
 +}
@@ -411,11 +408,9 @@ index 0000000..110033f
 +    });
 +    if (controller.signal.aborted) { client.close(); return null; }
 +    session = client;
-+    activeUser = userId;
-+    activeBase = base;
 +    clearInterval(heartbeat);
 +    heartbeat = setInterval(() => {
-+      fetch(`${base}/heartbeat`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({userId})}).catch(() => {});
++      client.heartbeat().catch(() => {});
 +    }, 60_000);
 +    const refresh = () => { if (session === client) setOnline({match: describeMatch(client)}); };
 +    client.on('presence', refresh);
@@ -436,27 +431,20 @@ index 0000000..110033f
 +/** Stop searching: the pairing request is dropped and the seat is released. */
 +export async function cancelFind() {
 +  if (!search) return;
-+  const base = online.base;
 +  search.abort();
 +  search = undefined;
 +  setOnline({phase: 'connected', error: ''});
-+  const body = JSON.stringify({userId: localUserId()});
-+  await fetch(`${base}/leave`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body}).catch(() => {});
 +}
 +
 +export function hasLiveMatch() { return session?.state === 'open'; }
 +
 +export function leaveLiveEngineMatch() {
 +  clearInterval(heartbeat);
-+  session?.close();
++  const client = session;
 +  session = undefined;
++  client?.leave().catch(() => {});
++  client?.close();
 +  if (online.phase === 'matched') setOnline({phase: 'connected', match: null});
-+  if (!activeUser) return;
-+  const body = JSON.stringify({userId: activeUser});
-+  activeUser = undefined;
-+  if (!navigator.sendBeacon(`${activeBase}/leave`, new Blob([body], {type: 'application/json'}))) {
-+    fetch(`${activeBase}/leave`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body, keepalive: true}).catch(() => {});
-+  }
 +}
 +
 +window.addEventListener('pagehide', leaveLiveEngineMatch);

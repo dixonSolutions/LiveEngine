@@ -167,7 +167,7 @@ describe('without a client', () => {
 
 describe('hub pairing: one shared room', () => {
   let app;
-  before(async () => { app = await serve({ hubId: 'api-room', allowedOrigins: [] }); });
+  before(async () => { app = await serve({ hubId: 'api-room', allowedOrigins: [], limits: { requestsPerMinute: 1000 } }); });
   const post = (route, body) => app.request(route, { body });
 
   test('pair, renew, heartbeat and leave track the seat; the descriptor carries a working single-use ticket', async () => {
@@ -180,15 +180,44 @@ describe('hub pairing: one shared room', () => {
     clients.push(client);
     await client.connect();
     assert.equal(client.state, 'open');
-    const renewed = await post('renew', { userId: 'room-a' });
+    const seatToken = paired.body.seatToken;
+    const renewed = await post('renew', { userId: 'room-a', seatToken });
     assert.equal(renewed.status, 200);
     assert.notEqual(renewed.body.ticket, paired.body.ticket);
-    assert.equal((await post('heartbeat', { userId: 'room-a' })).status, 200);
-    assert.equal((await post('heartbeat', { userId: 'room-nobody' })).status, 404);
-    assert.equal((await post('renew', { userId: 'room-nobody' })).status, 404);
-    assert.equal((await post('leave', { userId: 'room-a' })).status, 200);
+    assert.equal((await post('heartbeat', { userId: 'room-a', seatToken })).status, 200);
+    assert.equal((await post('heartbeat', { userId: 'room-nobody' })).status, 403);
+    assert.equal((await post('renew', { userId: 'room-nobody' })).status, 403);
+    assert.equal((await post('leave', { userId: 'room-a', seatToken })).status, 200);
     assert.deepEqual(app.api.stats(), { seats: 0, waiting: 0, pairings: 0 });
-    assert.equal((await post('renew', { userId: 'room-a' })).status, 404);
+    assert.equal((await post('renew', { userId: 'room-a' })).status, 403);
+  });
+
+  test('seat token prevents impersonation and is absent from other responses', async () => {
+    const victim = await post('pair', { userId: 'seat-victim' });
+    const token = victim.body.seatToken;
+    assert.match(token, /^[a-f0-9]{64}$/);
+    const socket = new LiveClient(victim.body, { direct: false });
+    clients.push(socket);
+    await socket.connect();
+    for (const route of ['renew', 'leave', 'heartbeat', 'pair']) {
+      for (const seatToken of [undefined, 'wrong-seat-token']) {
+        const response = await post(route, { userId: 'seat-victim', seatToken });
+        assert.equal(response.status, 403, route);
+        assert.ok(!response.text.includes(token));
+      }
+    }
+    assert.equal(socket.state, 'open');
+    assert.equal((await admin.call('api-room', 'getUser', ['seat-victim'])).status, 'paired');
+    for (const route of ['status', 'ping']) assert.ok(!(await app.request(route, { method: 'GET' })).text.includes(token));
+    for (const [route, body] of [['discover', {}], ['watch', {}], ['heartbeat', { userId: 'seat-victim', seatToken: token }], ['renew', { userId: 'seat-victim', seatToken: token }]]) {
+      const response = await post(route, body);
+      assert.equal(response.status, 200, route);
+      assert.ok(!response.text.includes(token), route);
+    }
+    const repeat = await post('pair', { userId: 'seat-victim', seatToken: token });
+    assert.equal(repeat.status, 200);
+    assert.equal(repeat.body.seatToken, token);
+    assert.equal((await post('leave', { userId: 'seat-victim', seatToken: token })).status, 200);
   });
 
   test('discover lists the hub with only public fields, and watch issues a ticket without the token', async () => {
@@ -219,14 +248,30 @@ describe('hub pairing: one shared room', () => {
     const quick = await serve({ hubId: 'api-idle', allowedOrigins: [], limits: { idleMs: 500, requestsPerMinute: 1000 } });
     const send = (route, userId) => quick.request(route, { body: { userId } });
     assert.equal((await send('pair', 'idle-a')).status, 200);
-    assert.equal((await send('pair', 'idle-b')).status, 200);
+    const active = await send('pair', 'idle-b');
+    assert.equal(active.status, 200);
     await until(async () => {
-      assert.equal((await send('heartbeat', 'idle-b')).status, 200);
+      assert.equal((await quick.request('heartbeat', { body: { userId: 'idle-b', seatToken: active.body.seatToken } })).status, 200);
       return quick.api.stats().seats === 1;
     }, 'the idle seat to be released');
     assert.notEqual((await admin.call('api-idle', 'getUser', ['idle-a']))?.status, 'paired');
     assert.equal((await admin.call('api-idle', 'getUser', ['idle-b'])).status, 'paired');
   });
+});
+
+test('seat token protects legacy join and its owner can leave', async () => {
+  const app = await serve({ hubId: 'api-legacy-seat', join: { server: { id: 'legacy-room', scopes: { app: 'test' }, maxUsers: 10 } }, limits: { requestsPerMinute: 1000 } });
+  const post = (route, body) => app.request(route, { body });
+  const joined = await post('join', { userId: 'legacy-seat' });
+  assert.equal(joined.status, 200);
+  const token = joined.body.seatToken;
+  assert.match(token, /^[a-f0-9]{64}$/);
+  for (const seatToken of [undefined, 'wrong-seat-token']) {
+    assert.equal((await post('join', { userId: 'legacy-seat', seatToken })).status, 403);
+    assert.equal((await post('leave', { userId: 'legacy-seat', seatToken })).status, 403);
+  }
+  assert.equal((await post('join', { userId: 'legacy-seat', seatToken: token })).status, 200);
+  assert.equal((await post('leave', { userId: 'legacy-seat', seatToken: token })).status, 200);
 });
 
 describe('peer pairing with waitMs', () => {
@@ -245,17 +290,17 @@ describe('peer pairing with waitMs', () => {
     assert.equal(held.body.link, 'peer-peer');
     assert.equal(held.body.room, second.body.room);
     assert.equal(app.api.stats().waiting, 0);
-    const renewed = await post('renew', { userId: 'peer-b' });
+    const renewed = await post('renew', { userId: 'peer-b', seatToken: second.body.seatToken });
     assert.equal(renewed.body.room, held.body.room);
-    await post('leave', { userId: 'peer-a' });
-    await post('leave', { userId: 'peer-b' });
+    await post('leave', { userId: 'peer-a', seatToken: held.body.seatToken });
+    await post('leave', { userId: 'peer-b', seatToken: second.body.seatToken });
   });
 
   test('a page that drops its pairing request leaves the queue and no seat behind', async () => {
     const controller = new AbortController();
     const dropped = fetch(`${app.base}/pair`, { method: 'POST', headers: { Origin: app.base }, body: JSON.stringify({ userId: 'peer-drop', waitMs: 3000 }), signal: controller.signal }).catch(error => error.name);
     await until(() => app.api.stats().waiting === 1, 'the request to wait');
-    assert.ok(await admin.call('api-peers', 'getUser', ['peer-drop']), 'the candidate was never registered');
+    await until(() => admin.call('api-peers', 'getUser', ['peer-drop']), 'the candidate to be registered');
     controller.abort();
     assert.equal(await dropped, 'AbortError');
     await until(async () => app.api.stats().waiting === 0 && (await admin.call('api-peers', 'getUser', ['peer-drop'])) === null, 'the seat to be gone');
@@ -263,18 +308,17 @@ describe('peer pairing with waitMs', () => {
     // A later pair is unaffected: it waits and is not matched with the dropped player.
     const lone = post('pair', { userId: 'peer-after', waitMs: 600 });
     assert.equal((await lone).status, 408);
-    assert.equal((await post('renew', { userId: 'peer-after' })).status, 404);
+    assert.equal((await post('renew', { userId: 'peer-after' })).status, 403);
   });
 
-  test('leave stops a pairing that is still waiting at once instead of after the wait', async () => {
-    const waiting = post('pair', { userId: 'peer-leave', waitMs: 4000 });
+  test('seat authorization refuses leave during a pending pairing', async () => {
+    const controller = new AbortController();
+    const waiting = fetch(`${app.base}/pair`, { method: 'POST', headers: { Origin: app.base }, body: JSON.stringify({ userId: 'peer-leave', waitMs: 4000 }), signal: controller.signal }).catch(error => error.name);
     await until(() => app.api.stats().waiting === 1, 'the request to wait');
-    const started = Date.now();
-    assert.equal((await post('leave', { userId: 'peer-leave' })).status, 200);
-    assert.ok(Date.now() - started < 2000, 'leave waited for the pairing');
-    assert.equal((await waiting).status, 409);
-    assert.equal(await admin.call('api-peers', 'getUser', ['peer-leave']), null);
-    assert.deepEqual(app.api.stats(), { seats: 0, waiting: 0, pairings: 0 });
+    assert.equal((await post('leave', { userId: 'peer-leave' })).status, 403);
+    controller.abort();
+    assert.equal(await waiting, 'AbortError');
+    await until(async () => app.api.stats().waiting === 0 && await admin.call('api-peers', 'getUser', ['peer-leave']) === null, 'cancelled seat');
   });
 
   test('the page may ask for a shorter wait, never a longer one than the API allows', async () => {

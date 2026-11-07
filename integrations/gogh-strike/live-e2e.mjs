@@ -364,9 +364,9 @@ const once = factory => { let promise; return () => (promise ||= factory()); };
 
 async function main() {
   const chromium = await loadChromium();
-  const ports = await Promise.all(Array.from({length: 17}, () => freePort()));
+  const ports = await Promise.all(Array.from({length: 18}, () => freePort()));
   const [portNested, portPeer, portRelay, portLinkA, portLinkB, portReconnect, portWatch, portSchema,
-    portUi, portFour, portCancel, portPage, portApi, portOther, portWrongPath, portCorrect, portClosed] = ports;
+    portUi, portFour, portCancel, portPage, portApi, portOther, portWrongPath, portCorrect, portClosed, portSeat] = ports;
   const origins = ports.map(port => `http://127.0.0.1:${port}`).join(',');
   const common = {LIVEENGINE_LIVE_ALLOWED_ORIGINS: origins, LIVEENGINE_ALLOWED_REMOTE_HOSTS: '127.0.0.1', LIVEENGINE_ICE_SERVERS: '[]',
     // One bridge, the test and every player share the loopback address, so the default budget of 120 requests a minute is too small.
@@ -389,6 +389,38 @@ async function main() {
   onClose(() => browser.close());
 
   // 1. Central hub, a nested central and a hub created on demand with its own auth.
+  await scenario('seat impersonation: a third browser cannot renew or remove a peer learned from presence', async () => {
+    const bridge = await startBridge(portSeat, central.address, centralToken, {LIVEENGINE_HUB_ID: 'gogh-seat'});
+    await bridge.warm();
+    const contexts = await Promise.all([0, 1, 2].map(() => browser.newContext()));
+    for (const context of contexts) onClose(() => context.close());
+    const pages = await Promise.all(contexts.map(context => context.newPage()));
+    await Promise.all(pages.map(page => page.goto(`${bridge.base}/health`)));
+    const ids = ['seat-browser-a', 'seat-browser-b', 'seat-browser-attacker'];
+    for (let i = 0; i < pages.length; i++) {
+      await pages[i].evaluate(async userId => {
+        const {connectLive} = await import('/api/liveengine/live-client.mjs');
+        window.seatTest = await connectLive({pairUrl: '/api/liveengine/pair', renewUrl: '/api/liveengine/renew', body: {userId}, direct: false});
+      }, ids[i]);
+    }
+    await until(() => pages[2].evaluate(id => window.seatTest.peers().includes(id), ids[0]), 'attacker to learn victim id from presence');
+    const statuses = await pages[2].evaluate(async () => {
+      const userId = window.seatTest.peers().find(id => id === 'seat-browser-a');
+      const results = [];
+      for (const route of ['renew', 'leave']) {
+        const response = await fetch(`/api/liveengine/${route}`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({userId})});
+        results.push(response.status);
+      }
+      return results;
+    });
+    assert.deepEqual(statuses, [403, 403]);
+    assert.equal(await pages[0].evaluate(() => window.seatTest.state), 'open');
+    assert.ok(await pages[1].evaluate(id => window.seatTest.peers().includes(id), ids[0]));
+    assert.equal((await adminC.call('gogh-seat', 'getUser', [ids[0]])).status, 'paired');
+    for (const page of pages) await page.evaluate(() => window.seatTest.leave());
+    return 'both unauthorized requests refused; victim remains connected and seated';
+  });
+
   await scenario('1 central, nested central and on-demand hub with its own auth', async () => {
     await adminC.contract();
     await adminC.register({id: 'region', mode: 'central'});

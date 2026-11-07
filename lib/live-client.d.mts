@@ -9,12 +9,15 @@ export interface ConnectLiveOptions extends LiveClientOptions {
   pairUrl: string;
   /** Posted for a fresh descriptor on reconnect. Defaults to `pairUrl`. */
   renewUrl?: string;
+  /** Seat routes; default to replacing the final /pair in pairUrl. */
+  leaveUrl?: string;
+  heartbeatUrl?: string;
   /** The request body `pairUrl` and `renewUrl` receive. */
   body?: Record<string, unknown>;
   fetch?: typeof fetch;
 }
 /** Pair through the application's own routes, connect, and resolve with the open client. */
-export declare function connectLive(options: ConnectLiveOptions): Promise<LiveClientType>;
+export declare function connectLive(options: ConnectLiveOptions): Promise<LiveClientType & { leave(): Promise<unknown>; heartbeat(): Promise<unknown> }>;
 export interface WatchedHub { id: string; mode: string; status: string; roomCount: number; memberCount: number; path: string[]; childrenLive?: boolean }
 export interface HubWatch {
   hubs(): WatchedHub[];

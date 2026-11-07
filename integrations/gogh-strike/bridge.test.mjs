@@ -1,3 +1,4 @@
+let playerSeatToken;
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import http from 'node:http';
@@ -108,7 +109,11 @@ test('bridge serves the game and keeps the service bearer token server-side', as
     body: JSON.stringify({userId: 'player-1', team: 1, role: 'vanguard'}),
   });
   assert.equal(joined.status, 200);
-  assert.deepEqual(await joined.json(), {ok: true, userId: 'player-1', serverId: 'gogh-room'});
+  const joinedBody = await joined.json();
+  const {seatToken, ...publicJoin} = joinedBody;
+  playerSeatToken = seatToken;
+  assert.match(seatToken, /^[a-f0-9]{64}$/);
+  assert.deepEqual(publicJoin, {ok: true, userId: 'player-1', serverId: 'gogh-room'});
   assert.equal(calls[0].register.id, 'gogh-test');
   assert.equal(calls.at(-1).method, 'autoJoin');
   assert.equal(calls.some(call => call.method === 'upsertServer' && call.args[0].scopes.game === 'gogh-strike'), true);
@@ -131,7 +136,7 @@ test('bridge serves the game and keeps the service bearer token server-side', as
 
   const repeated = await fetch(`${base}/api/liveengine/join`, {
     method: 'POST', headers: {'Content-Type': 'application/json', Origin: base},
-    body: JSON.stringify({userId: 'player-1'}),
+    body: JSON.stringify({userId: 'player-1', seatToken: playerSeatToken}),
   });
   assert.equal(repeated.status, 200);
   assert.equal((await repeated.json()).existing, true);
@@ -202,7 +207,7 @@ test('bridge enforces the request body byte limit', async () => {
 test('bridge releases a seat on leave', async () => {
   const base = `http://127.0.0.1:${bridgePort}`;
   const leave = await fetch(`${base}/api/liveengine/leave`, {
-    method: 'POST', headers: {'Content-Type': 'application/json', Origin: base}, body: JSON.stringify({userId: 'player-1'}),
+    method: 'POST', headers: {'Content-Type': 'application/json', Origin: base}, body: JSON.stringify({userId: 'player-1', seatToken: playerSeatToken}),
   });
   assert.equal(leave.status, 200);
   assert.equal(users.has('player-1'), false);
@@ -219,8 +224,8 @@ test('bridge reaps idle seats while retaining seats with heartbeats', async () =
       LIVEENGINE_TOKEN: 'test-administrator-token-long-enough', LIVEENGINE_HUB_ID: 'gogh-reaper'},
     stdio: 'ignore',
   });
-  const post = (action, userId) => fetch(`${base}/api/liveengine/${action}`, {
-    method: 'POST', headers: {'Content-Type': 'application/json', Origin: base}, body: JSON.stringify({userId}),
+  const post = (action, userId, seatToken) => fetch(`${base}/api/liveengine/${action}`, {
+    method: 'POST', headers: {'Content-Type': 'application/json', Origin: base}, body: JSON.stringify({userId, seatToken}),
   });
   try {
     let ready = false;
@@ -230,11 +235,13 @@ test('bridge reaps idle seats while retaining seats with heartbeats', async () =
     }
     assert.equal(ready, true);
     assert.equal((await post('join', 'idle-player')).status, 200);
-    assert.equal((await post('join', 'active-player')).status, 200);
+    const active = await post('join', 'active-player');
+    assert.equal(active.status, 200);
+    const activeToken = (await active.json()).seatToken;
     let reaped = false;
     for (let i = 0; i < 7; i++) {
       await new Promise(resolve => setTimeout(resolve, 200));
-      assert.equal((await post('heartbeat', 'active-player')).status, 200);
+      assert.equal((await post('heartbeat', 'active-player', activeToken)).status, 200);
       if (!users.has('idle-player')) { reaped = true; break; }
     }
     assert.equal(reaped, true);

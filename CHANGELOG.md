@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Protect browser hub API seats with private, hashed seat tokens; the live client handles renewal, heartbeat and leave.
+
 - Check published TypeScript declarations and documentation samples in CI.
 
 ## 0.3.0 — 2026-11-06
