@@ -114,6 +114,8 @@ async function startBridge(port, hubUrl, token, env = {}, bindHost = '127.0.0.1'
     env: {...process.env, PORT: String(port), HOST: bindHost, GOGH_STRIKE_ROOT: gameRoot,
       LIVEENGINE_URL: hubUrl, LIVEENGINE_TOKEN: token, GOGH_REQUEST_LIMIT: '100000', ...env},
   });
+  // A failed spawn must fail its scenario, not take the whole run and its cleanup with it.
+  child.once('error', error => output.push(`bridge failed to start: ${error.message}`));
   child.stdout.on('data', chunk => output.push(String(chunk)));
   child.stderr.on('data', chunk => output.push(String(chunk)));
   const bridge = {base: `http://${bindHost}:${port}`, output: () => output.join('')};
@@ -922,6 +924,8 @@ async function main() {
     await Promise.all(users.map(user => connectPanel(user, bridge.base)));
     await Promise.all(users.map(findMatch));
     await until(async () => { const ping = await apiPing(bridge); return ping.waiting === 1 && ping.seats === 4; }, 'four matched players and one waiting', 25000);
+    // The API counts a seat before the page has shown it.
+    await until(async () => (await Promise.all(users.map(phaseOf))).filter(phase => phase === 'matched').length === 4, 'four panels to show a match');
     const matched = [], waiting = [];
     for (const user of users) ((await phaseOf(user)) === 'matched' ? matched : waiting).push(user);
     assert.equal(matched.length, 4);
