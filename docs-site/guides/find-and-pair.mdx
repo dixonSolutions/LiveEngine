@@ -162,7 +162,7 @@ const descriptor = await hub.pair({
 
 The Rust `HubClient` has no `discover` or `pair` method. Use `request` for the endpoints, or `route` for a namespace:
 
-```rust
+```rust fragment
 use liveengine::hub::HubClient;
 use reqwest::Method;
 use serde_json::json;

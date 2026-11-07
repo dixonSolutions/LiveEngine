@@ -49,7 +49,7 @@ impl Engine {
 }
 ```
 
-```rust
+```rust fragment
 use liveengine::Engine;
 use serde_json::json;
 
@@ -127,7 +127,7 @@ engine.dispatch("reseed", vec![json!(99)])?;
 
 `rules` exposes the requirement parser and evaluator directly:
 
-```rust
+```rust fragment
 use liveengine::rules;
 
 let requirements = rules::parse_requirements(Some(&json!({

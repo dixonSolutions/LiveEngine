@@ -11,7 +11,7 @@ const { HubClient, HUB_PROTOCOL } = require('@dixonsolutions/liveengine/hubs');
 
 ## Constructor
 
-```ts
+```ts fragment
 interface HubClientOptions {
   token: string;
   timeoutMs?: number;          // default 5000
@@ -59,7 +59,7 @@ An optional `AbortSignal` can be passed to `call` and is combined with the timeo
 
 ### contract()
 
-```ts
+```ts fragment
 contract(): Promise<{ protocol: 'liveengine.hub/v1'; [key: string]: unknown }>
 ```
 
@@ -71,7 +71,7 @@ await client.contract();
 
 ### ping(options?)
 
-```ts
+```ts fragment
 interface HubPingOptions {
   samples?: number;   // 1–32, default 5
   intervalMs?: number; // default 0
@@ -99,7 +99,7 @@ console.log(result.avgMs, result.minMs, result.maxMs, result.jitterMs);
 
 ### list()
 
-```ts
+```ts fragment
 list(): Promise<{ hubs: HubInfo[] }>
 ```
 
@@ -111,7 +111,7 @@ const { hubs } = await client.list();
 
 ### register(hub)
 
-```ts
+```ts fragment
 register(hub: HubDefinition): Promise<HubInfo>
 ```
 
@@ -155,7 +155,7 @@ The client does not validate the DTO beyond serialization; the host returns `400
 
 ### get(id)
 
-```ts
+```ts fragment
 get(id: string): Promise<HubInfo>
 ```
 
@@ -163,7 +163,7 @@ Calls `GET /v1/hubs/{id}`. The ID is URL-encoded. A missing hub throws with `.st
 
 ### remove(id)
 
-```ts
+```ts fragment
 remove(id: string): Promise<null>
 ```
 
@@ -171,7 +171,7 @@ Calls `DELETE /v1/hubs/{id}`. A successful delete returns `204` with no body, so
 
 ### call(id, method, args?, options?)
 
-```ts
+```ts fragment
 call<T = unknown>(
   id: string,
   method: string,
@@ -200,7 +200,7 @@ const events = await client.call('ranked-au', 'drainEvents', [], {
 
 ### importRegistry(registry)
 
-```ts
+```ts fragment
 importRegistry(registry: {
   address: string;
   token: string;

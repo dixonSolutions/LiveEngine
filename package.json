@@ -65,7 +65,9 @@
     "test:e2e": "node integrations/gogh-strike/live-e2e.mjs",
     "dev:gogh": "node scripts/dev-gogh.mjs",
     "docs:dev": "cd docs-site && npx mint@latest dev",
-    "docs:validate": "cd docs-site && npx mint@latest validate && npx mint@latest broken-links"
+    "docs:validate": "cd docs-site && npx mint@latest validate && npx mint@latest broken-links",
+    "check:types": "tsc -p test/types/tsconfig.json",
+    "check:docs": "node scripts/check-docs-samples.mjs"
   },
   "bin": {
     "liveengine-hub": "bin/liveengine-hub.js"
@@ -96,5 +98,9 @@
       "default": "./lib/hub-api.mjs"
     },
     "./package.json": "./package.json"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^5.9.3"
   }
 }

@@ -50,7 +50,7 @@ If you nest the hub router under a path prefix, remote clients must include that
 
 ## Register an internal handler
 
-```rust
+```rust fragment
 use liveengine::hub::{
     HubConfig, HubHandler, HubMode, HubRegistration, HubService,
 };
@@ -146,7 +146,7 @@ impl HubService {
 
 The Rust types serialize with camelCase field names:
 
-```rust
+```rust fragment
 use liveengine::hub::{HubMode, HubRegistration};
 
 let registration: HubRegistration = serde_json::from_value(json!({
@@ -168,7 +168,7 @@ assert_eq!(registration.mode, HubMode::External);
 
 The host exposes an unauthenticated `GET /v1/ping` route. Rust clients can use `ping_hub`, which measures round-trip time with `Instant` and returns min, average, max, and jitter:
 
-```rust
+```rust fragment
 use liveengine::hub::ping_hub;
 use std::time::Duration;
 

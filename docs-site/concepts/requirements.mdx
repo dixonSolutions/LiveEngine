@@ -22,7 +22,7 @@ This normalization is why a `contains` rule with the number `1` can match a stor
 ### Shorthand object
 
 ```js
-{
+const requirements = {
   region: 'au',                          // eq
   rating: { between: [1200, 1800] },     // explicit operator
   tags: ['ranked', 'duo'],               // array shorthand means "in"
@@ -33,7 +33,7 @@ This normalization is why a `contains` rule with the number `1` can match a stor
 In an object rule, each key of the operator object is an operator:
 
 ```js
-{ rating: { gte: 1200, lt: 2000 } }
+const requirements = { rating: { gte: 1200, lt: 2000 } };
 ```
 
 ### Array of rules
@@ -50,7 +50,7 @@ A rule's `key` defaults to `"undefined"`, `op` defaults to `"eq"`, and `value` d
 ### Rule set with all/any
 
 ```js
-{
+const requirements = {
   rules: [
     { key: 'region', op: 'eq', value: 'au' },
     { key: 'rating', op: 'gte', value: 1500 }

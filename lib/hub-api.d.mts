@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { HubClient, HubSchema } from '../index';
+import type { HubAuth, HubClient, HubSchema, LiveChannel } from '../index.js';
 
 export interface HubApiLimits {
   /** Largest request body in bytes. Default 16384. */
@@ -38,9 +38,9 @@ export interface HubApiOptions {
   /** Schemas published once; an existing version is left alone. */
   schemas?: HubSchema[];
   /** The hub's channel table. */
-  channels?: Record<string, unknown>;
+  channels?: Record<string, LiveChannel>;
   /** The hub's `auth` verifier. Unset leaves the hub open. */
-  auth?: Record<string, unknown>;
+  auth?: HubAuth;
   peerLink?: HubApiPeerLink;
   /** Pages allowed to call the API: a list of origins, or a predicate. A POST without an allowed Origin is refused. */
   allowedOrigins?: Iterable<string> | ((origin: string) => boolean);

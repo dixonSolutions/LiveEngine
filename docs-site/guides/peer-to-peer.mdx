@@ -77,7 +77,7 @@ Here `/api/ticket` is a route of yours that re-issues a ticket for a user who is
 
 The Rust `HubClient` has no `pair` method. Use `request` against `POST /v1/pair`, or `route` with the `pair` operation. The request is the same JSON:
 
-```rust
+```rust fragment
 use liveengine::hub::HubClient;
 use reqwest::Method;
 use serde_json::json;

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Check published TypeScript declarations and documentation samples in CI.
+
 ## 0.3.0 — 2026-11-06
 
 - Add `createHubApi` (`@dixonsolutions/liveengine/hub-api`): a dependency-free Node handler that publishes schemas and channels, pairs players with `waitMs`, renews, heartbeats, issues watch tickets, tracks seats and reaps idle ones, with Origin checks, CORS, body and rate limits. A left player is now removed from the hub, so a cancelled search leaves no ghost candidate. Add `watchHubs` to `LiveClient` for a live hub list in a page, and `signal` to `HubClient.pair`.

@@ -215,6 +215,9 @@ export declare const HUB_PROTOCOL: 'liveengine.hub/v1';
 export declare class HubClient {
   constructor(address: string, options: HubClientOptions);
   readonly address: string;
+  timeoutMs: number;
+  maxResponseBytes: number;
+  request<T = unknown>(route: string, options?: { method?: string; body?: unknown; signal?: AbortSignal; timeoutMs?: number }): Promise<T>;
   contract(): Promise<{ protocol: typeof HUB_PROTOCOL; [key: string]: unknown }>;
   ping(options?: HubPingOptions): Promise<HubPing>;
   tree(depth?: number): Promise<unknown>;

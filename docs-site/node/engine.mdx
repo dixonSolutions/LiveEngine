@@ -16,7 +16,7 @@ export default LiveEngine;
 
 ## Construction
 
-```ts
+```ts fragment
 interface LiveEngineOptions {
   seed?: number;      // default 0
   autoEmit?: boolean; // default true
@@ -220,7 +220,7 @@ interface Stats {
 
 ## Generating users
 
-```ts
+```ts fragment
 interface GenerationSpec {
   idPrefix?: string;              // default 'user-'
   scopes?: Record<string, ScopeGenerator>;

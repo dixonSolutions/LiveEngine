@@ -1,5 +1,5 @@
-import type { ConnectPeerOptions, LiveClient as LiveClientType, LiveClientOptions, LiveDescriptor, PeerLink } from '../index';
-export type { ConnectPeerOptions, LiveClientEvents, LiveClientOptions, LiveDescriptor, LiveFrame, LiveRenew, LiveSendOptions, PeerLink } from '../index';
+import type { ConnectPeerOptions, LiveClient as LiveClientType, LiveClientOptions, LiveDescriptor, PeerLink } from '../index.js';
+export type { ConnectPeerOptions, LiveClientEvents, LiveClientOptions, LiveDescriptor, LiveFrame, LiveRenew, LiveSendOptions, PeerLink } from '../index.js';
 export declare const LiveClient: {
   new (descriptor: LiveDescriptor, options?: LiveClientOptions): LiveClientType;
 };

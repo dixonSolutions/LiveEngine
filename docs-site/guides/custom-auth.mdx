@@ -168,7 +168,7 @@ console.log(client.identity, client.identityOf('user-b'));
 
 An embedded service can verify with its own code, such as a database lookup. Register the verifier before the hubs that name it.
 
-```rust
+```rust fragment
 use liveengine::auth::{AuthError, AuthRequest, AuthVerifier, Identity};
 use liveengine::hub::{HubConfig, HubService, HubSpec};
 use serde_json::{json, Map};

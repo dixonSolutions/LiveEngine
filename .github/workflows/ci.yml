@@ -23,6 +23,8 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: npm ci
+      - run: npm run check:types
+      - run: npm run check:docs
       - run: npm test
       - run: npm run test:integration
       - run: node bench/bench.js 500 5000
