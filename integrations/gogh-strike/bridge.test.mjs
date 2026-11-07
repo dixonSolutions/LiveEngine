@@ -211,7 +211,7 @@ test('bridge releases a seat on leave', async () => {
   });
   assert.equal(leave.status, 200);
   assert.equal(users.has('player-1'), false);
-  assert.equal(calls.at(-1).method, 'leave');
+  assert.deepEqual(calls.slice(-2).map(call => call.method), ['leave', 'removeUser']);
 });
 
 test('bridge reaps idle seats while retaining seats with heartbeats', async () => {

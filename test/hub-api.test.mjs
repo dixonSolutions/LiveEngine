@@ -274,6 +274,30 @@ test('seat token protects legacy join and its owner can leave', async () => {
   assert.equal((await post('leave', { userId: 'legacy-seat', seatToken: token })).status, 200);
 });
 
+test('seat release and reaping remove only API-created join and pair users, leaving no ghost candidate', async () => {
+  for (const route of ['join', 'pair']) {
+    for (const expiry of [false, true]) {
+      const hubId = `seat-clean-${route}-${expiry}`;
+      const app = await serve({ hubId, subject: () => ({ app: 'test', ghost: hubId }), join: { server: { id: 'seat-room', scopes: { app: 'test' }, maxUsers: 10 } }, limits: { idleMs: 250, requestsPerMinute: 1000 } });
+      await app.api.setup();
+      const userId = `seat-${route}-${expiry}`;
+      const result = await app.request(route, { body: { userId } });
+      assert.equal(result.status, 200);
+      if (expiry) await until(() => app.api.stats().seats === 0, 'seat reaping');
+      else assert.equal((await app.request('leave', { body: { userId, seatToken: result.body.seatToken } })).status, 200);
+      assert.equal(await admin.call(hubId, 'getUser', [userId]), null);
+      const candidates = await admin.discover({ kind: 'peer', requirements: { app: 'test' } });
+      assert.ok(!candidates.candidates.some(candidate => candidate.id === userId));
+      await assert.rejects(admin.pair({ subject: { id: `later-${route}-${expiry}`, kind: 'peer', scopes: { ghost: hubId } }, target: { kind: 'peer', requirements: { ghost: hubId } }, waitMs: 150 }), error => error.status === 408);
+      await admin.call(hubId, 'upsertUser', [{ id: 'seat-preexisting', scopes: { app: 'test' } }]);
+      const existing = await app.request(route, { body: { userId: 'seat-preexisting' } });
+      assert.equal(existing.status, 200);
+      assert.equal((await app.request('leave', { body: { userId: 'seat-preexisting', seatToken: existing.body.seatToken } })).status, 200);
+      assert.ok(await admin.call(hubId, 'getUser', ['seat-preexisting']));
+    }
+  }
+});
+
 describe('peer pairing with waitMs', () => {
   let app;
   before(async () => { app = await serve({ hubId: 'api-peers', allowedOrigins: [], peerLink: { kind: 'peer', waitMs: 4000 }, limits: { requestsPerMinute: 1000 } }); });

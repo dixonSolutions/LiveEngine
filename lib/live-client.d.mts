@@ -12,6 +12,8 @@ export interface ConnectLiveOptions extends LiveClientOptions {
   /** Seat routes; default to replacing the final /pair in pairUrl. */
   leaveUrl?: string;
   heartbeatUrl?: string;
+  /** Per-tab seat token storage. Defaults to sessionStorage, with an in-memory fallback. */
+  seatStore?: { get(key: string): string | null | undefined; set(key: string, value: string): unknown; delete(key: string): unknown };
   /** The request body `pairUrl` and `renewUrl` receive. */
   body?: Record<string, unknown>;
   fetch?: typeof fetch;

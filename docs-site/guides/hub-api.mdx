@@ -115,7 +115,7 @@ const hubs = await watchHubs({ watchUrl: 'https://api.example.net/api/live/watch
 hubs.on('change', list => render(list));
 ```
 
-To cancel a search, abort the `fetch` you gave `connectLive`. A successful `pair` or legacy `join` returns a random `seatToken`; keep it private and send it in the body on repeat pair, renew, heartbeat and leave. `connectLive` retains it internally and exposes `client.heartbeat()` and `client.leave()`. The API stores only its hash. The page's origin must be in `allowedOrigins`, and the hub's `LIVEENGINE_LIVE_ALLOWED_ORIGINS` must list it too for the room socket and the registry socket.
+To cancel a search, abort the `fetch` you gave `connectLive`. A successful `pair` or legacy `join` returns a random `seatToken`; keep it private and send it in the body on repeat pair, renew, heartbeat and leave. `connectLive` saves it in the tab's `sessionStorage`, keyed by pair URL and user ID, so a reload can reclaim the seat. Pass a `seatStore` with synchronous `get`, `set`, and `delete` methods to replace that storage; unavailable storage falls back to memory. Leaving or a 403 refusal clears the token. `client.heartbeat()` keeps the seat and `client.leave()` releases it. The API stores only its hash and removes users it created on leave or expiry. The page's origin must be in `allowedOrigins`, and the hub's `LIVEENGINE_LIVE_ALLOWED_ORIGINS` must list it too for the room socket and the registry socket.
 
 <Warning>
   The API has no player authentication of its own. Use the hub's `auth` and pass the player's `credential` through, or put an authenticated proxy in front of it. Rate limits are per client address: behind a proxy, put the real address in front of the handler.

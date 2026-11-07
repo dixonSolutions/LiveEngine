@@ -404,6 +404,20 @@ async function main() {
       }, ids[i]);
     }
     await until(() => pages[2].evaluate(id => window.seatTest.peers().includes(id), ids[0]), 'attacker to learn victim id from presence');
+    const room = (await adminC.call('gogh-seat', 'getUser', [ids[0]])).serverId;
+    await pages[0].reload();
+    await pages[0].evaluate(async userId => {
+      const {connectLive} = await import('/api/liveengine/live-client.mjs');
+      window.seatTest = await connectLive({pairUrl: '/api/liveengine/pair', renewUrl: '/api/liveengine/renew', body: {userId}, direct: false});
+    }, ids[0]);
+    assert.equal(await pages[0].evaluate(() => window.seatTest.state), 'open');
+    assert.equal((await adminC.call('gogh-seat', 'getUser', [ids[0]])).serverId, room);
+    const refused = await pages[2].evaluate(async userId => {
+      const {connectLive} = await import('/api/liveengine/live-client.mjs');
+      try { await connectLive({pairUrl: '/api/liveengine/pair', body: {userId}, direct: false}); return 200; }
+      catch (error) { return error.status; }
+    }, ids[0]);
+    assert.equal(refused, 403);
     const statuses = await pages[2].evaluate(async () => {
       const userId = window.seatTest.peers().find(id => id === 'seat-browser-a');
       const results = [];
@@ -913,6 +927,7 @@ async function main() {
     assert.equal(matched.length, 4);
     assert.equal(waiting.length, 1);
     await Promise.all(matched.map(reachDirect));
+    await Promise.all(matched.map(instrument));
     const infos = await Promise.all(matched.map(sessionInfo));
     const rooms = new Map();
     infos.forEach(info => rooms.set(info.room, (rooms.get(info.room) || 0) + 1));
@@ -922,6 +937,7 @@ async function main() {
     await connectPanel(sixth, bridge.base);
     await findMatch(sixth);
     await Promise.all([reachDirect(waiting[0]), reachDirect(sixth)]);
+    await Promise.all([instrument(waiting[0]), instrument(sixth)]);
     const [a, b] = await Promise.all([sessionInfo(waiting[0]), sessionInfo(sixth)]);
     assert.equal(a.room, b.room);
     assert.ok(!rooms.has(a.room));
