@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Revoke password-hub tickets and live connections on credential changes, bound concurrent login attempts, and upgrade password hashes on login.
+
 - Add account and connection clients, browser sessions, and an optional administrator console.
 
 - Add administrative live connection listing, kicks and account bans, including linked rooms.

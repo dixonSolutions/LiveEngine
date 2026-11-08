@@ -41,6 +41,8 @@ pub(crate) struct StoredAccount {
     claims: Option<Value>,
     created_at: u64,
     password_hash: String,
+    #[serde(default)]
+    generation: u64,
 }
 impl From<&StoredAccount> for Account {
     fn from(a: &StoredAccount) -> Self {
@@ -77,6 +79,8 @@ pub(crate) struct Accounts {
     iterations: u32,
     ttl: u64,
     max_failures: u32,
+    #[cfg(test)]
+    verifications: std::sync::atomic::AtomicUsize,
 }
 fn setting(name: &str, default: u64, min: u64, max: u64) -> Result<u64, String> {
     match std::env::var(name) {
@@ -94,6 +98,8 @@ impl Accounts {
         Ok(Self {
             data: RwLock::new(data),
             failures: Default::default(),
+            #[cfg(test)]
+            verifications: Default::default(),
             iterations: setting("LIVEENGINE_PASSWORD_ITERATIONS", 310000, 100000, 10000000)? as u32,
             ttl: setting("LIVEENGINE_SESSION_TTL_SECONDS", 43200, 1, 31536000)?,
             max_failures: setting("LIVEENGINE_LOGIN_MAX_FAILURES", 5, 1, 1000)? as u32,
@@ -151,6 +157,17 @@ async fn make_hash(password: String, iterations: u32) -> Result<String, ()> {
     .await
     .map_err(|_| ())
 }
+fn hash_cost(hash: &str) -> Option<u32> {
+    let mut parts = hash.split('$');
+    if parts.next()? != "pbkdf2-sha256" || parts.next()? != "v1" {
+        return None;
+    }
+    parts
+        .next()?
+        .parse::<u32>()
+        .ok()
+        .filter(|n| (100000..=10000000).contains(n))
+}
 async fn verify(password: String, encoded: Option<String>, iterations: u32) -> bool {
     tokio::task::spawn_blocking(move || {
         let dummy_salt = [0u8; 16];
@@ -201,15 +218,10 @@ pub(crate) async fn session(state: &Inner, token: &str) -> Option<Account> {
     }
     Some(a.into())
 }
-pub(crate) async fn account_enabled(state: &Inner, username: &str) -> bool {
-    state
-        .accounts
-        .data
-        .read()
-        .await
-        .accounts
-        .get(&username.to_ascii_lowercase())
-        .is_some_and(|a| a.enabled)
+pub(crate) async fn credential_state(state: &Inner, username: &str) -> Option<(u64, bool, String)> {
+    let data = state.accounts.data.read().await;
+    let account = data.accounts.get(&username.to_ascii_lowercase())?;
+    Some((account.generation, account.enabled, account.role.clone()))
 }
 pub(crate) async fn is_admin(state: &Inner, token: &str) -> bool {
     session(state, token)
@@ -281,6 +293,7 @@ pub(crate) async fn create(State(s): State<Arc<Inner>>, Json(v): Json<Create>) -
         claims: v.claims,
         created_at: now(),
         password_hash: hash,
+        generation: u64::from_le_bytes(random(8).try_into().unwrap()),
     };
     let public = Account::from(&a);
     d.accounts.insert(key, a);
@@ -346,28 +359,36 @@ pub(crate) async fn patch(
         a.password_hash = h;
     }
     if let Some(role) = v.role {
-        end |= a.role == "admin" && role == "user";
+        end |= a.role != role;
         a.role = role;
     }
     if let Some(enabled) = v.enabled {
-        end |= !enabled;
+        end |= a.enabled && !enabled;
         a.enabled = enabled;
     }
     if let Some(claims) = v.claims {
         a.claims = claims;
+    }
+    if end {
+        a.generation = a.generation.wrapping_add(1);
     }
     let public = Account::from(&*a);
     if end {
         revoke(&mut d, &key);
     }
     let mut response = Json(public).into_response();
-    if v.enabled == Some(false) {
-        response.extensions_mut().insert(BanAccount(key));
+    if end {
+        let code = if v.enabled == Some(false) {
+            "banned"
+        } else {
+            "credentials-changed"
+        };
+        response.extensions_mut().insert(AccountChanged(key, code));
     }
     response
 }
 #[derive(Clone)]
-pub(crate) struct BanAccount(pub(crate) String);
+pub(crate) struct AccountChanged(pub(crate) String, pub(crate) &'static str);
 pub(crate) async fn delete(State(s): State<Arc<Inner>>, Path(name): Path<String>) -> Response {
     let key = name.to_ascii_lowercase();
     let mut d = s.accounts.data.write().await;
@@ -375,7 +396,11 @@ pub(crate) async fn delete(State(s): State<Arc<Inner>>, Path(name): Path<String>
         return error(StatusCode::NOT_FOUND, "account not found");
     }
     revoke(&mut d, &key);
-    StatusCode::NO_CONTENT.into_response()
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response
+        .extensions_mut()
+        .insert(AccountChanged(key, "account-deleted"));
+    response
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -394,66 +419,115 @@ pub(crate) async fn login(
         .unwrap_or_else(|| "unknown".into());
     let keys = [format!("u:{}", hash_token(&key)), format!("p:{peer}")];
     let time = now();
-    let blocked = {
-        let mut f = s
+    // Reserve both budgets before starting expensive work, including work already in flight.
+    {
+        let mut failures = s
             .accounts
             .failures
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        f.retain(|_, v| time.saturating_sub(v.first) < 900 || v.until > time);
-        f.len()
-            .saturating_add(keys.iter().filter(|k| !f.contains_key(*k)).count())
-            > 8192
-            || keys
-                .iter()
-                .any(|k| f.get(k).is_some_and(|v| v.until > time))
-    };
-    let saved = { s.accounts.data.read().await.accounts.get(&key).cloned() };
-    let valid = verify(
-        v.password,
-        saved.as_ref().map(|a| a.password_hash.clone()),
-        s.accounts.iterations,
-    )
-    .await
-        && saved.as_ref().is_some_and(|a| a.enabled)
-        && !blocked;
-    if !valid {
-        let time = now();
-        let mut f = s
-            .accounts
-            .failures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for k in keys {
-            if f.len() >= 8192 && !f.contains_key(&k) {
-                continue;
+        failures.retain(|_, v| time.saturating_sub(v.first) < 900 || v.until > time);
+        if keys
+            .iter()
+            .any(|k| failures.get(k).is_some_and(|v| v.until > time))
+        {
+            return error(StatusCode::UNAUTHORIZED, "invalid username or password");
+        }
+        for key in &keys {
+            if !failures.contains_key(key) && failures.len() >= 8192 {
+                if let Some(oldest) = failures
+                    .iter()
+                    .filter(|(k, _)| !keys.contains(k))
+                    .min_by_key(|(_, v)| v.first)
+                    .map(|(k, _)| k.clone())
+                {
+                    failures.remove(&oldest);
+                }
             }
-            let e = f.entry(k).or_insert(Failure {
+            let entry = failures.entry(key.clone()).or_insert(Failure {
                 count: 0,
                 first: time,
                 until: 0,
             });
-            e.count = e.count.saturating_add(1);
-            if e.count >= s.accounts.max_failures {
-                e.until =
-                    time.saturating_add(1 + (1u64 << (e.count - s.accounts.max_failures).min(10)));
+            entry.count = entry.count.saturating_add(1);
+            if entry.count >= s.accounts.max_failures {
+                entry.until = time
+                    .saturating_add(1 + (1u64 << (entry.count - s.accounts.max_failures).min(10)));
             }
         }
+    }
+    let (saved, dummy_cost) = {
+        let data = s.accounts.data.read().await;
+        let mut costs = HashMap::<u32, usize>::new();
+        for account in data.accounts.values() {
+            if let Some(cost) = hash_cost(&account.password_hash) {
+                *costs.entry(cost).or_default() += 1;
+            }
+        }
+        (
+            data.accounts.get(&key).cloned(),
+            costs
+                .into_iter()
+                .max_by_key(|(cost, count)| (*count, *cost))
+                .map(|(cost, _)| cost)
+                .unwrap_or(s.accounts.iterations),
+        )
+    };
+    #[cfg(test)]
+    s.accounts
+        .verifications
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let valid = verify(
+        v.password.clone(),
+        saved.as_ref().map(|a| a.password_hash.clone()),
+        dummy_cost,
+    )
+    .await
+        && saved.as_ref().is_some_and(|a| a.enabled);
+    if !valid {
         return error(StatusCode::UNAUTHORIZED, "invalid username or password");
     }
+    let replacement = if saved.as_ref().and_then(|a| hash_cost(&a.password_hash))
+        != Some(s.accounts.iterations)
+    {
+        match make_hash(v.password, s.accounts.iterations).await {
+            Ok(hash) => Some(hash),
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "hashing failed"),
+        }
+    } else {
+        None
+    };
     let token = URL_SAFE_NO_PAD.encode(random(32));
     let mut d = s.accounts.data.write().await;
-    let Some(a) = d.accounts.get(&key) else {
+    let Some(a) = d.accounts.get_mut(&key) else {
         return error(StatusCode::UNAUTHORIZED, "invalid username or password");
     };
     if !a.enabled
-        || saved
-            .as_ref()
-            .is_none_or(|old| old.password_hash != a.password_hash)
+        || saved.as_ref().is_none_or(|old| {
+            old.password_hash != a.password_hash || old.generation != a.generation
+        })
     {
         return error(StatusCode::UNAUTHORIZED, "invalid username or password");
     }
-    let account = Account::from(a);
+    if let Some(hash) = replacement {
+        a.password_hash = hash;
+    }
+    let account = Account::from(&*a);
+    {
+        let mut failures = s
+            .accounts
+            .failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for key in &keys {
+            if let Some(entry) = failures.get_mut(key) {
+                entry.count = entry.count.saturating_sub(1);
+                if entry.count < s.accounts.max_failures {
+                    entry.until = 0;
+                }
+            }
+        }
+    }
     let expiry = time.saturating_add(s.accounts.ttl);
     d.sessions.retain(|_, v| v.expires_at > time);
     while d.sessions.len() >= 10000
@@ -542,6 +616,131 @@ pub(crate) async fn change_password(
         return error(StatusCode::UNAUTHORIZED, "unauthorized");
     }
     a.password_hash = hash;
+    a.generation = a.generation.wrapping_add(1);
     revoke(&mut d, &key);
-    StatusCode::NO_CONTENT.into_response()
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response
+        .extensions_mut()
+        .insert(AccountChanged(key, "credentials-changed"));
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::{HubConfig, HubService};
+
+    async fn setup() -> Arc<Inner> {
+        let service = HubService::new(HubConfig {
+            token: "test-administrator-token-0123456789".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let state = service.inner;
+        let result = create(
+            State(state.clone()),
+            Json(Create {
+                username: "alice".into(),
+                password: "correct-password-123".into(),
+                role: "user".into(),
+                enabled: true,
+                claims: None,
+            }),
+        )
+        .await;
+        assert_eq!(result.status(), StatusCode::CREATED);
+        state
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_wrong_logins_reserve_before_verification() {
+        let state = setup().await;
+        let mut tasks = Vec::new();
+        for _ in 0..40 {
+            let state = state.clone();
+            tasks.push(tokio::spawn(async move {
+                login(
+                    State(state),
+                    None,
+                    Json(Login {
+                        username: "alice".into(),
+                        password: "wrong-password-123".into(),
+                    }),
+                )
+                .await
+                .status()
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(
+            state
+                .accounts
+                .verifications
+                .load(std::sync::atomic::Ordering::SeqCst),
+            state.accounts.max_failures as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn full_failure_map_evicts_oldest_and_correct_login_succeeds() {
+        let state = setup().await;
+        {
+            let mut failures = state.accounts.failures.lock().unwrap();
+            for i in 0..8192 {
+                failures.insert(
+                    format!("old:{i}"),
+                    Failure {
+                        count: 1,
+                        first: now(),
+                        until: 0,
+                    },
+                );
+            }
+        }
+        let response = login(
+            State(state.clone()),
+            None,
+            Json(Login {
+                username: "alice".into(),
+                password: "correct-password-123".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.accounts.failures.lock().unwrap().len(), 8192);
+    }
+
+    #[tokio::test]
+    async fn successful_login_rehashes_old_cost() {
+        let state = setup().await;
+        let old = make_hash("correct-password-123".into(), 100000)
+            .await
+            .unwrap();
+        state
+            .accounts
+            .data
+            .write()
+            .await
+            .accounts
+            .get_mut("alice")
+            .unwrap()
+            .password_hash = old.clone();
+        let response = login(
+            State(state.clone()),
+            None,
+            Json(Login {
+                username: "alice".into(),
+                password: "correct-password-123".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let data = state.accounts.data.read().await;
+        let hash = &data.accounts["alice"].password_hash;
+        assert_ne!(hash, &old);
+        assert_eq!(hash_cost(hash), Some(state.accounts.iterations));
+        assert!(verify("correct-password-123".into(), Some(hash.clone()), 100000).await);
+    }
 }

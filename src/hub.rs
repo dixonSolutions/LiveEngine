@@ -1561,8 +1561,11 @@ async fn persist_request(
         && request.extensions().get::<PairWait>().is_none();
     if !mutation || state.config.state_file.is_none() {
         let response = next.run(request).await;
-        if let Some(ban) = response.extensions().get::<crate::accounts::BanAccount>() {
-            crate::live::ban(&state, &ban.0).await;
+        if let Some(ban) = response
+            .extensions()
+            .get::<crate::accounts::AccountChanged>()
+        {
+            crate::live::account_changed(&state, &ban.0, ban.1).await;
         }
         return response;
     }
@@ -1576,8 +1579,11 @@ async fn persist_request(
             "cannot persist state file",
         );
     }
-    if let Some(ban) = response.extensions().get::<crate::accounts::BanAccount>() {
-        crate::live::ban(&state, &ban.0).await;
+    if let Some(ban) = response
+        .extensions()
+        .get::<crate::accounts::AccountChanged>()
+    {
+        crate::live::account_changed(&state, &ban.0, ban.1).await;
     }
     response
 }

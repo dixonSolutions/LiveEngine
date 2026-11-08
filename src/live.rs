@@ -129,6 +129,8 @@ pub struct TicketClaims {
     /// Present only when the hub verified a credential for this connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<PeerIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_generation: Option<u64>,
 }
 
 /// What `authorize` proved, signed so pairing can hand it to ticket issue without the
@@ -144,6 +146,8 @@ struct Receipt {
     expiry: u64,
     jti: String,
     identity: PeerIdentity,
+    #[serde(default)]
+    credential_generation: Option<u64>,
 }
 const RECEIPT_TTL_SECONDS: u64 = 30;
 
@@ -175,7 +179,7 @@ impl TicketSigner {
         role: String,
         ttl: u64,
     ) -> Result<(String, u64), &'static str> {
-        self.issue_with_channels(hub_path, room, user, role, ttl, None, None)
+        self.issue_with_channels(hub_path, room, user, role, ttl, None, None, None)
     }
     #[allow(clippy::too_many_arguments)]
     fn issue_with_channels(
@@ -187,6 +191,7 @@ impl TicketSigner {
         ttl: u64,
         inherited_channels: Option<ChannelPolicy>,
         identity: Option<PeerIdentity>,
+        credential_generation: Option<u64>,
     ) -> Result<(String, u64), &'static str> {
         if identity.as_ref().is_some_and(|i| !i.within_limits()) {
             return Err("identity exceeds size limit");
@@ -206,6 +211,7 @@ impl TicketSigner {
             jti: URL_SAFE_NO_PAD.encode(random),
             inherited_channels,
             identity,
+            credential_generation,
         };
         let encoded = URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&claims).map_err(|_| "cannot encode ticket")?);
@@ -228,6 +234,7 @@ impl TicketSigner {
         hmac::Key::new(hmac::HMAC_SHA256, derived.as_ref())
     }
     /// Sign the result of a successful credential check for one ticket request.
+    #[allow(clippy::too_many_arguments)]
     fn issue_receipt(
         &self,
         hub_path: Vec<String>,
@@ -236,6 +243,7 @@ impl TicketSigner {
         user: &str,
         role: &str,
         identity: PeerIdentity,
+        credential_generation: Option<u64>,
     ) -> Result<String, &'static str> {
         let mut random = [0u8; 16];
         OsRng.fill_bytes(&mut random);
@@ -248,6 +256,7 @@ impl TicketSigner {
             expiry: now()?.saturating_add(RECEIPT_TTL_SECONDS),
             jti: URL_SAFE_NO_PAD.encode(random),
             identity,
+            credential_generation,
         };
         let encoded = URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&receipt).map_err(|_| "cannot encode receipt")?);
@@ -267,7 +276,7 @@ impl TicketSigner {
         room: &str,
         user: &str,
         role: &str,
-    ) -> Result<PeerIdentity, &'static str> {
+    ) -> Result<(PeerIdentity, Option<u64>), &'static str> {
         const REFUSED: &str = "invalid receipt";
         if receipt.len() > 16384 {
             return Err(REFUSED);
@@ -295,7 +304,7 @@ impl TicketSigner {
             return Err(REFUSED);
         }
         used.insert(key, receipt.expiry);
-        Ok(receipt.identity)
+        Ok((receipt.identity, receipt.credential_generation))
     }
     /// Verify signature, expiry and binding, consuming the ticket on success.
     pub fn verify(
@@ -477,6 +486,13 @@ pub(crate) async fn authorize_hub(
             .await;
         }
     }
+    let generation = if matches!(record.auth, Some(crate::auth::AuthConfig::Password { .. })) {
+        crate::accounts::credential_state(&state, &request.user_id)
+            .await
+            .map(|v| v.0)
+    } else {
+        None
+    };
     match crate::auth::authorize(
         &state,
         record.auth.as_ref(),
@@ -498,6 +514,7 @@ pub(crate) async fn authorize_hub(
                 &request.user_id,
                 &request.role,
                 identity,
+                generation,
             ) {
                 Ok(receipt) => {
                     Json(serde_json::json!({"ok":true,"receipt":receipt})).into_response()
@@ -538,6 +555,14 @@ pub(crate) async fn issue_ticket(
     let forwards_raw =
         record.auth.is_none() && record.handler.is_none() && record.info.address.is_some();
     let mut identity = None;
+    let mut verified_generation =
+        if matches!(record.auth, Some(crate::auth::AuthConfig::Password { .. })) {
+            crate::accounts::credential_state(&state, &request.user_id)
+                .await
+                .map(|v| v.0)
+        } else {
+            None
+        };
     if trusted {
         request.verified = None;
     } else if !forwards_raw {
@@ -550,7 +575,10 @@ pub(crate) async fn issue_ticket(
                 &request.user_id,
                 &request.role,
             ) {
-                Ok(identity) => Some(identity),
+                Ok((identity, generation)) => {
+                    verified_generation = generation;
+                    Some(identity)
+                }
                 Err(_) => return error(StatusCode::FORBIDDEN, "credential refused"),
             },
             None => match crate::auth::authorize(
@@ -619,6 +647,29 @@ pub(crate) async fn issue_ticket(
         };
         let mut path = state.hub_path.clone();
         path.push(id);
+        let generation = if let Some(crate::auth::AuthConfig::Password { roles }) = &record.auth {
+            let Some((generation, enabled, account_role)) =
+                crate::accounts::credential_state(&state, &request.user_id).await
+            else {
+                return error(StatusCode::FORBIDDEN, "credential refused");
+            };
+            if Some(generation) != verified_generation
+                || !enabled
+                || roles
+                    .as_ref()
+                    .is_some_and(|roles| !roles.contains(&account_role))
+                || !identity.as_ref().is_some_and(|i| {
+                    i.identity.eq_ignore_ascii_case(&request.user_id)
+                        && i.claims.get("role").and_then(Value::as_str)
+                            == Some(account_role.as_str())
+                })
+            {
+                return error(StatusCode::FORBIDDEN, "credential refused");
+            }
+            Some(generation)
+        } else {
+            None
+        };
         match state.ticket_signer.issue_with_channels(
             path,
             request.server_id,
@@ -627,6 +678,7 @@ pub(crate) async fn issue_ticket(
             state.config.ticket_ttl.as_secs(),
             inherited_channels,
             identity.clone(),
+            generation,
         ) {
             Ok((ticket, expires_at)) => {
                 let mut response =
@@ -750,7 +802,7 @@ pub(crate) async fn kick(State(state): State<Arc<Inner>>, Path(id): Path<String>
     }
     error(StatusCode::NOT_FOUND, "connection not found")
 }
-pub(crate) async fn ban(state: &Inner, username: &str) {
+pub(crate) async fn account_changed(state: &Inner, username: &str, code: &'static str) {
     let rooms = state.live_rooms.rooms.lock().await;
     for queue in rooms.values().flat_map(|room| room.values()) {
         if queue.password_auth
@@ -759,7 +811,7 @@ pub(crate) async fn ban(state: &Inner, username: &str) {
                 .as_ref()
                 .is_some_and(|i| i.identity.eq_ignore_ascii_case(username))
         {
-            let _ = queue.disconnect.send(Some("banned"));
+            let _ = queue.disconnect.send(Some(code));
         }
     }
 }
@@ -1616,6 +1668,7 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
         refuse(socket, "auth").await;
         return;
     }
+    let credential_generation = claims.credential_generation;
     let inherited_channels = claims.inherited_channels;
     let identity = claims.identity.map(Arc::new);
     let service = claims.role == "service";
@@ -1625,14 +1678,25 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
         refuse(socket, "auth").await;
         return;
     };
-    if matches!(record.auth, Some(crate::auth::AuthConfig::Password { .. }))
-        && (!identity
+    if let Some(crate::auth::AuthConfig::Password { roles }) = &record.auth {
+        let account = crate::accounts::credential_state(&state, &user).await;
+        let valid = identity
             .as_ref()
             .is_some_and(|i| i.identity.eq_ignore_ascii_case(&user))
-            || !crate::accounts::account_enabled(&state, &user).await)
-    {
-        refuse(socket, "banned").await;
-        return;
+            && account.as_ref().is_some_and(|(generation, enabled, role)| {
+                *enabled
+                    && Some(*generation) == credential_generation
+                    && roles.as_ref().is_none_or(|roles| roles.contains(role))
+            });
+        if !valid {
+            let code = if account.as_ref().is_some_and(|(_, enabled, _)| !enabled) {
+                "banned"
+            } else {
+                "auth"
+            };
+            refuse(socket, code).await;
+            return;
+        }
     }
     if !paired(&state, &record, &user, &key.1)
         .await
@@ -1753,19 +1817,27 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
             },
         );
     }
-    // Recheck after insertion so a disable racing the upgrade cannot miss this socket.
-    if matches!(record.auth, Some(crate::auth::AuthConfig::Password { .. }))
-        && !crate::accounts::account_enabled(&state, &user).await
-    {
-        if let Some(queue) = state
-            .live_rooms
-            .rooms
-            .lock()
-            .await
-            .get(&key)
-            .and_then(|r| r.get(&user))
-        {
-            let _ = queue.disconnect.send(Some("banned"));
+    // Recheck after insertion so a credential change racing the upgrade cannot miss this socket.
+    if matches!(record.auth, Some(crate::auth::AuthConfig::Password { .. })) {
+        let account = crate::accounts::credential_state(&state, &user).await;
+        if !account.as_ref().is_some_and(|(generation, enabled, _)| {
+            *enabled && Some(*generation) == credential_generation
+        }) {
+            let code = match account {
+                None => "account-deleted",
+                Some((_, false, _)) => "banned",
+                _ => "credentials-changed",
+            };
+            if let Some(queue) = state
+                .live_rooms
+                .rooms
+                .lock()
+                .await
+                .get(&key)
+                .and_then(|r| r.get(&user))
+            {
+                let _ = queue.disconnect.send(Some(code));
+            }
         }
     }
     let (mut sink, mut stream) = socket.split();

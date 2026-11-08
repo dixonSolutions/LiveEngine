@@ -461,3 +461,140 @@ async fn connections_kick_ban_and_unban() {
     assert_eq!(status, 200);
     let _reconnected = connect(renewed["ticket"].clone()).await;
 }
+
+#[tokio::test]
+async fn generation_changes_invalidate_tickets_and_close_only_owner_sockets() {
+    for change in ["password", "reset", "role", "disable", "delete"] {
+        let s = server().await;
+        let alice = account(&s, "alice", "admin").await;
+        let bob = account(&s, "bob", "user").await;
+        assert_eq!(
+            post(
+                &s,
+                "/v1/hubs",
+                json!({"id":"game","mode":"internal","auth":{"kind":"password"}})
+            )
+            .await
+            .0,
+            201
+        );
+        for user in ["alice", "bob"] {
+            call(&s, "game", "upsertUser", json!([{"id":user}])).await;
+        }
+        call(
+            &s,
+            "game",
+            "upsertServer",
+            json!([{"id":"room","capacity":2}]),
+        )
+        .await;
+        for user in ["alice", "bob"] {
+            call(&s, "game", "join", json!([user, "room"])).await;
+        }
+        let issue = |user: &str, credential: &str| json!({"userId":user,"serverId":"room","credential":credential});
+        let (_, active) = post(&s, "/v1/hubs/game/tickets", issue("alice", &alice)).await;
+        let (_, unused) = post(&s, "/v1/hubs/game/tickets", issue("alice", &alice)).await;
+        let (_, other) = post(&s, "/v1/hubs/game/tickets", issue("bob", &bob)).await;
+        let ws = s.base.replacen("http:", "ws:", 1) + "/v1/live";
+        let (mut a, _) = tokio_tungstenite::connect_async(&ws).await.unwrap();
+        a.send(Message::Text(
+            json!({"type":"auth","ticket":active["ticket"]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(frame(&mut a).await["type"], "welcome");
+        let (mut b, _) = tokio_tungstenite::connect_async(&ws).await.unwrap();
+        b.send(Message::Text(
+            json!({"type":"auth","ticket":other["ticket"]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(frame(&mut b).await["type"], "welcome");
+        assert_eq!(frame(&mut a).await["type"], "presence");
+        let status = match change {
+            "password" => reqwest::Client::new()
+                .post(format!("{}/v1/accounts/me/password", s.base))
+                .bearer_auth(&alice)
+                .json(&json!({"current":"a-long-password-123","next":"new-long-password-123"}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            "reset" => {
+                request(
+                    &s,
+                    reqwest::Method::PATCH,
+                    "/v1/accounts/alice",
+                    json!({"password":"new-long-password-123"}),
+                )
+                .await
+                .0
+            }
+            "role" => {
+                request(
+                    &s,
+                    reqwest::Method::PATCH,
+                    "/v1/accounts/alice",
+                    json!({"role":"user"}),
+                )
+                .await
+                .0
+            }
+            "disable" => {
+                request(
+                    &s,
+                    reqwest::Method::PATCH,
+                    "/v1/accounts/alice",
+                    json!({"enabled":false}),
+                )
+                .await
+                .0
+            }
+            _ => {
+                request(
+                    &s,
+                    reqwest::Method::DELETE,
+                    "/v1/accounts/alice",
+                    Value::Null,
+                )
+                .await
+                .0
+            }
+        };
+        assert!(status == 200 || status == 204, "{change}: {status}");
+        let code = match change {
+            "disable" => "banned",
+            "delete" => "account-deleted",
+            _ => "credentials-changed",
+        };
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), frame(&mut a))
+                .await
+                .unwrap()["code"],
+            code,
+            "{change}"
+        );
+        let (mut stale, _) = tokio_tungstenite::connect_async(&ws).await.unwrap();
+        stale
+            .send(Message::Text(
+                json!({"type":"auth","ticket":unused["ticket"]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(frame(&mut stale).await["type"], "error", "{change}");
+        let (_, still_valid) = post(&s, "/v1/hubs/game/tickets", issue("bob", &bob)).await;
+        assert!(still_valid["ticket"].is_string(), "{change}");
+        // Bob receives Alice's presence departure but is not disconnected.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), frame(&mut b))
+            .await
+            .unwrap();
+        assert_ne!(event["type"], "error", "{change}");
+    }
+}
