@@ -1,6 +1,8 @@
 //! Live pairing and hub hosting. Embed `hub::HubService::router()` in an Axum API,
 //! or run the `liveengine-hub` binary with the same contract.
 #[cfg(feature = "host")]
+pub mod accounts;
+#[cfg(feature = "host")]
 pub mod auth;
 pub mod engine;
 #[cfg(feature = "host")]

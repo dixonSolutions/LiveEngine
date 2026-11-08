@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add local accounts, password login, role-based sessions and durable session storage.
+
 - Remove API-created join and pair users when their seats are released, preserve seat tokens across page reloads, and derive seat routes from pair URLs with trailing slashes or queries.
 
 - Pair rooms default to two peers; `target.capacity` can request a larger room up to `LIVEENGINE_MAX_ROOM_CAPACITY` (default 64). The Gogh Strike bridge defaults to 12.

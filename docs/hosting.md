@@ -299,3 +299,27 @@ stays a plain connection. Each bridged frame carries a unique `id` stamped by th
 counts under `frames`.
 
 The browser hub API returns a private `seatToken` when `pair` or legacy `join` seats a player. Repeat pair, renew, heartbeat and leave require it in the request body; missing or invalid tokens receive 403. The API stores only its SHA-256 hash. `connectLive` keeps the token internally and supplies `heartbeat()` and `leave()` methods. Abort a pending pair request to cancel it.
+
+### Local accounts and sessions
+
+The service token can create accounts with `POST /v1/accounts` using `username`,
+`password`, `role` (`admin` or `user`), and optional `enabled` and `claims`.
+Account names are case-insensitively unique. Administrators can list accounts
+and get, patch, or delete `/v1/accounts/{username}`. A patch accepts `role`,
+`enabled`, `claims`, and `password` for a reset. Passwords must contain 10–1024
+bytes; account names contain 3–64 ASCII letters, digits, `.`, `_`, or `-`.
+
+`POST /v1/sessions` accepts `username` and `password` and returns a bearer token,
+account and Unix `expiresAt`. Use it with `GET /v1/sessions/me`,
+`DELETE /v1/sessions`, and `POST /v1/accounts/me/password` (`current`, `next`).
+A password change ends every session for that account. Disabling, deleting,
+demoting, or resetting a password also ends its sessions. User sessions can
+only read their own account, change their password and log out. Admin sessions
+can administer the service. Keep session tokens secret.
+
+`LIVEENGINE_PASSWORD_ITERATIONS` defaults to 310000 (minimum 100000),
+`LIVEENGINE_SESSION_TTL_SECONDS` defaults to 43200, and
+`LIVEENGINE_LOGIN_MAX_FAILURES` defaults to 5 in 15 minutes. Failed logins
+are subject to per-name and per-address backoff. With `LIVEENGINE_STATE_FILE`,
+accounts and hashed session tokens persist in the protected state file; they
+are never included in registry exports.

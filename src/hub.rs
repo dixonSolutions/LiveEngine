@@ -689,6 +689,7 @@ enum HandlerCallError {
 }
 
 pub(crate) struct Inner {
+    pub(crate) accounts: Arc<crate::accounts::Accounts>,
     pub(crate) config: HubConfig,
     pub(crate) hubs: RwLock<HashMap<String, HubRecord>>,
     pub(crate) schemas: Arc<RwLock<HashMap<String, Value>>>,
@@ -765,6 +766,12 @@ impl HubService {
         let registry_subscribers = Arc::new(Semaphore::new(config.live_registry_max_subscribers));
         let service = Self {
             inner: Arc::new(Inner {
+                accounts: Arc::new(crate::accounts::Accounts::new(
+                    snapshot
+                        .as_ref()
+                        .map(|s| s.accounts.clone())
+                        .unwrap_or_default(),
+                )?),
                 config,
                 hubs: RwLock::new(HashMap::new()),
                 schemas: Arc::new(RwLock::new(HashMap::from([(
@@ -934,6 +941,25 @@ impl HubService {
             .route("/v1/ping", get(ping))
             .route("/v1/contract", get(contract))
             .route("/v1/contract/schema", get(contract_schema))
+            .route(
+                "/v1/accounts",
+                get(crate::accounts::list).post(crate::accounts::create),
+            )
+            .route(
+                "/v1/accounts/me/password",
+                post(crate::accounts::change_password),
+            )
+            .route(
+                "/v1/accounts/{username}",
+                get(crate::accounts::get)
+                    .patch(crate::accounts::patch)
+                    .delete(crate::accounts::delete),
+            )
+            .route(
+                "/v1/sessions",
+                post(crate::accounts::login).delete(crate::accounts::logout),
+            )
+            .route("/v1/sessions/me", get(crate::accounts::me))
             .route("/v1/schemas", get(list_schemas).post(create_schema))
             .route("/v1/schemas/{id}", get(get_schema).delete(delete_schema))
             .route("/v1/templates", get(list_templates).post(create_template))
@@ -1099,6 +1125,8 @@ impl HubService {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Snapshot {
+    #[serde(default)]
+    accounts: crate::accounts::Data,
     version: u8,
     instance_id: String,
     #[serde(default)]
@@ -1279,6 +1307,7 @@ fn restore_hubs(state: &Arc<Inner>, saved: Vec<SavedHub>, depth: usize) -> Resul
             inner.schemas = state.schemas.clone();
             inner.templates = state.templates.clone();
             inner.imports = state.imports.clone();
+            inner.accounts = state.accounts.clone();
             inner.persistence_lock = state.persistence_lock.clone();
             inner.mutation_lock = state.mutation_lock.clone();
             inner.durable = state.durable;
@@ -1390,6 +1419,7 @@ fn snapshot_hubs(
     })
 }
 struct Definitions {
+    accounts: crate::accounts::Data,
     hubs: HashMap<String, HubRecord>,
     schemas: HashMap<String, Value>,
     templates: HashMap<String, Value>,
@@ -1410,6 +1440,7 @@ impl Definitions {
                 children.push((child, definitions));
             }
             Self {
+                accounts: state.accounts.data.read().await.clone(),
                 hubs,
                 schemas: state.schemas.read().await.clone(),
                 templates: state.templates.read().await.clone(),
@@ -1428,6 +1459,7 @@ impl Definitions {
             for (child, definitions) in definitions.children {
                 Self::restore(&child, definitions).await;
             }
+            *state.accounts.data.write().await = definitions.accounts;
             *state.hubs.write().await = definitions.hubs;
             *state.schemas.write().await = definitions.schemas;
             *state.templates.write().await = definitions.templates;
@@ -1465,6 +1497,7 @@ async fn persist(state: &Inner) -> Result<(), String> {
     };
     let _guard = state.persistence_lock.lock().await;
     let snapshot = Snapshot {
+        accounts: state.accounts.data.read().await.clone(),
         version: 1,
         instance_id: state.instance_id.clone(),
         signing_key: Some(state.ticket_signer.key()),
@@ -1516,7 +1549,8 @@ async fn persist_request(
 ) -> Response {
     let path = request.uri().path();
     let mutation = (request.method() == axum::http::Method::POST
-        || request.method() == axum::http::Method::DELETE)
+        || request.method() == axum::http::Method::DELETE
+        || request.method() == axum::http::Method::PATCH)
         && path != "/v1/ping"
         && !(path.starts_with("/v1/hubs/") && path.ends_with("/call"))
         && request.extensions().get::<PairWait>().is_none();
@@ -1655,7 +1689,8 @@ async fn secure_request(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("")
-        .as_bytes();
+        .as_bytes()
+        .to_vec();
     let expected = state.config.token.as_bytes();
     let mut difference = 0u8;
     for (index, expected_byte) in expected.iter().enumerate() {
@@ -1663,8 +1698,13 @@ async fn secure_request(
     }
     let equal = bool::from(supplied.len().ct_eq(&expected.len())) && difference == 0;
     let mut request = request;
-    if !equal {
-        if let Some(auth) = crate::links::credential_auth(
+    let login =
+        request.method() == axum::http::Method::POST && request.uri().path() == "/v1/sessions";
+    if !equal && !login {
+        let token = std::str::from_utf8(&supplied).unwrap_or("");
+        if crate::accounts::allowed(&state, token, request.method(), request.uri().path()).await {
+            // An authorized account session has the privileges checked above.
+        } else if let Some(auth) = crate::links::credential_auth(
             &state,
             request.method(),
             request.uri().path(),
@@ -2918,6 +2958,7 @@ async fn register_hub_inherited(
         inner.call_waiting = state.call_waiting.clone();
         inner.root = false;
         inner.imports = state.imports.clone();
+        inner.accounts = state.accounts.clone();
         inner.persistence_lock = state.persistence_lock.clone();
         inner.mutation_lock = state.mutation_lock.clone();
         inner.durable = state.durable;

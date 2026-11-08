@@ -323,7 +323,8 @@ async fn serve(root: Arc<Inner>, mut socket: WebSocket, forward_trace: String) {
                 .and_then(Value::as_str)
                 .unwrap_or("")
         });
-    let admin = token.as_bytes().ct_eq(root.config.token.as_bytes()).into();
+    let admin: bool = bool::from(token.as_bytes().ct_eq(root.config.token.as_bytes()))
+        || crate::accounts::is_admin(&root, token).await;
     let claims = if admin {
         None
     } else {
