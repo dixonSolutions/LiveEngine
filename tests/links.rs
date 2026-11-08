@@ -1531,3 +1531,183 @@ async fn linked_sender_must_be_announced_on_the_same_link() {
     assert_eq!(counters(&n).await.1, before + 2);
     n.task.abort();
 }
+
+#[tokio::test]
+async fn remote_connection_can_be_listed_and_kicked_by_its_owner() {
+    let (a, b) = pair().await;
+    let (mut alice, w1) = peer(&a, "alice").await;
+    let (mut bob, w2) = peer(&b, "bob").await;
+    sees(&mut alice, &w1, &["bob"]).await;
+    sees(&mut bob, &w2, &["alice"]).await;
+    let client = reqwest::Client::new();
+    let remote = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let values: Value = client
+                .get(format!("{}/v1/connections?user=bob", a.base))
+                .bearer_auth(&a.token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if let Some(info) = values
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["remote"] == true)
+            {
+                break info.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!remote.to_string().contains(&b.token));
+    assert_eq!(
+        client
+            .delete(format!(
+                "{}/v1/connections/{}",
+                a.base,
+                remote["id"].as_str().unwrap()
+            ))
+            .bearer_auth(&a.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    assert!(wait_for(&mut bob, 5000, |v| v["type"] == "error"
+        && v["code"] == "kicked")
+    .await
+    .is_some());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (_bob, _) = peer(&b, "bob").await;
+    a.task.abort();
+    b.task.abort();
+}
+
+#[tokio::test]
+async fn banning_a_linked_password_peer_closes_its_own_socket() {
+    use futures_util::SinkExt;
+    let token = "linked-password-administrator-token-123456789";
+    let service = HubService::new(HubConfig {
+        token: token.into(),
+        public_url: Some("ws://localhost/v1/live".into()),
+        allowed_remote_hosts: vec!["127.0.0.1".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let (base, task) = serve(service).await;
+    let a = Node {
+        name: "a".into(),
+        base,
+        token: token.into(),
+        task,
+    };
+    let b = node("b", &["bob", "svc-a"]).await;
+    assert_eq!(
+        post(
+            &a.base,
+            &a.token,
+            "/v1/accounts",
+            json!({"username":"alice","password":"password-for-alice-123","role":"user"})
+        )
+        .await
+        .status(),
+        201
+    );
+    let session: Value = post(
+        &a.base,
+        &a.token,
+        "/v1/sessions",
+        json!({"username":"alice","password":"password-for-alice-123"}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(
+        post(
+            &a.base,
+            &a.token,
+            "/v1/hubs",
+            json!({"id":"game","mode":"internal","auth":{"kind":"password"}})
+        )
+        .await
+        .status(),
+        201
+    );
+    for (method, args) in [
+        ("upsertUser", json!([{"id":"alice"}])),
+        ("upsertServer", json!([{"id":"room"}])),
+        ("join", json!(["alice", "room"])),
+    ] {
+        assert_eq!(
+            post(
+                &a.base,
+                &a.token,
+                "/v1/hubs/game/call",
+                json!({"method":method,"args":args})
+            )
+            .await
+            .status(),
+            200
+        );
+    }
+    link(&a, &b, "ab").await;
+    link_status(&a, "ab", "connected").await;
+    let issued: Value = post(
+        &a.base,
+        &a.token,
+        "/v1/hubs/game/tickets",
+        json!({"userId":"alice","serverId":"room","credential":session["token"]}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let (mut alice, _) = tokio_tungstenite::connect_async(format!(
+        "{}/v1/live",
+        a.base.replacen("http://", "ws://", 1)
+    ))
+    .await
+    .unwrap();
+    alice
+        .send(Message::Text(
+            json!({"type":"auth","ticket":issued["ticket"]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert!(wait_for(&mut alice, 5000, |v| v["type"] == "welcome")
+        .await
+        .is_some());
+    let (mut bob, welcome) = peer(&b, "bob").await;
+    sees(&mut bob, &welcome, &["alice"]).await;
+    assert_eq!(
+        reqwest::Client::new()
+            .patch(format!("{}/v1/accounts/alice", a.base))
+            .bearer_auth(&a.token)
+            .json(&json!({"enabled":false}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert!(wait_for(&mut alice, 5000, |v| v["type"] == "error"
+        && v["code"] == "banned")
+    .await
+    .is_some());
+    assert!(wait_for(&mut bob, 5000, |v| v["type"] == "presence"
+        && v["event"] == "leave"
+        && v["peer"] == "alice")
+    .await
+    .is_some());
+    a.task.abort();
+    b.task.abort();
+}

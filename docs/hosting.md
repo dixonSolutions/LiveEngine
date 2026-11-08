@@ -326,3 +326,16 @@ can administer the service. Keep session tokens secret.
 are subject to per-name and per-address backoff. With `LIVEENGINE_STATE_FILE`,
 accounts and hashed session tokens persist in the protected state file; they
 are never included in registry exports.
+
+### Managing live connections
+
+An administrator can `GET /v1/connections` to list live sockets. Optional `hub`
+(a slash-separated hub path), `room`, and `user` query parameters filter the
+list. Each entry contains an opaque `id`, `hub` path, `room`, `user`, live
+`role`, `transport`, Unix-seconds `connectedAt`, and `remote` flag. Linked
+room peers are marked remote; credentials and network addresses are omitted.
+`DELETE /v1/connections/{id}` sends the peer a `kicked` error and closes its
+socket. A new ticket permits it to reconnect. Disabling an account ends its
+sessions and closes its password-authenticated sockets with `banned`;
+re-enabling it permits a fresh login. Linked socket termination is performed by
+the service that owns the socket.

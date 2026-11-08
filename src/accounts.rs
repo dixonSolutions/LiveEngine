@@ -201,6 +201,16 @@ pub(crate) async fn session(state: &Inner, token: &str) -> Option<Account> {
     }
     Some(a.into())
 }
+pub(crate) async fn account_enabled(state: &Inner, username: &str) -> bool {
+    state
+        .accounts
+        .data
+        .read()
+        .await
+        .accounts
+        .get(&username.to_ascii_lowercase())
+        .is_some_and(|a| a.enabled)
+}
 pub(crate) async fn is_admin(state: &Inner, token: &str) -> bool {
     session(state, token)
         .await
@@ -350,8 +360,14 @@ pub(crate) async fn patch(
     if end {
         revoke(&mut d, &key);
     }
-    Json(public).into_response()
+    let mut response = Json(public).into_response();
+    if v.enabled == Some(false) {
+        response.extensions_mut().insert(BanAccount(key));
+    }
+    response
 }
+#[derive(Clone)]
+pub(crate) struct BanAccount(pub(crate) String);
 pub(crate) async fn delete(State(s): State<Arc<Inner>>, Path(name): Path<String>) -> Response {
     let key = name.to_ascii_lowercase();
     let mut d = s.accounts.data.write().await;

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add administrative live connection listing, kicks and account bans, including linked rooms.
+
 - Add password-backed hub authentication using account sessions and role restrictions.
 
 - Add local accounts, password login, role-based sessions and durable session storage.

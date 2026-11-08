@@ -324,3 +324,140 @@ async fn peer_pair_requires_both_sessions_and_reports_verified_identities() {
     assert_eq!(presence["identity"]["identity"], "bob");
     assert_eq!(presence["identity"]["claims"]["role"], "admin");
 }
+
+#[tokio::test]
+async fn connections_kick_ban_and_unban() {
+    let s = server().await;
+    let session = account(&s, "alice", "user").await;
+    assert_eq!(
+        post(
+            &s,
+            "/v1/hubs",
+            json!({"id":"game","mode":"internal","auth":{"kind":"password"}})
+        )
+        .await
+        .0,
+        201
+    );
+    call(&s, "game", "upsertUser", json!([{"id":"alice"}])).await;
+    call(&s, "game", "upsertServer", json!([{"id":"room"}])).await;
+    call(&s, "game", "join", json!(["alice", "room"])).await;
+    let ticket =
+        |credential: &str| json!({"userId":"alice","serverId":"room","credential":credential});
+    let connect = |ticket: Value| {
+        let ws = s.base.replacen("http:", "ws:", 1) + "/v1/live";
+        async move {
+            let (mut socket, _) = tokio_tungstenite::connect_async(ws).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"type":"auth","ticket":ticket}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(frame(&mut socket).await["type"], "welcome");
+            socket
+        }
+    };
+    let (_, t) = post(&s, "/v1/hubs/game/tickets", ticket(&session)).await;
+    let mut socket = connect(t["ticket"].clone()).await;
+    let (_, list) = request(
+        &s,
+        reqwest::Method::GET,
+        "/v1/connections?hub=game&room=room&user=alice",
+        Value::Null,
+    )
+    .await;
+    let list = list.as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["hub"], json!(["game"]));
+    assert_eq!(list[0]["transport"], "websocket");
+    assert_eq!(list[0]["remote"], false);
+    assert!(!list[0].to_string().contains(&session));
+    let id = list[0]["id"].as_str().unwrap();
+    let denied = reqwest::Client::new()
+        .get(format!("{}/v1/connections", s.base))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 401);
+    assert_eq!(
+        request(
+            &s,
+            reqwest::Method::DELETE,
+            &format!("/v1/connections/{id}"),
+            Value::Null
+        )
+        .await
+        .0,
+        204
+    );
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), frame(&mut socket))
+            .await
+            .unwrap()["code"],
+        "kicked"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let (_, t) = post(&s, "/v1/hubs/game/tickets", ticket(&session)).await;
+    let mut socket = connect(t["ticket"].clone()).await;
+    let (_, unused) = post(&s, "/v1/hubs/game/tickets", ticket(&session)).await;
+    assert_eq!(
+        request(
+            &s,
+            reqwest::Method::PATCH,
+            "/v1/accounts/alice",
+            json!({"enabled":false})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), frame(&mut socket))
+            .await
+            .unwrap()["code"],
+        "banned"
+    );
+    assert_eq!(
+        post(&s, "/v1/hubs/game/tickets", ticket(&session)).await.0,
+        403
+    );
+    assert_eq!(post(&s, "/v1/pair", json!({"subject":{"kind":"peer","id":"alice","scopes":{},"credential":session},"target":{"kind":"hub","requirements":{}}})).await.0, 403);
+    let ws = s.base.replacen("http:", "ws:", 1) + "/v1/live";
+    let (mut stale, _) = tokio_tungstenite::connect_async(ws).await.unwrap();
+    stale
+        .send(Message::Text(
+            json!({"type":"auth","ticket":unused["ticket"]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(frame(&mut stale).await["code"], "banned");
+    assert_eq!(
+        request(
+            &s,
+            reqwest::Method::PATCH,
+            "/v1/accounts/alice",
+            json!({"enabled":true})
+        )
+        .await
+        .0,
+        200
+    );
+    let (_, login) = post(
+        &s,
+        "/v1/sessions",
+        json!({"username":"alice","password":"a-long-password-123"}),
+    )
+    .await;
+    let (status, renewed) = post(
+        &s,
+        "/v1/hubs/game/tickets",
+        ticket(login["token"].as_str().unwrap()),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let _reconnected = connect(renewed["ticket"].clone()).await;
+}

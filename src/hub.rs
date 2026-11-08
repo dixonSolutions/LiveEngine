@@ -960,6 +960,11 @@ impl HubService {
                 post(crate::accounts::login).delete(crate::accounts::logout),
             )
             .route("/v1/sessions/me", get(crate::accounts::me))
+            .route("/v1/connections", get(crate::live::list_connections))
+            .route(
+                "/v1/connections/{id}",
+                axum::routing::delete(crate::live::kick),
+            )
             .route("/v1/schemas", get(list_schemas).post(create_schema))
             .route("/v1/schemas/{id}", get(get_schema).delete(delete_schema))
             .route("/v1/templates", get(list_templates).post(create_template))
@@ -1555,7 +1560,11 @@ async fn persist_request(
         && !(path.starts_with("/v1/hubs/") && path.ends_with("/call"))
         && request.extensions().get::<PairWait>().is_none();
     if !mutation || state.config.state_file.is_none() {
-        return next.run(request).await;
+        let response = next.run(request).await;
+        if let Some(ban) = response.extensions().get::<crate::accounts::BanAccount>() {
+            crate::live::ban(&state, &ban.0).await;
+        }
+        return response;
     }
     let _guard = state.mutation_lock.lock().await;
     let before = Definitions::capture(&state).await;
@@ -1566,6 +1575,9 @@ async fn persist_request(
             StatusCode::INTERNAL_SERVER_ERROR,
             "cannot persist state file",
         );
+    }
+    if let Some(ban) = response.extensions().get::<crate::accounts::BanAccount>() {
+        crate::live::ban(&state, &ban.0).await;
     }
     response
 }

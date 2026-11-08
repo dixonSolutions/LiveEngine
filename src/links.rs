@@ -460,7 +460,7 @@ async fn connect(state: Arc<Inner>, entry: &Arc<Entry>) -> bool {
                     let over_budget = count > max_count;
                     if let (Some(key), Ok(value)) = (&bridge, serde_json::from_str::<serde_json::Value>(&s)) {
                         // Ordinary room frames are not carried; only the two link frame types are.
-                        if !matches!(value["type"].as_str(), Some("link.frame" | "link.presence")) { continue; }
+                        if !matches!(value["type"].as_str(), Some("link.frame" | "link.presence" | "link.control")) { continue; }
                         if let Some(state) = weak.upgrade() { live::ingest(&state, key, &name, &value, None, over_budget).await; }
                     }
                 }, Some(Ok(Message::Ping(data))) => { if socket.send(Message::Pong(data)).await.is_err() { break; } }, Some(Ok(Message::Pong(_))) => {}, _ => break } }

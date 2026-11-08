@@ -4,7 +4,7 @@ use crate::hub::{
     Inner, LiveChannel, LiveDelivery, RouteRequest,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -673,11 +673,103 @@ use axum::extract::ws::{Message, WebSocketUpgrade};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionInfo {
+    id: String,
+    hub: Vec<String>,
+    room: String,
+    user: String,
+    role: String,
+    transport: String,
+    connected_at: u64,
+    remote: bool,
+}
+#[derive(Deserialize)]
+pub(crate) struct ConnectionFilter {
+    hub: Option<String>,
+    room: Option<String>,
+    user: Option<String>,
+}
+pub(crate) async fn list_connections(
+    State(state): State<Arc<Inner>>,
+    Query(filter): Query<ConnectionFilter>,
+) -> Response {
+    let rooms = state.live_rooms.rooms.lock().await;
+    let bridges = state.live_rooms.bridges.lock().await;
+    let mut items: Vec<_> = rooms
+        .values()
+        .flat_map(|room| room.values())
+        .filter_map(|q| q.info.clone())
+        .filter(|c| {
+            filter
+                .hub
+                .as_ref()
+                .is_none_or(|h| c.hub.join("/") == *h || c.hub.last() == Some(h))
+                && filter.room.as_ref().is_none_or(|r| c.room == *r)
+                && filter.user.as_ref().is_none_or(|u| c.user == *u)
+        })
+        .collect();
+    items.extend(
+        bridges
+            .values()
+            .flat_map(|b| b.remote_info.values())
+            .filter(|c| {
+                filter
+                    .hub
+                    .as_ref()
+                    .is_none_or(|h| c.hub.join("/") == *h || c.hub.last() == Some(h))
+                    && filter.room.as_ref().is_none_or(|r| c.room == *r)
+                    && filter.user.as_ref().is_none_or(|u| c.user == *u)
+            })
+            .cloned(),
+    );
+    items.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(items).into_response()
+}
+pub(crate) async fn kick(State(state): State<Arc<Inner>>, Path(id): Path<String>) -> Response {
+    let rooms = state.live_rooms.rooms.lock().await;
+    for queue in rooms.values().flat_map(|room| room.values()) {
+        if queue.info.as_ref().is_some_and(|i| i.id == id) {
+            let _ = queue.disconnect.send(Some("kicked"));
+            return StatusCode::NO_CONTENT.into_response();
+        }
+    }
+    let bridges = state.live_rooms.bridges.lock().await;
+    for bridge in bridges.values() {
+        if let Some((peer, _)) = bridge.remote_info.iter().find(|(_, info)| info.id == id) {
+            if let Some(link) = bridge
+                .remote
+                .get(peer)
+                .and_then(|via| bridge.links.get(via))
+            {
+                link.queue.send(text(serde_json::json!({"type":"link.control","trace":[state.instance_id],"id":id,"code":"kicked"})), false);
+                return StatusCode::NO_CONTENT.into_response();
+            }
+        }
+    }
+    error(StatusCode::NOT_FOUND, "connection not found")
+}
+pub(crate) async fn ban(state: &Inner, username: &str) {
+    let rooms = state.live_rooms.rooms.lock().await;
+    for queue in rooms.values().flat_map(|room| room.values()) {
+        if queue.password_auth
+            && queue
+                .identity
+                .as_ref()
+                .is_some_and(|i| i.identity.eq_ignore_ascii_case(username))
+        {
+            let _ = queue.disconnect.send(Some("banned"));
+        }
+    }
+}
 type RoomKey = (Vec<String>, String);
 #[derive(Clone)]
 struct PeerQueue {
     sender: mpsc::Sender<Message>,
-    disconnect: tokio::sync::watch::Sender<bool>,
+    disconnect: tokio::sync::watch::Sender<Option<&'static str>>,
+    info: Option<ConnectionInfo>,
+    password_auth: bool,
     /// Service sockets are never announced as bridged peers.
     service: bool,
     /// What the hub's `auth` verified for this peer, shown to the room.
@@ -686,7 +778,7 @@ struct PeerQueue {
 impl PeerQueue {
     fn send(&self, message: Message, lossy: bool) {
         if self.sender.try_send(message).is_err() && !lossy {
-            let _ = self.disconnect.send(true);
+            let _ = self.disconnect.send(Some("rate"));
         }
     }
 }
@@ -720,6 +812,7 @@ struct Attached {
 struct Bridge {
     links: HashMap<String, Attached>,
     remote: HashMap<String, String>,
+    remote_info: HashMap<String, ConnectionInfo>,
 }
 impl Bridge {
     fn is_link_user(&self, peer: &str) -> bool {
@@ -876,7 +969,7 @@ pub(crate) struct LinkAttach {
     /// Current presence, to send first; the first frame also announces the link.
     pub(crate) snapshot: Vec<Message>,
     pub(crate) rx: mpsc::Receiver<Message>,
-    pub(crate) disconnected: tokio::sync::watch::Receiver<bool>,
+    pub(crate) disconnected: tokio::sync::watch::Receiver<Option<&'static str>>,
 }
 pub(crate) fn room_key(state: &Inner, hub_id: &str, room: &str) -> RoomKey {
     let mut path = state.hub_path.clone();
@@ -890,10 +983,12 @@ pub(crate) async fn attach_link(
 ) -> Option<LinkAttach> {
     resolve(state, &key.0).await?;
     let (sender, rx) = mpsc::channel::<Message>(limit("LIVEENGINE_LIVE_SEND_QUEUE", 64));
-    let (disconnect, disconnected) = tokio::sync::watch::channel(false);
+    let (disconnect, disconnected) = tokio::sync::watch::channel(None);
     let queue = PeerQueue {
         sender,
         disconnect,
+        info: None,
+        password_auth: false,
         service: true,
         identity: None,
     };
@@ -951,20 +1046,17 @@ fn snapshot(
     name: &str,
 ) -> Vec<Message> {
     let trace = [state.instance_id.clone()];
-    let local = room
-        .into_iter()
-        .flatten()
-        .filter(|(peer, queue)| !queue.service && !bridge.is_link_user(peer))
-        .map(|(peer, _)| peer);
-    let remote = bridge
-        .remote
-        .iter()
-        .filter(|(_, via)| *via != name)
-        .map(|(peer, _)| peer);
-    local
-        .chain(remote)
-        .map(|peer| wire_presence(&trace, "join", Some(peer)))
-        .collect()
+    let local = room.into_iter().flatten().filter(|(peer, queue)| !queue.service && !bridge.is_link_user(peer)).map(|(peer, queue)| {
+        let mut value = serde_json::json!({"type":"link.presence","trace":trace,"event":"join","peer":peer});
+        if let Some(info) = &queue.info { value["connection"] = serde_json::to_value(info).unwrap_or(Value::Null); value["connection"]["remote"] = Value::Bool(true); }
+        text(value)
+    });
+    let remote = bridge.remote.iter().filter(|(_, via)| *via != name).map(|(peer, _)| {
+        let mut value = serde_json::json!({"type":"link.presence","trace":trace,"event":"join","peer":peer});
+        if let Some(info) = bridge.remote_info.get(peer) { value["connection"] = serde_json::to_value(info).unwrap_or(Value::Null); }
+        text(value)
+    });
+    local.chain(remote).collect()
 }
 /// Queue messages with backpressure, off the lock; a snapshot can exceed the queue.
 fn spawn_send(sender: mpsc::Sender<Message>, messages: Vec<Message>) {
@@ -996,6 +1088,7 @@ pub(crate) async fn detach_link(state: &Arc<Inner>, key: &RoomKey, name: &str, g
         .collect();
     for peer in &lost {
         bridge.remote.remove(peer);
+        bridge.remote_info.remove(peer);
     }
     let trace = [state.instance_id.clone()];
     for peer in &lost {
@@ -1047,6 +1140,41 @@ pub(crate) async fn ingest(
                     } else {
                         LiveRooms::count(&state.live_rooms.rejected);
                     }
+                }
+            }
+            true
+        }
+        Some("link.control") => {
+            let Some(trace) = parse_trace(wire) else {
+                return true;
+            };
+            if trace.contains(&state.instance_id)
+                || trace.len() >= MAX_TRACE
+                || wire.get("code").and_then(Value::as_str) != Some("kicked")
+            {
+                return true;
+            }
+            let Some(id) = wire
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| id.len() <= 256)
+            else {
+                return true;
+            };
+            let rooms = state.live_rooms.rooms.lock().await;
+            if let Some(queue) = rooms
+                .get(key)
+                .into_iter()
+                .flat_map(|r| r.values())
+                .find(|q| q.info.as_ref().is_some_and(|i| i.id == id))
+            {
+                let _ = queue.disconnect.send(Some("kicked"));
+            } else {
+                let bridges = state.live_rooms.bridges.lock().await;
+                if let Some(bridge) = bridges.get(key) {
+                    let mut value = wire.clone();
+                    value["trace"] = serde_json::json!(extended(&trace, &state.instance_id));
+                    bridge.offer(Some(via), &text(value), false);
                 }
             }
             true
@@ -1216,14 +1344,25 @@ async fn ingest_presence(state: &Arc<Inner>, key: &RoomKey, via: &str, wire: &Va
             return;
         }
         bridge.remote.insert(peer.to_owned(), via.to_owned());
+        if let Some(mut info) = wire
+            .get("connection")
+            .and_then(|v| serde_json::from_value::<ConnectionInfo>(v.clone()).ok())
+            .filter(|i| i.user == peer && i.id.len() <= 256 && i.hub.len() <= 16)
+        {
+            info.remote = true;
+            bridge.remote_info.insert(peer.to_owned(), info);
+        }
     } else if bridge.remote.get(peer).map(String::as_str) == Some(via) {
         bridge.remote.remove(peer);
+        bridge.remote_info.remove(peer);
     } else {
         return;
     }
     notify_local(rooms.get(key), bridge, &local_presence(event, peer));
     let trace = extended(&trace, &state.instance_id);
-    bridge.offer(Some(via), &wire_presence(&trace, event, Some(peer)), false);
+    let mut forwarded = wire.clone();
+    forwarded["trace"] = serde_json::json!(trace);
+    bridge.offer(Some(via), &text(forwarded), false);
     if event == "unreachable" {
         // The peer may still be reachable through another link: ask them to announce again.
         let hello = wire_presence(std::slice::from_ref(&state.instance_id), "join", None);
@@ -1486,6 +1625,15 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
         refuse(socket, "auth").await;
         return;
     };
+    if matches!(record.auth, Some(crate::auth::AuthConfig::Password { .. }))
+        && (!identity
+            .as_ref()
+            .is_some_and(|i| i.identity.eq_ignore_ascii_case(&user))
+            || !crate::accounts::account_enabled(&state, &user).await)
+    {
+        refuse(socket, "banned").await;
+        return;
+    }
     if !paired(&state, &record, &user, &key.1)
         .await
         .unwrap_or(false)
@@ -1507,8 +1655,18 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
         return;
     };
     let (tx, mut rx) = mpsc::channel::<Message>(limit("LIVEENGINE_LIVE_SEND_QUEUE", 64));
-    let (disconnect, mut disconnected) = tokio::sync::watch::channel(false);
+    let (disconnect, mut disconnected) = tokio::sync::watch::channel(None);
     let error_tx = tx.clone();
+    let info = ConnectionInfo {
+        id: format!("{}-{:016x}", state.instance_id, rand::random::<u64>()),
+        hub: key.0.clone(),
+        room: key.1.clone(),
+        user: user.clone(),
+        role: claims.role.clone(),
+        transport: "websocket".into(),
+        connected_at: now().unwrap_or_default(),
+        remote: false,
+    };
     {
         let mut rooms = state.live_rooms.rooms.lock().await;
         if rooms.values().map(HashMap::len).sum::<usize>()
@@ -1574,7 +1732,9 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
             if !service {
                 if let Some(bridge) = bridges.get(&key) {
                     let trace = [state.instance_id.clone()];
-                    bridge.offer(None, &wire_presence(&trace, "join", Some(&user)), false);
+                    let mut presence = serde_json::json!({"type":"link.presence","trace":trace,"event":"join","peer":user,"connection":info});
+                    presence["connection"]["remote"] = Value::Bool(true);
+                    bridge.offer(None, &Message::Text(presence.to_string().into()), false);
                 }
             }
         }
@@ -1583,10 +1743,30 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
             PeerQueue {
                 sender: tx,
                 disconnect,
+                info: Some(info),
+                password_auth: matches!(
+                    record.auth,
+                    Some(crate::auth::AuthConfig::Password { .. })
+                ),
                 service,
                 identity: identity.clone(),
             },
         );
+    }
+    // Recheck after insertion so a disable racing the upgrade cannot miss this socket.
+    if matches!(record.auth, Some(crate::auth::AuthConfig::Password { .. }))
+        && !crate::accounts::account_enabled(&state, &user).await
+    {
+        if let Some(queue) = state
+            .live_rooms
+            .rooms
+            .lock()
+            .await
+            .get(&key)
+            .and_then(|r| r.get(&user))
+        {
+            let _ = queue.disconnect.send(Some("banned"));
+        }
     }
     let (mut sink, mut stream) = socket.split();
     let mut writer = tokio::spawn(async move {
@@ -1611,7 +1791,7 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
     loop {
         let message = tokio::select! {
             result = stream.next() => match result { Some(Ok(message)) => message, Some(Err(_)) => { violation = Some("frame"); break }, None => break },
-            _ = disconnected.changed() => { violation = Some("rate"); break },
+            _ = disconnected.changed() => { violation = *disconnected.borrow(); break },
             _ = &mut writer => break,
             _ = tick.tick() => {
                 if last_activity.elapsed() >= Duration::from_secs(limit("LIVEENGINE_LIVE_IDLE_SECONDS", 60) as u64) { break }
@@ -1900,19 +2080,21 @@ mod queue_tests {
     #[test]
     fn full_queue_drops_lossy_and_disconnects_reliable() {
         let (sender, mut receiver) = mpsc::channel(1);
-        let (disconnect, disconnected) = tokio::sync::watch::channel(false);
+        let (disconnect, disconnected) = tokio::sync::watch::channel(None);
         let queue = PeerQueue {
             sender,
             disconnect,
+            info: None,
+            password_auth: false,
             service: false,
             identity: None,
         };
         queue.send(Message::Text("first".into()), false);
         queue.send(Message::Text("lossy".into()), true);
-        assert!(!*disconnected.borrow());
+        assert!(disconnected.borrow().is_none());
         assert_eq!(receiver.try_recv().unwrap(), Message::Text("first".into()));
         queue.send(Message::Text("first".into()), false);
         queue.send(Message::Text("reliable".into()), false);
-        assert!(*disconnected.borrow());
+        assert_eq!(*disconnected.borrow(), Some("rate"));
     }
 }
