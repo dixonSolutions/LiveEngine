@@ -100,6 +100,10 @@ pub(crate) struct TokenEntry {
     deny_unknown_fields
 )]
 pub(crate) enum AuthConfig {
+    Password {
+        #[serde(default)]
+        roles: Option<Vec<String>>,
+    },
     Token {
         tokens: Vec<TokenEntry>,
     },
@@ -147,6 +151,7 @@ impl AuthConfig {
     pub(crate) fn info(&self) -> AuthInfo {
         AuthInfo {
             kind: match self {
+                Self::Password { .. } => "password",
                 Self::Token { .. } => "token",
                 Self::Hmac { .. } => "hmac",
                 Self::Jwt { .. } => "jwt",
@@ -159,6 +164,16 @@ impl AuthConfig {
 
     pub(crate) fn validate(&self, state: &Inner, registering: bool) -> Result<(), String> {
         match self {
+            Self::Password { roles } => {
+                if roles.as_ref().is_some_and(|r| {
+                    r.is_empty()
+                        || r.len() > 2
+                        || r.iter().any(|v| !matches!(v.as_str(), "user" | "admin"))
+                        || (r.len() == 2 && r[0] == r[1])
+                }) {
+                    return Err("auth roles must contain distinct user or admin roles".into());
+                }
+            }
             Self::Token { tokens } => {
                 if tokens.is_empty() || tokens.len() > MAX_TOKENS {
                     return Err("auth tokens must hold 1 to 256 entries".into());
@@ -509,6 +524,26 @@ pub(crate) async fn verify(
         credential,
     };
     let mut identity = match config {
+        AuthConfig::Password { roles } => {
+            let account = crate::accounts::session(state, credential)
+                .await
+                .ok_or(AuthError)?;
+            if roles
+                .as_ref()
+                .is_some_and(|roles| !roles.contains(&account.role))
+            {
+                return Err(AuthError);
+            }
+            let mut claims = account
+                .claims
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            claims.insert("role".into(), Value::String(account.role));
+            Identity {
+                identity: account.username,
+                claims,
+            }
+        }
         AuthConfig::Token { tokens } => verify_token(tokens, credential)?,
         AuthConfig::Hmac {
             secret,

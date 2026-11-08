@@ -27,7 +27,7 @@ const MAX_CREDENTIAL_BYTES: usize = 128;
 
 /// Route operations a hub-scoped credential may run, against its own subtree only.
 /// Anything not listed, including operations added later, is refused.
-pub(crate) const ALLOWED_OPS: [&str; 11] = [
+pub(crate) const ALLOWED_OPS: [&str; 12] = [
     "discover",
     "pair",
     "tree",
@@ -38,6 +38,7 @@ pub(crate) const ALLOWED_OPS: [&str; 11] = [
     "watchTicket",
     "ticket",
     "authorize",
+    "authPolicy",
     "call",
 ];
 

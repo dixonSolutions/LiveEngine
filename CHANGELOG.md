@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add password-backed hub authentication using account sessions and role restrictions.
+
 - Add local accounts, password login, role-based sessions and durable session storage.
 
 - Remove API-created join and pair users when their seats are released, preserve seat tokens across page reloads, and derive seat routes from pair URLs with trailing slashes or queries.

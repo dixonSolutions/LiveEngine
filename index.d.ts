@@ -157,6 +157,7 @@ export type HubMode = 'internal' | 'external' | 'central';
 export interface LiveChannel { schemaRef?: string; delivery: 'reliable' | 'lossy'; maxRate?: number; }
 /** Per-hub credential verifier checked before a ticket is issued. Secrets are write-only. */
 export type HubAuth =
+  | { kind: 'password'; roles?: ('user' | 'admin')[] }
   | { kind: 'token'; tokens: { token: string; identity?: string; claims?: Record<string, unknown> }[] }
   | { kind: 'hmac'; secret: string; leewaySeconds?: number }
   | { kind: 'jwt'; alg: 'HS256'; secret: string; issuer?: string; audience?: string; identityClaim?: string; leewaySeconds?: number }
@@ -221,7 +222,7 @@ export declare class HubClient {
   contract(): Promise<{ protocol: typeof HUB_PROTOCOL; [key: string]: unknown }>;
   ping(options?: HubPingOptions): Promise<HubPing>;
   tree(depth?: number): Promise<unknown>;
-  route(path: string[], op: 'register' | 'list' | 'get' | 'delete' | 'call' | 'tree' | 'ticket' | 'watchTicket' | 'authorize' | 'discover' | 'pair', body?: Record<string, unknown>): Promise<unknown>;
+  route(path: string[], op: 'register' | 'list' | 'get' | 'delete' | 'call' | 'tree' | 'ticket' | 'watchTicket' | 'authorize' | 'authPolicy' | 'discover' | 'pair', body?: Record<string, unknown>): Promise<unknown>;
   listTemplates(): Promise<unknown>;
   createTemplate(template: HubTemplate): Promise<unknown>;
   getTemplate(name: string): Promise<unknown>;
@@ -263,7 +264,7 @@ export interface DiscoveryCandidate { kind: 'hub' | 'peer'; id: string; path: st
 export interface PairRequest {
   subject: { id: string; kind?: 'peer' | 'hub'; scopes?: Record<string, unknown>; credential?: string };
   /** `id` narrows the match to one named hub or peer, for hubs that share scopes. */
-  target?: { kind: 'hub' | 'peer' | 'any'; id?: string; requirements?: Record<string, unknown>; capacity?: number };
+  target?: { kind: 'hub' | 'peer' | 'any'; id?: string; requirements?: Record<string, unknown>; capacity?: number; credential?: string };
   path?: string[];
   /** The subject's credential for a hub that sets `auth`. Overrides `subject.credential`. */
   credential?: string;
@@ -277,6 +278,7 @@ export interface PairRequest {
 }
 /** What `pair` returns and `LiveClient` consumes. */
 export interface LiveDescriptor {
+  identity?: { identity: string; claims: Record<string, unknown> };
   link: 'peer-peer' | 'peer-hub' | 'hub-hub';
   room: string;
   /** The id this subject has in the room. */

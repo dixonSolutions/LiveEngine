@@ -35,6 +35,7 @@ struct Waiting {
     kind: Value,
     id: Value,
     requirements: Value,
+    credential: Value,
     wake: oneshot::Sender<Matched>,
 }
 
@@ -61,7 +62,7 @@ pub(crate) enum Claim {
     /// The candidate is not waiting in a request.
     Direct,
     /// The candidate was removed from the queue; wake it once the pairing holds.
-    Taken(oneshot::Sender<Matched>),
+    Taken((oneshot::Sender<Matched>, Value)),
 }
 
 pub(crate) enum Enter {
@@ -107,6 +108,7 @@ impl PendingPairs {
         false
     }
 
+    #[cfg(test)]
     fn enter(
         &self,
         state: &Arc<Inner>,
@@ -114,6 +116,18 @@ impl PendingPairs {
         scopes: &Value,
         target: &serde_json::Map<String, Value>,
         requirements: Value,
+    ) -> Result<(Seat, oneshot::Receiver<Matched>), Enter> {
+        self.enter_with_credential(state, id, scopes, target, requirements, Value::Null)
+    }
+
+    fn enter_with_credential(
+        &self,
+        state: &Arc<Inner>,
+        id: &str,
+        scopes: &Value,
+        target: &serde_json::Map<String, Value>,
+        requirements: Value,
+        credential: Value,
     ) -> Result<(Seat, oneshot::Receiver<Matched>), Enter> {
         let key = seat_key(id, scopes);
         let mut guard = self.lock();
@@ -133,6 +147,7 @@ impl PendingPairs {
                 kind: target.get("kind").cloned().unwrap_or(Value::Null),
                 id: target.get("id").cloned().unwrap_or(Value::Null),
                 requirements,
+                credential,
                 wake,
             },
         );
@@ -181,7 +196,7 @@ impl PendingPairs {
         if let Some(seat) = seat {
             guard.1.remove(&seat.key);
         }
-        Claim::Taken(taken.wake)
+        Claim::Taken((taken.wake, taken.credential))
     }
 
     #[cfg(test)]
@@ -576,12 +591,13 @@ pub(crate) async fn pair(
     let credential = body["subject"]["credential"].clone();
     let deadline = Instant::now() + wait;
     loop {
-        let (seat, mut wake) = match state.pending.enter(
+        let (seat, mut wake) = match state.pending.enter_with_credential(
             &state,
             &id,
             &body["subject"]["scopes"],
             target,
             requirements.clone(),
+            credential.clone(),
         ) {
             Ok(entered) => entered,
             Err(Enter::Duplicate) => {
@@ -865,6 +881,7 @@ async fn pair_once(
     }
     let mut selected = None;
     let mut taken = None;
+    let mut target_credential = body["target"]["credential"].clone();
     let mut candidate_scopes = Value::Null;
     if let Some(candidates) = found["candidates"].as_array() {
         for candidate in candidates {
@@ -966,7 +983,10 @@ async fn pair_once(
                     Claim::Lost => break,
                     Claim::Skip => continue,
                     Claim::Direct => {}
-                    Claim::Taken(wake) => taken = Some(wake),
+                    Claim::Taken((wake, credential)) => {
+                        taken = Some(wake);
+                        target_credential = credential;
+                    }
                 }
             }
             selected = Some(candidate);
@@ -1067,6 +1087,39 @@ async fn pair_once(
         Err(e) => return *e,
     };
     if peer {
+        let info = match routed(
+            state.clone(),
+            headers.clone(),
+            path.clone(),
+            "authPolicy",
+            json!({"id":hub_id}),
+            inherited.clone(),
+        )
+        .await
+        {
+            Ok(info) => info,
+            Err(e) => return *e,
+        };
+        if info["kind"] == "password" {
+            if target_credential.is_null() && seat.is_some() {
+                return error(StatusCode::NOT_FOUND, "no matching authenticated peer");
+            }
+            if let Err(e) = authorize_proof(
+                &state,
+                &headers,
+                &path,
+                &hub_id,
+                target_id,
+                &room,
+                "peer",
+                &target_credential,
+                &inherited,
+            )
+            .await
+            {
+                return *e;
+            }
+        }
         let result = routed(
             state.clone(),
             headers.clone(),
@@ -1261,7 +1314,11 @@ async fn ticket_descriptor(
         Ok(v) => v,
         Err(e) => return *e,
     };
-    Json(json!({"link":link,"room":room,"userId":id,"ticket":ticket["ticket"],"url":ticket["url"],"transports":["webrtc","websocket"]})).into_response()
+    let mut descriptor = json!({"link":link,"room":room,"userId":id,"ticket":ticket["ticket"],"url":ticket["url"],"transports":["webrtc","websocket"]});
+    if let Some(identity) = ticket.get("identity") {
+        descriptor["identity"] = identity.clone();
+    }
+    Json(descriptor).into_response()
 }
 
 fn call_for(id: &str, method: &str, args: Vec<Value>) -> Value {

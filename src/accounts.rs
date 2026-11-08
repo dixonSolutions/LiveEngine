@@ -24,11 +24,11 @@ use tokio::sync::RwLock;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Account {
-    username: String,
-    role: String,
-    enabled: bool,
+    pub(crate) username: String,
+    pub(crate) role: String,
+    pub(crate) enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    claims: Option<Value>,
+    pub(crate) claims: Option<Value>,
     created_at: u64,
 }
 // Snapshot serialization must include the password hash, while public responses never do.

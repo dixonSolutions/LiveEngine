@@ -2206,6 +2206,12 @@ async fn route_scoped(
             )
             .await
         }
+        "authPolicy" => {
+            let Some(id) = request.body.get("id").and_then(Value::as_str) else {
+                return error(StatusCode::BAD_REQUEST, "missing hub id");
+            };
+            crate::live::auth_policy(state, id.to_owned(), headers).await
+        }
         "authorize" => {
             let Some(id) = request.body.get("id").and_then(Value::as_str) else {
                 return error(StatusCode::BAD_REQUEST, "missing hub id");

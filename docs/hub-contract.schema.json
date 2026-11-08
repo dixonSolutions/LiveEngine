@@ -453,6 +453,30 @@
               "description": "A verifier registered with HubService::register_verifier."
             }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "password"
+            },
+            "roles": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 2,
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "user",
+                  "admin"
+                ]
+              }
+            }
+          }
         }
       ]
     },
@@ -469,7 +493,8 @@
             "hmac",
             "jwt",
             "webhook",
-            "custom"
+            "custom",
+            "password"
           ]
         }
       }
@@ -672,7 +697,8 @@
             "watchTicket",
             "authorize",
             "discover",
-            "pair"
+            "pair",
+            "authPolicy"
           ]
         },
         "body": {
@@ -971,6 +997,11 @@
                 "array",
                 "null"
               ]
+            },
+            "credential": {
+              "type": "string",
+              "writeOnly": true,
+              "description": "The target peer session for a direct pairing on a password hub."
             }
           }
         },

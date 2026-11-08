@@ -391,6 +391,42 @@ pub(crate) async fn ticket_hub(
     }
     issue_ticket(state, id, headers, request, None, credential.is_some()).await
 }
+/// Resolve the effective auth kind at the service owning an external hub.
+pub(crate) async fn auth_policy(state: Arc<Inner>, id: String, headers: HeaderMap) -> Response {
+    let record = {
+        let mut hubs = state.hubs.write().await;
+        expire_hubs(&mut hubs);
+        hubs.get(&id).cloned()
+    };
+    let Some(record) = record else {
+        return error(StatusCode::NOT_FOUND, "hub not found");
+    };
+    if record.auth.is_none() && record.handler.is_none() {
+        if let Some(address) = record.info.address.as_deref() {
+            let depth = header_depth(&headers).unwrap_or(usize::MAX);
+            if depth >= state.config.max_depth {
+                return error(StatusCode::LOOP_DETECTED, "forwarding depth exceeded");
+            }
+            return forward_route(
+                &state,
+                address,
+                record.remote_token.as_deref().unwrap_or(""),
+                &headers,
+                depth + 1,
+                &RouteRequest {
+                    path: vec![],
+                    op: "authPolicy".into(),
+                    body: serde_json::json!({"id":record.info.remote_hub_id}),
+                    inherited_schemas: None,
+                    inherited_channels: None,
+                },
+            )
+            .await;
+        }
+    }
+    Json(serde_json::json!({"kind":record.auth.as_ref().map(|auth| auth.info().kind)}))
+        .into_response()
+}
 /// Check a user's credential for a hub without issuing anything. Pairing calls this
 /// before it changes membership.
 pub(crate) async fn authorize_hub(
@@ -590,11 +626,15 @@ pub(crate) async fn issue_ticket(
             request.role,
             state.config.ticket_ttl.as_secs(),
             inherited_channels,
-            identity,
+            identity.clone(),
         ) {
             Ok((ticket, expires_at)) => {
-                Json(serde_json::json!({"ticket":ticket,"url":url,"expiresAt":expires_at}))
-                    .into_response()
+                let mut response =
+                    serde_json::json!({"ticket":ticket,"url":url,"expiresAt":expires_at});
+                if let Some(identity) = identity {
+                    response["identity"] = identity.fields();
+                }
+                Json(response).into_response()
             }
             Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "could not issue ticket"),
         }

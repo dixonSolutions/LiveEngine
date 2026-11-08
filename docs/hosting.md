@@ -139,11 +139,14 @@ not user credentials and skip this check. `auth` is not available on central hub
 
 | `kind` | Definition | Credential |
 | --- | --- | --- |
+| `password` | `roles?` containing `user` and/or `admin` (default both) | an enabled account’s session token from the hub-owning service |
 | `token` | `tokens: [{token, identity?, claims?}]`, each token 24 to 512 bytes | the token, compared in constant time |
 | `hmac` | `secret` (32 to 512 bytes), `leewaySeconds?` | `base64url(payload JSON).base64url(HMAC-SHA256(secret, first segment))`; payload has `sub`, a required `exp` in Unix seconds, and any claims |
 | `jwt` | `alg` of `HS256` (with `secret`) or `EdDSA` (with `publicKey`, 32 raw bytes as unpadded base64url); `issuer?`, `audience?`, `identityClaim?` (default `sub`), `leewaySeconds?` | a compact JWT with a required `exp` |
 | `webhook` | `url`, `secret?` (sent as a bearer token), `timeoutMs?` (100 to 10000, default 3000) | opaque; forwarded to the webhook |
 | `custom` | `name` of a verifier registered with `HubService::register_verifier` | opaque; given to the verifier |
+
+For password hubs, `userId` must exactly match the account username. Claims include the verified account role; this role replaces any user-defined `role` claim. A peer pairing needs each peer’s session: each waiting peer supplies `subject.credential`, or a direct request supplies the other peer’s session as `target.credential`. Sessions are checked by the service that owns the hub, including through external hubs and remote centrals. Accounts and sessions are never exported.
 
 The JWT algorithm comes only from the hub definition. A token whose `alg` header
 differs, including `none`, is refused, and no other algorithm can be configured.
@@ -185,7 +188,7 @@ is default deny:
   normalised. The owner is found by walking local centrals only, so a credential is never
   forwarded to a remote central before it has matched inside the subtree.
 - Only these operations run: `discover`, `pair`, `tree`, `register`, `list`, `get`,
-  `delete`, `watchTicket`, `ticket`, `authorize` and `call`. Any other operation, a
+  `delete`, `watchTicket`, `ticket`, `authorize`, `authPolicy` and `call`. Any other operation, a
   `register` that names a `template`, and the forwarding fields `inherited_schemas` and
   `inherited_channels` answer `403`.
 - Digests are compared in constant time. Deleting the hub ends the credential; a hub
