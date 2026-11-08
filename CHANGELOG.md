@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add account and connection clients, browser sessions, and an optional administrator console.
+
 - Add administrative live connection listing, kicks and account bans, including linked rooms.
 
 - Add password-backed hub authentication using account sessions and role restrictions.

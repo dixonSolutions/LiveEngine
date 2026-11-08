@@ -213,12 +213,25 @@ export interface HubPing {
   serverTimeMs?: number;
 }
 export declare const HUB_PROTOCOL: 'liveengine.hub/v1';
+export interface Account { username: string; role: 'admin' | 'user'; enabled: boolean; claims?: Record<string, unknown>; createdAt: number; }
+export interface Connection { id: string; hub: string[]; room: string; user: string; role: string; transport: string; connectedAt: number; remote: boolean; }
 export declare class HubClient {
   constructor(address: string, options: HubClientOptions);
   readonly address: string;
   timeoutMs: number;
   maxResponseBytes: number;
-  request<T = unknown>(route: string, options?: { method?: string; body?: unknown; signal?: AbortSignal; timeoutMs?: number }): Promise<T>;
+  request<T = unknown>(route: string, options?: { method?: string; body?: unknown; signal?: AbortSignal; token?: string; timeoutMs?: number }): Promise<T>;
+  login(username: string, password: string): Promise<{ token: string; account: Account; expiresAt: number }>;
+  logout(): Promise<unknown>;
+  me(): Promise<Account>;
+  changePassword(current: string, next: string): Promise<unknown>;
+  listAccounts(): Promise<Account[]>;
+  createAccount(account: { username: string; password: string; role: 'admin' | 'user'; claims?: Record<string, unknown> }): Promise<Account>;
+  getAccount(username: string): Promise<Account>;
+  updateAccount(username: string, changes: { role?: 'admin' | 'user'; enabled?: boolean; claims?: Record<string, unknown>; password?: string }): Promise<Account>;
+  deleteAccount(username: string): Promise<unknown>;
+  connections(filters?: { hub?: string; room?: string; user?: string }): Promise<Connection[]>;
+  kick(id: string): Promise<unknown>;
   contract(): Promise<{ protocol: typeof HUB_PROTOCOL; [key: string]: unknown }>;
   ping(options?: HubPingOptions): Promise<HubPing>;
   tree(depth?: number): Promise<unknown>;
@@ -357,6 +370,8 @@ export interface LiveClientEvents {
   disconnected: { reconnecting: boolean };
   close: { reason: string; reconnecting: boolean; error?: Error };
   error: Error;
+  kicked: Error;
+  banned: Error;
 }
 export interface PeerLink {
   readonly peer: string;

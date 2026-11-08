@@ -4302,6 +4302,98 @@ impl HubClient {
         read_remote_json(response, self.max_response_bytes).await
     }
 
+    /// Authenticate an account and receive a session token.
+    pub async fn login(&self, username: &str, password: &str) -> Result<Value, String> {
+        self.request(
+            reqwest::Method::POST,
+            "/v1/sessions",
+            Some(serde_json::json!({"username": username, "password": password})),
+        )
+        .await
+    }
+    /// Revoke the session used by this client.
+    pub async fn logout(&self) -> Result<Value, String> {
+        self.request(reqwest::Method::DELETE, "/v1/sessions", None)
+            .await
+    }
+    /// Retrieve the account owning this session.
+    pub async fn me(&self) -> Result<Value, String> {
+        self.request(reqwest::Method::GET, "/v1/sessions/me", None)
+            .await
+    }
+    /// Change the session account's password.
+    pub async fn change_password(&self, current: &str, next: &str) -> Result<Value, String> {
+        self.request(
+            reqwest::Method::POST,
+            "/v1/accounts/me/password",
+            Some(serde_json::json!({"current":current,"next":next})),
+        )
+        .await
+    }
+    /// List or create accounts, or get, update, or delete a named account.
+    pub async fn accounts(
+        &self,
+        method: reqwest::Method,
+        username: Option<&str>,
+        body: Option<Value>,
+    ) -> Result<Value, String> {
+        let route = match username {
+            Some(name) => {
+                if !name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+                    || name.is_empty()
+                {
+                    return Err("invalid username".into());
+                }
+                format!("/v1/accounts/{name}")
+            }
+            None => "/v1/accounts".into(),
+        };
+        self.request(method, &route, body).await
+    }
+    /// List live connections, optionally filtering by hub, room and user.
+    pub async fn connections(
+        &self,
+        hub: Option<&str>,
+        room: Option<&str>,
+        user: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in [("hub", hub), ("room", room), ("user", user)] {
+            if let Some(value) = value {
+                query.append_pair(key, value);
+            }
+        }
+        let query = query.finish();
+        self.request(
+            reqwest::Method::GET,
+            &if query.is_empty() {
+                "/v1/connections".into()
+            } else {
+                format!("/v1/connections?{query}")
+            },
+            None,
+        )
+        .await
+    }
+    /// Disconnect a live connection.
+    pub async fn kick(&self, id: &str) -> Result<Value, String> {
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+        {
+            return Err("invalid connection id".into());
+        }
+        self.request(
+            reqwest::Method::DELETE,
+            &format!("/v1/connections/{id}"),
+            None,
+        )
+        .await
+    }
+
     /// Route an operation to a central namespace. The empty path targets the root.
     pub async fn route(&self, path: &[String], op: &str, body: Value) -> Result<Value, String> {
         self.request(

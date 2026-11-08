@@ -889,3 +889,41 @@ describe('connectLive', () => {
     afterFallback.close();
   });
 });
+
+test('kicked and banned events stop automatic reconnect', async () => {
+  for (const code of ['kicked', 'banned']) {
+    const { a } = await pairPeers();
+    let renewals = 0;
+    const client = track(new LiveClient(a, { direct: false, renew: async () => { renewals++; throw Error('unexpected renewal'); } }));
+    const errors = [];
+    client.on(code, error => errors.push(error.code));
+    await client.connect();
+    const [connection] = await admin.connections({ user: a.userId });
+    if (code === 'kicked') await admin.kick(connection.id);
+    else client._frame({ type: 'error', code });
+    await until(() => client.state === 'closed');
+    await sleep(100);
+    assert.deepEqual(errors, [code]);
+    assert.equal(renewals, 0);
+  }
+});
+
+test('a real account ban emits banned and stops retries', async () => {
+  await admin.createAccount({ username: 'terminal-ban', role: 'user', password: 'long-test-password-123' });
+  const session = await admin.login('terminal-ban', 'long-test-password-123');
+  await admin.register({ id: 'terminal-ban-hub', mode: 'internal', auth: { kind: 'password' } });
+  await admin.call('terminal-ban-hub', 'upsertUser', [{ id: 'terminal-ban' }]);
+  await admin.call('terminal-ban-hub', 'upsertServer', [{ id: 'room' }]);
+  await admin.call('terminal-ban-hub', 'join', ['terminal-ban', 'room']);
+  const ticket = await admin.ticket('terminal-ban-hub', { userId: 'terminal-ban', serverId: 'room', credential: session.token });
+  let renewals = 0;
+  const client = track(new LiveClient({ ...ticket, userId: 'terminal-ban', room: 'room' }, { direct: false, renew: async () => { renewals++; throw Error('unexpected renewal'); } }));
+  const errors = [];
+  client.on('banned', error => errors.push(error.code));
+  await client.connect();
+  await admin.updateAccount('terminal-ban', { enabled: false });
+  await until(() => client.state === 'closed');
+  await sleep(100);
+  assert.deepEqual(errors, ['banned']);
+  assert.equal(renewals, 0);
+});

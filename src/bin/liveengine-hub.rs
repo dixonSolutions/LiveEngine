@@ -6,6 +6,9 @@ use liveengine::hub::{ping_hub, HubClient, HubConfig, HubService};
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
+        Some("login") | Some("accounts") | Some("connections") | Some("kick") => {
+            run_admin(&args).await
+        }
         Some("ping") => run_ping(&args[1..]).await,
         Some("request") => run_request(&args[1..]).await,
         Some("ticket") => run_ticket(&args[1..]).await,
@@ -35,7 +38,7 @@ async fn main() -> ExitCode {
 
 fn print_usage() {
     println!(
-        "Usage:\n  liveengine-hub [serve]\n  liveengine-hub ping <url> [--samples N] [--timeout-ms N] [--json]\n  liveengine-hub request <url> <method> <route> [json-body]\n  liveengine-hub ticket <url> <hub-id> <user-id> <room> [--path a/b] [--role peer|service] [--credential VALUE]\n  liveengine-hub watch-ticket <url> [--path a/b] [--depth N]\n  liveengine-hub watch <url> [--path a/b] [--depth N] [--count N]\n\nticket, watch-ticket and watch read the administrator token from LIVEENGINE_TOKEN.\nticket reads the credential for a hub that sets auth from LIVEENGINE_CREDENTIAL when --credential is not given.\nwatch prints one JSON message per line, the snapshot first, and stops after --count messages."
+        "Usage:\n  liveengine-hub login <url> <username> (reads LIVEENGINE_PASSWORD)\n  liveengine-hub accounts <url> <method> [username] [json-body]\n  liveengine-hub connections <url>\n  liveengine-hub kick <url> <id>\n  liveengine-hub [serve]\n  liveengine-hub ping <url> [--samples N] [--timeout-ms N] [--json]\n  liveengine-hub request <url> <method> <route> [json-body]\n  liveengine-hub ticket <url> <hub-id> <user-id> <room> [--path a/b] [--role peer|service] [--credential VALUE]\n  liveengine-hub watch-ticket <url> [--path a/b] [--depth N]\n  liveengine-hub watch <url> [--path a/b] [--depth N] [--count N]\n\nticket, watch-ticket and watch read the administrator token from LIVEENGINE_TOKEN.\nticket reads the credential for a hub that sets auth from LIVEENGINE_CREDENTIAL when --credential is not given.\nwatch prints one JSON message per line, the snapshot first, and stops after --count messages."
     );
 }
 
@@ -261,4 +264,45 @@ async fn run_watch(args: &[String]) -> Result<(), String> {
             limit.is_none_or(|limit| seen < limit)
         })
         .await
+}
+
+async fn run_admin(args: &[String]) -> Result<(), String> {
+    let address = args.get(1).ok_or("hub URL required")?;
+    let client = HubClient::new(
+        address,
+        std::env::var("LIVEENGINE_TOKEN").unwrap_or_else(|_| "login".into()),
+    )?;
+    let value = match args[0].as_str() {
+        "login" => {
+            let name = args.get(2).ok_or("username required")?;
+            let password = std::env::var("LIVEENGINE_PASSWORD")
+                .map_err(|_| "LIVEENGINE_PASSWORD must be set")?;
+            client.login(name, &password).await?
+        }
+        "accounts" => {
+            let method = args
+                .get(2)
+                .ok_or("method required")?
+                .parse()
+                .map_err(|_| "invalid method")?;
+            let name = args.get(3).map(String::as_str).filter(|s| *s != "-");
+            let body = args
+                .get(4)
+                .map(|s| serde_json::from_str(s).map_err(|_| "invalid JSON body"))
+                .transpose()?;
+            client.accounts(method, name, body).await?
+        }
+        "connections" => client.connections(None, None, None).await?,
+        "kick" => {
+            client
+                .kick(args.get(2).ok_or("connection id required")?)
+                .await?
+        }
+        _ => return Err("unknown command".into()),
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&value).map_err(|e| e.to_string())?
+    );
+    Ok(())
 }

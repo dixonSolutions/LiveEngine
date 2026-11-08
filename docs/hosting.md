@@ -339,3 +339,7 @@ socket. A new ticket permits it to reconnect. Disabling an account ends its
 sessions and closes its password-authenticated sockets with `banned`;
 re-enabling it permits a fresh login. Linked socket termination is performed by
 the service that owns the socket.
+
+### Browser accounts and administration
+
+`createHubApi({ ..., adminConsole: true })` enables an account and connection console at the API's `/admin` path. `POST /login`, `GET /me`, and `POST /logout` manage a browser session. Login sets an HttpOnly, SameSite=Strict cookie with an opaque identifier; the hub session remains on the API server. The cookie is Secure when served over HTTPS. An explicit hub session bearer token is also accepted. The session is passed to password-authenticated pair and renew operations. Browser sessions are held in memory and require a new sign-in after an API restart. Configure allowed origins and serve over HTTPS.

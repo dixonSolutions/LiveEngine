@@ -122,3 +122,9 @@ To cancel a search, abort the `fetch` you gave `connectLive`. A successful `pair
 </Warning>
 
 See [Gogh Strike integration](/guides/gogh-strike) for a game built on it, and [Developer testing](/guides/dev-testing) to run the end-to-end check.
+
+## Accounts and administration
+
+Set `adminConsole: true` on `createHubApi` to enable the console at the API's `/admin` path. An administrator signs in through `POST /login` with `username` and `password`; `GET /me` returns the account and `POST /logout` ends the session. The browser receives an HttpOnly, SameSite=Strict cookie containing an opaque API session identifier. The hub session stays on the API server. HTTPS adds the Secure cookie attribute. An explicit hub session bearer token can also be supplied in the Authorization header. Configure allowed origins and HTTPS for the host serving the API.
+
+The console lists and manages accounts and connections. It checks the current account's administrator role for every request. Pair and renew pass the signed-in hub session to password-authenticated hubs. Sessions in the API are held in memory, so users sign in again after an API restart.

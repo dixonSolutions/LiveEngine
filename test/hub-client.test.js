@@ -102,3 +102,15 @@ test('HubClient sends schema and registry operations with encoded identifiers', 
   assert.equal(JSON.parse(requests[5].init.body).refreshSeconds, 60);
   assert.ok(requests.every(r => r.init.headers.authorization === 'Bearer test-administrator-token-long-enough'));
 });
+
+test('account and connection methods use the corresponding authenticated routes', async () => {
+  const requests = [];
+  const client = new HubClient('https://hub.example', { token: 'session-token-for-testing-123456', fetch: async (url, init) => { requests.push({ url, init }); return Response.json({}); } });
+  await client.login('alice', 'long-password'); await client.me(); await client.changePassword('old-password', 'new-password');
+  await client.listAccounts(); await client.createAccount({ username: 'alice', role: 'user', password: 'long-password' });
+  await client.getAccount('alice'); await client.updateAccount('alice', { enabled: false }); await client.deleteAccount('alice');
+  await client.connections({ user: 'alice', room: 'a b' }); await client.kick('socket-1'); await client.logout();
+  assert.deepEqual(requests.map(r => r.init.method), ['POST','GET','POST','GET','POST','GET','PATCH','DELETE','GET','DELETE','DELETE']);
+  assert.match(requests[8].url, /user=alice&room=a\+b/);
+  assert.match(requests[9].url, /connections\/socket-1$/);
+});

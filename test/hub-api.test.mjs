@@ -375,3 +375,36 @@ test('roomCapacity is passed to pairing', async () => {
   assert.equal(room.capacity, 3);
   assert.equal(room.members.length, 3);
 });
+
+test('browser sessions hide hub tokens and restrict the admin console', async () => {
+  await admin.createAccount({ username: 'api-admin', role: 'admin', password: 'test-password-admin-123' });
+  await admin.createAccount({ username: 'api-user', role: 'user', password: 'test-password-user-123' });
+  const app = await serve({ hubId: 'api-accounts', adminConsole: true });
+  assert.equal((await app.request('admin', { method: 'GET' })).status, 401);
+  const login = await app.request('login', { body: { username: 'api-user', password: 'test-password-user-123' } });
+  assert.equal(login.status, 200);
+  assert.match(login.headers.get('set-cookie'), /HttpOnly; SameSite=Strict/);
+  assert.equal(login.body.token, undefined);
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  assert.equal((await app.request('me', { method: 'GET', headers: { cookie } })).body.username, 'api-user');
+  assert.equal((await app.request('admin', { method: 'GET', headers: { cookie } })).status, 403);
+  assert.equal((await app.request('admin/accounts', { method: 'GET', headers: { cookie } })).status, 403);
+  const adminLogin = await app.request('login', { body: { username: 'api-admin', password: 'test-password-admin-123' } });
+  const adminCookie = adminLogin.headers.get('set-cookie').split(';')[0];
+  assert.equal((await app.request('admin', { method: 'GET', headers: { cookie: adminCookie } })).status, 200);
+  assert.equal((await app.request('admin/accounts', { method: 'GET', headers: { cookie: adminCookie } })).status, 200);
+  assert.equal((await app.request('logout', { headers: { cookie }, body: {} })).status, 200);
+  assert.equal((await app.request('me', { method: 'GET', headers: { cookie } })).status, 401);
+});
+
+test('browser session authenticates password hub pair and renewal', async () => {
+  const app = await serve({ hubId: 'api-password', auth: { kind: 'password' } });
+  const login = await app.request('login', { body: { username: 'api-user', password: 'test-password-user-123' } });
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  const paired = await app.request('pair', { headers: { cookie }, body: { userId: 'api-user' } });
+  assert.equal(paired.status, 200, paired.text);
+  assert.equal(paired.body.identity.identity, 'api-user');
+  const renewed = await app.request('renew', { headers: { cookie }, body: { userId: 'api-user', seatToken: paired.body.seatToken } });
+  assert.equal(renewed.status, 200, renewed.text);
+  assert.ok(renewed.body.ticket);
+});

@@ -59,6 +59,8 @@ export interface HubApiOptions {
   statusExtra?: Record<string, unknown>;
   /** Where the page opens the registry socket. Default: the hub's own address. */
   watchUrl?: string;
+  /** Enable the administrator account and connection console at /admin. */
+  adminConsole?: boolean;
   /** The 503 message when there is no client. */
   notConfigured?: string;
 }
