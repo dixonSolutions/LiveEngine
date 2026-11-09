@@ -123,6 +123,7 @@ console.log(client.transportOf('user-b')); // 'direct' or 'relay'
 - `direct`: `"auto"` (default) connects directly only for `peer-peer` descriptors; `true` forces it for any descriptor; `false` disables it.
 - `directBroadcast` (default `false`): a broadcast normally goes through the hub. With `true` it goes over every open data channel and the hub gets a targeted copy only for peers that have none, so nobody hears a frame twice.
 - `directTimeoutMs` (default 10000): how long to wait for the channel to open before falling back.
+- `iceTransportPolicy` (`"all"`, the default, or `"relay"`): with `"relay"` the browser gathers only TURN candidates, so the data channel can only travel through your TURN server and neither peer sees the other's address. Without a reachable TURN server a relay-only link never opens, and the peers stay on the hub relay after `directTimeoutMs`. `connectPeer(peerId, { iceTransportPolicy })` takes the same option for one link.
 - `RTCPeerConnection`: a constructor, for runtimes without a global one.
 - `maxFrameBytes` (default 65536) applies to frames received over a data channel too.
 
@@ -172,6 +173,25 @@ export LIVEENGINE_TURN_SECRET="$(openssl rand -hex 32)"
 
 `LiveClient` uses the `iceServers` from `welcome` automatically; you can read them with `client.iceServers`.
 
+### Run coturn as the TURN server
+
+coturn's shared-secret mode matches `LIVEENGINE_TURN_SECRET`. A minimal container (replace the address, ports and secret; keep the secret out of shell history and logs):
+
+```sh
+podman run -d --name turn --memory=1g --memory-swap=1g --network=host docker.io/coturn/coturn:4.6.3 \
+  -n --log-file=stdout --no-cli --no-tls --no-dtls --fingerprint \
+  --use-auth-secret --static-auth-secret="$LIVEENGINE_TURN_SECRET" --realm=example.org \
+  --listening-port=3478 --min-port=49160 --max-port=49200
+```
+
+Open UDP and TCP 3478 and UDP 49160 to 49200 on the firewall, and set `--external-ip` when the server sits behind NAT. Then point the hub at it:
+
+```sh
+export LIVEENGINE_ICE_SERVERS='[{"urls":"turn:turn.example.org:3478?transport=udp"}]'
+```
+
+To check that peers really go through it, create the client with `iceTransportPolicy: 'relay'` and read `getStats()` on the link's `pc`: the selected candidate pair must have a local candidate whose `candidateType` is `relay`. The credential's expiry is enforced by coturn: a username whose timestamp has passed gets a 401 on the next allocation. The repository's end-to-end test (scenario 24) does exactly this against a coturn container on loopback.
+
 ## Limits
 
 | Setting | Default |
@@ -202,7 +222,7 @@ Other room and rate limits are in [live rooms](/guides/live-rooms). Details of `
 ## Security notes
 
 - Both peers are authenticated only by tickets your server chose to issue. Pair on your server, after you authenticated the player.
-- A direct channel exposes each peer's network addresses to the other, as WebRTC does. If that matters, force relay with `direct: false`. `LiveClient` has no relay-only ICE policy option.
+- A direct channel exposes each peer's network addresses to the other, as WebRTC does. If that matters, use `iceTransportPolicy: 'relay'` with a TURN server (peers then see only the TURN server's address), or force the hub relay with `direct: false`.
 - Direct frames bypass hub schemas and rate limits. A malicious peer can send anything its partner will parse.
 - Keep `LIVEENGINE_TURN_SECRET` out of client code and logs.
 
@@ -212,5 +232,4 @@ Other room and rate limits are in [live rooms](/guides/live-rooms). Details of `
 - No group mesh management: `LiveClient` opens a link to each peer in the room, and the larger id offers; there is no selective connection policy beyond `direct` and `connectPeer`.
 - No Rust `LiveClient` and no built-in WebRTC in Node. Supply `RTCPeerConnection`.
 - No built-in STUN or TURN server.
-- No ICE transport policy option, such as relay-only.
 - No retry of a failed direct link other than a reconnect, a new offer from the peer, or calling `connectPeer` again.

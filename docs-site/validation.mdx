@@ -9,9 +9,18 @@ Observed on 2026-11-09, with Chromium 1194 (1248 aborts on text inputs on the te
 
 - `npm run test:e2e` passed 24 of 24 scenarios, three runs in a row, from an upstream clone. The eight new ones sign in through the real front screen and admin console: wrong passwords, roles, peer-to-peer between signed-in users, kick, disable, a password change across tabs, an admin reset mid-match, an external password hub through a central, and ten signed-in users at once.
 - Open hubs stay open when their service has accounts, and pass the same suite.
-- `cargo test --locked` 184 tests, `npm test` 97, integration 22, eight repeated Rust runs, the container test, type and docs checks.
+- `cargo test --locked` 187 tests, `npm test` 99, integration 22, the Gogh Strike game's own 178 tests and build, eight repeated Rust runs, the container test, type and docs checks.
 
-Not verified for 0.4.0: two physical devices, NAT and TURN, machines without a GPU, and password hubs at more than ten simultaneous users.
+Added after the first 0.4.0 validation, observed on 2026-11-09:
+
+- `npm run test:e2e` now has 27 results (the seat check plus scenarios 1 to 26) and passed 27 of 27 three runs in a row with Chromium 1194. Chromium is chosen by trying it: 1248 and 1243 crash on a page with a text input on the test machine and are skipped with the reason printed.
+- **TURN.** Scenario 24 ran a real coturn 4.6.3 in a podman container on loopback (1 GB memory and swap cap) with `LIVEENGINE_TURN_SECRET`, and two browsers forced to `iceTransportPolicy: 'relay'`. `getStats()` showed a `relay` candidate on both sides of the selected pair (UDP, through the coturn address), every gathered candidate was a relay, and ten frames crossed the data channel. coturn refused (401) a credential whose timestamp had passed and one that lapsed five seconds after it was made, and refused one signed with another secret. This is one machine and loopback; it is not NAT traversal across real networks.
+- **No GPU.** Scenario 25 ran two `LiveClient`s on a plain page in a Chromium with the GPU disabled (Chromium reports canvas and compositing as software only, WebGL on SwiftShader). They paired peer to peer and exchanged ten frames over a direct data channel. The full game is a different matter: on the same software rendering it ran at about 11 to 12 frames a second, took about three minutes to start its simulation, and in the two runs where it started, its two players were still on the hub relay five seconds after play began; in the third the simulation had not started after two minutes. Use a GPU for the game itself; LiveEngine does not need one.
+- **Twenty signed-in users.** Scenario 26 put twenty users through the front screen, each under their own name, into four rooms of five, with 80 pairwise frames over direct data channels and no one left waiting.
+- **Memory.** The suite's peak, measured as the memory cap scope's `memory.peak`, was 10.3 to 10.6 GB for the 24 earlier results, before scenarios cleaned up after themselves. It is now 7.9 to 8.2 GB for all 27, including twenty game pages at once (sampled every three seconds, scenarios 1 to 25 stayed under about 4 GB).
+- **A pairing bug found and fixed.** A peer waiting for a partner slept until its wait ran out if a room with space opened after it last looked; in the 10-user scenario one user was left searching. Every waiting peer now watches the queue and joins such a room. A new test (`a_waiting_peer_joins_a_room_that_opens_after_it_started_waiting`) failed before the fix and passes after it.
+
+Not verified for 0.4.0: two physical devices, NAT traversal and TURN across real networks, machines with a different GPU or none for the full game, and password hubs at more than twenty simultaneous users.
 
 ## 0.3.0
 

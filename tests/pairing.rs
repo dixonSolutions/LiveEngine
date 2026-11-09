@@ -703,6 +703,79 @@ async fn a_registered_arrival_pairs_with_a_waiter(config: HubConfig) {
     task.abort();
 }
 
+/// A peer that found no partner joins a room that opens afterwards, as it would have had it asked a moment later.
+/// "x" waits first and cannot be claimed by the pair (their `club` rule excludes it); when "a" and "b" pair
+/// into a room with space, "x" must be woken and seated, not left asleep until its wait runs out.
+#[tokio::test]
+async fn a_waiting_peer_joins_a_room_that_opens_after_it_started_waiting() {
+    let (base, task) = server_with(waiting_config(TOKEN)).await;
+    let c = reqwest::Client::new();
+    arena(&c, &base, TOKEN).await;
+    for (id, scopes) in [
+        ("x", json!({"game":"g"})),
+        ("a", json!({"game":"g","club":"c"})),
+        ("b", json!({"game":"g","club":"c"})),
+    ] {
+        let (status, body) = post(
+            &c,
+            &base,
+            TOKEN,
+            "/v1/hubs/arena/call",
+            json!({"method":"upsertUser","args":[{"id":id,"scopes":scopes}]}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let request = |id: &str, scopes: Value, requirements: Value| {
+        json!({
+            "subject":{"kind":"peer","id":id,"scopes":scopes},
+            "target":{"kind":"peer","requirements":requirements,"capacity":3},
+            "waitMs":3000
+        })
+    };
+    let x = spawn_pair(
+        &c,
+        &base,
+        TOKEN,
+        request("x", json!({"game":"g"}), json!({"game":"g"})),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!x.is_finished(), "x must be waiting");
+    let club = json!({"game":"g","club":"c"});
+    let a = spawn_pair(
+        &c,
+        &base,
+        TOKEN,
+        request("a", club.clone(), json!({"club":"c"})),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !a.is_finished(),
+        "a cannot pair with x, whose scopes lack the club"
+    );
+    let (status, b) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/pair",
+        request("b", club, json!({"club":"c"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{b}");
+    let (status, a) = a.await.unwrap();
+    assert_eq!(status, 200, "{a}");
+    assert_eq!(a["room"], b["room"]);
+    let started = std::time::Instant::now();
+    let (status, x) = x.await.unwrap();
+    assert_eq!(
+        status, 200,
+        "x was left waiting for a room that has space: {x}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(x["room"], b["room"]);
+    task.abort();
+}
+
 #[tokio::test]
 async fn a_registered_arrival_pairs_with_a_waiter_under_the_waiting_config() {
     a_registered_arrival_pairs_with_a_waiter(waiting_config(TOKEN)).await;

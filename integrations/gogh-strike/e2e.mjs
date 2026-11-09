@@ -5,8 +5,9 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import {fileURLToPath, pathToFileURL} from 'node:url';
+import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
+import {launchChromium, loadChromium} from '../../test/support/browser.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '../../../gogh-strike');
@@ -102,10 +103,8 @@ try {
   console.log(`service join ok: ${mode} hub ${hubId} -> room ${serverId}`);
 
   if (process.env.PLAYWRIGHT_PATH) {
-    const playwrightModule = await import(pathToFileURL(path.resolve(process.env.PLAYWRIGHT_PATH)).href);
-    const chromium = playwrightModule.chromium || playwrightModule.default?.chromium;
-    assert.ok(chromium, 'PLAYWRIGHT_PATH must resolve to a Playwright module exporting chromium');
-    browser = await chromium.launch({headless: true, ...(process.env.CHROMIUM_PATH ? {executablePath: process.env.CHROMIUM_PATH} : {})});
+    const chromium = await loadChromium();
+    ({browser} = await launchChromium(chromium));
     const page = await browser.newPage();
     // LAN pages run outside a secure context, where crypto.randomUUID is unavailable.
     await page.addInitScript(() => {

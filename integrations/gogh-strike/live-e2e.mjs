@@ -5,24 +5,28 @@
 //
 // The game is fetched once into .cache/ (upstream Gogh Strike at the validated commit plus gogh-strike.patch);
 // GOGH_STRIKE_ROOT overrides it. Playwright: npm install --no-save playwright && npx playwright install chromium,
-// or PLAYWRIGHT_PATH and CHROMIUM_PATH for an existing install.
+// or PLAYWRIGHT_PATH and CHROMIUM_PATH for an existing install. Without CHROMIUM_PATH, the newest installed
+// Chromium that renders a text input is used (test/support/browser.mjs); the run prints which and why.
 //
 // Everything listens on 127.0.0.1 on free ports (scenario 14 uses the machine's LAN address, never a
 // Tailscale one) and is stopped at the end, also on failure. One
 // PASS or FAIL line is printed per scenario; any failure exits non-zero. Nothing is skipped: a
 // scenario whose setup breaks fails.
 //
-// Chromium flags used (see WEBRTC_ARGS and GPU_ARGS below): the two WebRTC flags let contexts of one
+// Chromium flags used (see WEBRTC_ARGS, MEMORY_ARGS and GPU_ARGS below): the two WebRTC flags let contexts of one
 // browser find local candidates, and the GPU flags make the game render fast enough to test.
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
-import {randomBytes} from 'node:crypto';
-import {existsSync} from 'node:fs';
+import {createHmac, randomBytes} from 'node:crypto';
+import {existsSync, readdirSync, readFileSync, readlinkSync} from 'node:fs';
 import net from 'node:net';
 import {createRequire} from 'node:module';
 import path from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {LiveClient} from '../../lib/live-client.mjs';
+import {launchChromium, loadChromium} from '../../test/support/browser.mjs';
+import {startCoturn} from '../../test/support/coturn.mjs';
+import {connectPlainClient, selectedPair, sendPlain, startPlainPage} from '../../test/support/plain-page.mjs';
 import {freePort, startHub} from '../../test/support/hub-process.mjs';
 import {ensureGame, lanAddress} from './setup.mjs';
 
@@ -39,8 +43,10 @@ const WEBRTC_ARGS = ['--disable-features=WebRtcHideLocalIpsWithMdns', '--allow-l
 // callbacks; on a machine with a render node, ANGLE over Vulkan uses the GPU, still headless.
 // GOGH_E2E_CHROMIUM_ARGS replaces the whole list.
 const GPU_ARGS = ['--use-gl=angle', '--use-angle=vulkan', '--enable-features=Vulkan', '--ignore-gpu-blocklist', '--enable-gpu'];
+// Low-end device mode makes each game page about a third smaller (twenty pages at once were 9.7 GB of renderers, now 6.6 GB).
+const MEMORY_ARGS = ['--enable-low-end-device-mode'];
 const CHROMIUM_ARGS = process.env.GOGH_E2E_CHROMIUM_ARGS ? process.env.GOGH_E2E_CHROMIUM_ARGS.split(' ').filter(Boolean)
-  : [...WEBRTC_ARGS, ...(existsSync('/dev/dri/renderD128') ? GPU_ARGS : [])];
+  : [...WEBRTC_ARGS, ...MEMORY_ARGS, ...(existsSync('/dev/dri/renderD128') ? GPU_ARGS : [])];
 const secret = () => randomBytes(24).toString('hex');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check, what, timeoutMs = 20_000) {
@@ -55,11 +61,17 @@ async function until(check, what, timeoutMs = 20_000) {
 
 // ---- processes ----
 
+// Whatever a scenario starts (bridges, extra hubs, contexts, containers) is stopped when that scenario ends,
+// so memory does not pile up across 26 scenarios. What a shared setup (`once`) or the run itself starts
+// lives until the run ends.
 const closers = [];
-const onClose = fn => { closers.unshift(fn); };
-async function closeAll() {
-  for (const close of closers.splice(0)) await Promise.resolve().then(close).catch(() => {});
+let scoped = null;
+let sharedDepth = 0;
+const onClose = fn => { (scoped && !sharedDepth ? scoped : closers).unshift(fn); };
+async function runClosers(list) {
+  for (const close of list.splice(0)) await Promise.resolve().then(close).catch(() => {});
 }
+const closeAll = () => runClosers(closers);
 
 const centralToken = secret();
 const remoteToken = secret();
@@ -153,21 +165,10 @@ async function diagnose() {
   return lines.join(' || ');
 }
 
-async function loadChromium() {
-  const candidates = [];
-  try { candidates.push(createRequire(import.meta.url)('playwright')); } catch { /* not installed here */ }
-  if (process.env.PLAYWRIGHT_PATH) candidates.push(await import(pathToFileURL(path.resolve(process.env.PLAYWRIGHT_PATH)).href));
-  for (const candidate of candidates) {
-    const chromium = candidate.chromium || candidate.default?.chromium;
-    if (chromium) return chromium;
-  }
-  throw new Error('Playwright is not installed. Install it and a Chromium once with:\n  npm install --no-save playwright && npx playwright install chromium\nor point PLAYWRIGHT_PATH at a module that exports chromium (and CHROMIUM_PATH at a Chromium binary).');
-}
-
 /** A player: its own browser context, so its own sessionStorage, localStorage and WebSocket. */
-async function openPlayer(label, base, {userId, credential, online = false} = {}) {
+async function openPlayer(label, base, {userId, credential, online = false, browser: host = browser} = {}) {
   // A small viewport keeps the software-rendered game light enough for two pages at once.
-  const context = await browser.newContext({userAgent: `gogh-e2e-${label}`, viewport: {width: 640, height: 400}, deviceScaleFactor: 1});
+  const context = await host.newContext({userAgent: `gogh-e2e-${label}`, viewport: {width: 640, height: 400}, deviceScaleFactor: 1});
   const page = await context.newPage();
   // The game renders in software here, so its page can be slow to settle.
   page.setDefaultTimeout(90_000);
@@ -394,12 +395,20 @@ async function kick(popup, user) {
 const results = [];
 const SCENARIO_MS = 420_000;
 const only = process.env.GOGH_E2E_ONLY ? process.env.GOGH_E2E_ONLY.split(',') : null;
-async function scenario(name, run) {
+async function scenario(name, run, release = []) {
   const started = Date.now();
   const mark = players.length;
-  const finish = () => Promise.all(players.slice(mark).filter(player => !player.shared).map(player => player.context.close().catch(() => {})));
   // A filtered run is for debugging: it says so and never exits 0.
   if (only && !only.includes(name.split(' ')[0])) { results.push({name, ok: false}); console.log(`SKIP ${name} | not selected by GOGH_E2E_ONLY`); return; }
+  scoped = [];
+  const own = scoped;
+  // `release` names shared setups this is the last scenario to use: their players close now.
+  const finish = async () => {
+    scoped = null;
+    for (const setup of release) { const shared = await setup().catch(() => null); for (const player of [shared?.a, shared?.b]) if (player) { player.shared = false; await player.context.close().catch(() => {}); } }
+    await Promise.all(players.slice(mark).filter(player => !player.shared).map(player => player.context.close().catch(() => {})));
+    await runClosers(own);
+  };
   try {
     let timer;
     const detail = await Promise.race([run(), new Promise((resolve, reject) => { timer = setTimeout(() => reject(new Error(`scenario exceeded ${SCENARIO_MS / 1000}s`)), SCENARIO_MS); })]).finally(() => clearTimeout(timer));
@@ -415,13 +424,13 @@ async function scenario(name, run) {
 }
 
 // A setup that several scenarios share runs once. If it fails, each of them fails with its error.
-const once = factory => { let promise; return () => (promise ||= factory()); };
+const once = factory => { let promise; return () => (promise ||= (async () => { sharedDepth++; try { return await factory(); } finally { sharedDepth--; } })()); };
 
 async function main() {
   const chromium = await loadChromium();
-  const ports = await Promise.all(Array.from({length: 20}, () => freePort()));
+  const ports = await Promise.all(Array.from({length: 21}, () => freePort()));
   const [portNested, portPeer, portRelay, portLinkA, portLinkB, portReconnect, portWatch, portSchema,
-    portUi, portFour, portCancel, portPage, portApi, portOther, portWrongPath, portCorrect, portClosed, portSeat, portCapacity, portExternal] = ports;
+    portUi, portFour, portCancel, portPage, portApi, portOther, portWrongPath, portCorrect, portClosed, portSeat, portCapacity, portExternal, portSoft] = ports;
   const origins = ports.map(port => `http://127.0.0.1:${port}`).join(',');
   const common = {LIVEENGINE_LIVE_ALLOWED_ORIGINS: origins, LIVEENGINE_ALLOWED_REMOTE_HOSTS: '127.0.0.1', LIVEENGINE_ICE_SERVERS: '[]',
     // One bridge, the test and every player share the loopback address, so the default budget of 120 requests a minute is too small.
@@ -439,8 +448,9 @@ async function main() {
   const adminC = new HubClient(central.address, {token: centralToken});
   const adminR = new HubClient(remote.address, {token: remoteToken});
 
-  browser = await chromium.launch({headless: true, args: CHROMIUM_ARGS, ...(process.env.CHROMIUM_PATH ? {executablePath: process.env.CHROMIUM_PATH} : {})})
-    .catch(error => { throw new Error(`Chromium could not start: ${error.message.split('\n')[0]}\nInstall one with: npx playwright install chromium (or set CHROMIUM_PATH to a Chromium binary).`); });
+  // CHROMIUM_PATH if set, else the newest installed Chromium that renders a text input (the choice and the builds skipped are printed).
+  let chosen;
+  ({browser, choice: chosen} = await launchChromium(chromium, {args: CHROMIUM_ARGS}).catch(error => { throw new Error(`Chromium could not start: ${error.message}`); }));
   onClose(() => browser.close());
 
   // 1. Central hub, a nested central and a hub created on demand with its own auth.
@@ -581,7 +591,7 @@ async function main() {
     const moved = await seeEachOther(a, b, ids);
     assert.ok((beforeA['state:direct'] || 0) > 0 && (beforeB['state:direct'] || 0) > 0);
     return `relay state frames in 1.5 s a=${relayed.a} b=${relayed.b}; ${moved}`;
-  });
+  }, [peerPair]);
 
   // 4. peer-hub: the relay is the only path, and a service participant joins the room.
   await scenario('4 peer-hub over the relay with a service participant', async () => {
@@ -774,7 +784,7 @@ async function main() {
     const moved = await seeEachOther(a, b, ids);
     assert.equal(a.errors.length + b.errors.length, 0, `page errors: ${[...a.errors, ...b.errors].join('; ')}`);
     return `${malformed.length} malformed frames refused; ${moved}`;
-  });
+  }, [relayPair]);
   // ---- Play online: the front screen, a hub API and real peer-to-peer matchmaking ----
   // Each of these drives the lobby panel by clicking and typing. Nothing reaches into the page to
   // pair or connect for the flow under test; the helpers only read what the panel and the session show.
@@ -1334,10 +1344,11 @@ async function main() {
     return `accounts on the remote service only; alice-g and bob-g signed in, matched on ${url.host}, identities verified, frames ${via.join('/')}`;
   });
 
-  await scenario('23 ten users signed in at once, matched into rooms, every one exchanging data and shown under their own name', async () => {
-    const crowd = 10;
-    const bridge = await authBridge(authPorts[6], 'gogh-auth-h', {GOGH_MATCH_CAPACITY: '5'});
-    const names = Array.from({length: crowd}, (_, index) => `crowd-h-${index}`);
+  /** `crowd` signed-in users at once, matched into rooms of five, all exchanging data under their own names. */
+  const crowdScenario = (number, crowd, portIndex, tag) => scenario(`${number} ${crowd} users signed in at once, matched into rooms, every one exchanging data and shown under their own name`, async () => {
+    const hubId = `gogh-auth-${tag}`;
+    const bridge = await authBridge(authPorts[portIndex], hubId, {GOGH_MATCH_CAPACITY: '5'});
+    const names = Array.from({length: crowd}, (_, index) => `crowd-${tag}-${index}`);
     const secrets = new Map();
     for (const name of names) secrets.set(name, await makeUser(name));
     const users = await Promise.all(names.map(name => openPlayer(`auth-${name}`, bridge.base, {online: true})));
@@ -1354,7 +1365,7 @@ async function main() {
     assert.equal([...rooms.values()].flat().length, crowd, 'a player is in no room or in two');
     for (const [room, members] of rooms) {
       assert.ok(members.length >= 2, `room ${room} holds a lone player`);
-      const seated = (await (await authSetup()).admin.call('gogh-auth-h', 'getServer', [room])).members;
+      const seated = (await (await authSetup()).admin.call(hubId, 'getServer', [room])).members;
       assert.deepEqual([...seated].sort(), members.map(index => names[index]).sort(), `the hub's members of ${room} differ from the pages'`);
     }
     const via = [];
@@ -1375,8 +1386,257 @@ async function main() {
     const ping = await apiPing(bridge);
     assert.deepEqual([ping.waiting, ping.seats], [0, crowd]);
     assert.equal(users.reduce((sum, user) => sum + user.errors.length, 0), 0, 'page errors');
-    return `rooms ${[...rooms.values()].map(members => members.length).join('+')}, ${via.length} pairwise frames ${[...new Set(via)].join('/')}, ten names shown`;
+    return `rooms ${[...rooms.values()].map(members => members.length).join('+')}, ${via.length} pairwise frames ${[...new Set(via)].join('/')}, ${crowd} names shown`;
   });
+  await crowdScenario(23, 10, 6, 'h');
+
+  // ---- 24 and 25: WebRTC on a plain page (no game): through a real TURN server, and without a GPU ----
+
+  /** Two peers on a hub, paired the way an app server would. Returns both descriptors. */
+  async function pairPlain(admin, ids) {
+    const group = `plain-${secret().slice(0, 8)}`;
+    for (const id of ids) await admin.call('plain', 'upsertUser', [{id, scopes: {group}}]);
+    const request = id => ({subject: {id, scopes: {group}}, target: {kind: 'peer', requirements: {group}, capacity: 2}, waitMs: 15_000});
+    return Promise.all(ids.map(id => admin.pair(request(id))));
+  }
+  /** A hub for plain-page tests: one internal hub called "plain", the plain page's origin allowed. */
+  async function plainHub(origin, env = {}) {
+    const token = secret();
+    const hub = await startHub({LIVEENGINE_TOKEN: token, LIVEENGINE_LIVE_ALLOWED_ORIGINS: origin, LIVEENGINE_RATE_LIMIT_REQUESTS: '100000', ...env});
+    onClose(() => hub.stop());
+    const admin = new HubClient(hub.address, {token});
+    await admin.register({id: 'plain', mode: 'internal', scopes: {tier: 'open'}});
+    return {hub, admin};
+  }
+  const directBoth = async (pages, ids, why) => until(() => Promise.all(pages.map((page, i) => page.evaluate(peer => window.__client.transportOf(peer), ids[1 - i]))).then(kinds => kinds.every(kind => kind === 'direct')),
+    'a direct WebRTC transport on both plain pages', 30_000).catch(async error => {
+    const state = await Promise.all(pages.map((page, i) => page.evaluate(peer => { const l = window.__client.links.get(peer); return {ice: l?.pc?.iceConnectionState, ch: l?.channel?.readyState, failure: l?.failure, events: window.__events}; }, ids[1 - i]).catch(e => e.message)));
+    throw new Error(`${error.message}${why ? ` (${why})` : ''}; ${JSON.stringify(state)}`);
+  });
+  /** Gather candidates with `server` as the only ICE server, relay only. Resolves with the candidates and any gathering errors. */
+  const gatherRelay = (page, server) => page.evaluate(async iceServer => {
+    const pc = new RTCPeerConnection({iceServers: [iceServer], iceTransportPolicy: 'relay'});
+    const candidates = [];
+    const errors = [];
+    pc.onicecandidate = event => { if (event.candidate) candidates.push(event.candidate.candidate); };
+    pc.onicecandidateerror = event => errors.push({code: event.errorCode, text: event.errorText});
+    pc.createDataChannel('probe');
+    await pc.setLocalDescription(await pc.createOffer());
+    await new Promise(resolve => { pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') resolve(); }; setTimeout(resolve, 10_000); });
+    pc.close();
+    return {candidates: candidates.filter(c => / typ relay /.test(c)).length, errors};
+  }, server);
+  /** A TURN REST credential as the hub documents it: username `<expiry>:<user>:<n>`, credential base64 HMAC-SHA1 of it. */
+  const turnCredential = (secretWord, expiry, user = 'expiry-probe') => {
+    const username = `${expiry}:${user}:${Math.floor(Math.random() * 1e9)}`;
+    return {username, credential: createHmac('sha1', secretWord).update(username).digest('base64')};
+  };
+
+  await scenario('24 TURN: two browsers forced to relay-only reach each other through a real coturn, and its credentials expire', async () => {
+    const turnSecret = secret();
+    secrets.add(turnSecret);
+    const coturn = await startCoturn({secret: turnSecret}); // fails, never skips, if the image cannot be pulled or run
+    onClose(() => coturn.stop());
+    const plain = await startPlainPage();
+    onClose(() => plain.stop());
+    const {hub, admin} = await plainHub(plain.origin, {LIVEENGINE_ICE_SERVERS: JSON.stringify([{urls: coturn.url}]), LIVEENGINE_TURN_SECRET: turnSecret});
+    const ids = ['turn-a', 'turn-b'];
+    const contexts = await Promise.all(ids.map(() => browser.newContext()));
+    try {
+      const pages = await Promise.all(contexts.map(context => context.newPage()));
+      for (const page of pages) page.on('pageerror', error => pageErrors.push(`turn: ${error.message}`));
+      const descriptors = await pairPlain(admin, ids);
+      await Promise.all(pages.map((page, i) => connectPlainClient(page, plain.origin, descriptors[i], {iceTransportPolicy: 'relay', direct: true, directTimeoutMs: 25_000})));
+
+      // The hub hands each client its own short-lived TURN credential: expiry an hour ahead, HMAC-SHA1 of the username.
+      const issued = await Promise.all(pages.map(page => page.evaluate(() => window.__client.iceServers)));
+      const now = Math.floor(Date.now() / 1000);
+      issued.forEach((servers, i) => {
+        assert.equal(servers.length, 1, 'the welcome frame should carry exactly the configured ICE server');
+        const [server] = servers;
+        assert.equal(server.urls, coturn.url);
+        const [expiry, user, nonce] = server.username.split(':');
+        assert.equal(user, ids[i], 'the username names the user');
+        assert.ok(/^\d+$/.test(nonce), 'the username ends with a random number');
+        assert.ok(Math.abs(Number(expiry) - (now + 3600)) < 60, `the credential should expire an hour from now, not at ${expiry} (now ${now})`);
+        assert.equal(server.credential, createHmac('sha1', turnSecret).update(server.username).digest('base64'), 'the credential is not the HMAC-SHA1 of the username');
+      });
+      assert.notEqual(issued[0][0].username, issued[1][0].username, 'two connections shared one credential');
+
+      await directBoth(pages, ids, 'relay-only, so the path must be coturn');
+      const pairs = await Promise.all(pages.map((page, i) => selectedPair(page, ids[1 - i])));
+      const [low, high] = coturn.relayPorts;
+      pairs.forEach((pair, i) => {
+        assert.equal(pair.local?.type, 'relay', `${ids[i]} selected a ${pair.local?.type} local candidate: ${JSON.stringify(pair)}`);
+        assert.equal(pair.remote?.type, 'relay', `${ids[i]} selected a ${pair.remote?.type} remote candidate: ${JSON.stringify(pair)}`);
+        assert.equal(pair.local.relayProtocol, 'udp');
+        assert.equal(pair.local.address, '127.0.0.1');
+        assert.ok(pair.local.port >= low && pair.local.port <= high, `${ids[i]}'s relay address ${pair.local.address}:${pair.local.port} is not in coturn's relay range ${low}-${high}`);
+        assert.ok(pair.local.url?.includes(`127.0.0.1:${coturn.port}`), `${ids[i]}'s relay candidate does not name coturn: ${pair.local.url}`);
+        assert.ok(pair.gathered.length > 0 && pair.gathered.every(c => c.type === 'relay'), `${ids[i]} gathered a non-relay candidate: ${JSON.stringify(pair.gathered)}`);
+      });
+
+      // Frames flow in both directions, over the data channel (so over coturn), not the hub relay.
+      const via = [];
+      for (let n = 1; n <= 5; n++) {
+        via.push(await sendPlain(pages[0], pages[1], ids[0], ids[1], {n}, until));
+        via.push(await sendPlain(pages[1], pages[0], ids[1], ids[0], {n: 100 + n}, until));
+      }
+      assert.ok(via.every(kind => kind === 'direct'), `frames did not use the data channel: ${via}`);
+      const after = await Promise.all(pages.map((page, i) => selectedPair(page, ids[1 - i])));
+      after.forEach((pair, i) => assert.ok(pair.bytesSent > 0 && pair.bytesReceived > 0, `${ids[i]}'s selected pair carried no bytes: ${JSON.stringify(pair)}`));
+
+      // The TURN server saw the allocations of both browsers.
+      const logs = await coturn.logs();
+      for (const id of ids) assert.ok(new RegExp(`user <\\d+:${id}:\\d+>: incoming packet ALLOCATE processed, success`).test(logs), `the coturn log shows no successful allocation for ${id}\n${logs.split('\n').slice(-10).join('\n')}`);
+
+      // Expiry: coturn accepts a fresh credential and refuses an expired one, a short-lived one once it lapses, and a wrong secret.
+      const at = Math.floor(Date.now() / 1000);
+      const server = credential => ({urls: coturn.url, ...credential});
+      const fresh = await gatherRelay(pages[0], issued[0][0]);
+      assert.ok(fresh.candidates > 0, `the hub-issued credential gets no relay candidate: ${JSON.stringify(fresh)}`);
+      const expired = await gatherRelay(pages[0], server(turnCredential(turnSecret, at - 120)));
+      assert.equal(expired.candidates, 0, 'coturn allocated with an expired credential');
+      assert.ok(expired.errors.some(error => error.code === 401), `coturn did not answer an expired credential with 401: ${JSON.stringify(expired.errors)}`);
+      const forged = await gatherRelay(pages[0], server({...turnCredential(turnSecret, at + 3600), credential: createHmac('sha1', secret()).update('x').digest('base64')}));
+      assert.equal(forged.candidates, 0, 'coturn allocated with a credential signed by another secret');
+      const expiry = Math.floor(Date.now() / 1000) + 5;
+      const shortLived = server(turnCredential(turnSecret, expiry));
+      const early = await gatherRelay(pages[0], shortLived);
+      assert.ok(early.candidates > 0, `a credential five seconds from expiry was refused: ${JSON.stringify(early)}`);
+      await until(() => Math.floor(Date.now() / 1000) > expiry + 1, 'the short-lived credential to lapse', 15_000);
+      const late = await gatherRelay(pages[0], shortLived);
+      assert.equal(late.candidates, 0, 'coturn allocated with the same credential after its expiry');
+      assert.ok(late.errors.some(error => error.code === 401), `the lapsed credential was not refused with 401: ${JSON.stringify(late.errors)}`);
+
+      // Control: relay-only with no TURN server cannot connect directly. The policy is applied, and the hub relay still carries frames.
+      const bare = await plainHub(plain.origin, {LIVEENGINE_ICE_SERVERS: '[]'});
+      const controlIds = ['turn-c', 'turn-d'];
+      const controlContexts = await Promise.all(controlIds.map(() => browser.newContext()));
+      try {
+        const controlPages = await Promise.all(controlContexts.map(context => context.newPage()));
+        const controlDescriptors = await pairPlain(bare.admin, controlIds);
+        await Promise.all(controlPages.map((page, i) => connectPlainClient(page, plain.origin, controlDescriptors[i], {iceTransportPolicy: 'relay', direct: true, directTimeoutMs: 4000})));
+        await until(() => controlPages[0].evaluate(() => window.__events.some(event => event.directFailed)), 'the relay-only link without TURN to give up', 15_000);
+        assert.equal(await controlPages[0].evaluate(peer => window.__client.transportOf(peer), controlIds[1]), 'relay', 'a relay-only link with no TURN server went direct');
+        assert.equal(await sendPlain(controlPages[0], controlPages[1], controlIds[0], controlIds[1], {n: 900}, until), 'relay');
+      } finally { await Promise.all(controlContexts.map(context => context.close().catch(() => {}))); }
+
+      assert.equal(pageErrors.filter(error => error.startsWith('turn:')).length, 0, 'page errors');
+      const types = pairs.map(pair => `${pair.local.type}/${pair.remote.type}`).join(' and ');
+      return `selected pair ${types} over ${pairs[0].local.relayProtocol} via ${coturn.url} (relay ${pairs[0].local.address}:${pairs[0].local.port} and ${pairs[1].local.address}:${pairs[1].local.port}), every gathered candidate relay, ${via.length} frames ${[...new Set(via)].join('/')}; credential: expires +3600 s, hub-issued accepted, expired (401), forged, and lapsed after 5 s (401) refused; control without TURN stayed on the hub relay`;
+    } finally {
+      await Promise.all(contexts.map(context => context.close().catch(() => {})));
+    }
+  });
+
+  // Browser processes that hold a GPU device open (a record: the GPU process opens the render node to read device info even with the GPU disabled).
+  function gpuHolders(markerArg) {
+    const parents = new Map();
+    const commands = new Map();
+    for (const entry of readdirSync('/proc')) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const stat = readFileSync(`/proc/${entry}/stat`, 'utf8');
+        parents.set(Number(entry), Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]));
+        commands.set(Number(entry), readFileSync(`/proc/${entry}/cmdline`, 'utf8'));
+      } catch { /* the process ended */ }
+    }
+    const root = [...commands].find(([, command]) => command.includes(markerArg))?.[0];
+    if (!root) return {processes: 0, holders: []};
+    const tree = new Set([root]);
+    for (let grew = true; grew;) { grew = false; for (const [pid, parent] of parents) if (tree.has(parent) && !tree.has(pid)) { tree.add(pid); grew = true; } }
+    const holders = [];
+    for (const pid of tree) {
+      try { for (const fd of readdirSync(`/proc/${pid}/fd`)) { const target = readlinkSync(`/proc/${pid}/fd/${fd}`); if (/^\/dev\/(dri|nvidia|kfd)/.test(target)) holders.push(`${pid} ${/--type=([a-z-]+)/.exec(commands.get(pid))?.[1] || 'browser'}:${target}`); } } catch { /* not ours to read */ }
+    }
+    return {processes: tree.size, holders};
+  }
+
+  // Flags that turn the GPU off and leave Chromium on its software paths (SwiftShader for WebGL, software compositing).
+  const NO_GPU_ARGS = ['--disable-gpu', '--disable-gpu-compositing', '--disable-accelerated-2d-canvas', '--disable-gpu-rasterization', '--disable-features=Vulkan', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'];
+
+  await scenario('25 no GPU: two LiveClients on a plain page pair peer to peer and exchange data in a Chromium with the GPU disabled', async () => {
+    const marker = `--e2e-no-gpu=${secret().slice(0, 12)}`;
+    const soft = await chromium.launch({headless: true, args: [...WEBRTC_ARGS, ...NO_GPU_ARGS, marker], ...(chosen.executablePath ? {executablePath: chosen.executablePath} : {})});
+    onClose(() => soft.close());
+    const plain = await startPlainPage();
+    onClose(() => plain.stop());
+    const {admin} = await plainHub(plain.origin, {LIVEENGINE_ICE_SERVERS: '[]'});
+    const ids = ['soft-a', 'soft-b'];
+    const contexts = await Promise.all(ids.map(() => soft.newContext()));
+    try {
+      const pages = await Promise.all(contexts.map(context => context.newPage()));
+      const descriptors = await pairPlain(admin, ids);
+      await Promise.all(pages.map((page, i) => connectPlainClient(page, plain.origin, descriptors[i], {direct: true, directTimeoutMs: 25_000})));
+      // The page really is on software rendering: WebGL is absent or SwiftShader, and no browser process has a GPU device open.
+      const gl = await pages[0].evaluate(() => {
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('webgl');
+        if (!context) return 'no WebGL';
+        const info = context.getExtension('WEBGL_debug_renderer_info');
+        return info ? context.getParameter(info.UNMASKED_RENDERER_WEBGL) : context.getParameter(context.RENDERER);
+      });
+      assert.ok(/no WebGL|swiftshader|software|llvmpipe/i.test(gl), `the page is not on software rendering: ${gl}`);
+      // Chromium's own report: canvas and compositing are software only.
+      const status = await contexts[0].newPage().then(async report => {
+        await report.goto('chrome://gpu');
+        await sleep(2000);
+        const text = await report.evaluate(() => { const out = []; const walk = node => { if (node.nodeType === 3 && node.textContent.trim()) out.push(node.textContent.trim()); if (node.shadowRoot) walk(node.shadowRoot); node.childNodes?.forEach(walk); }; walk(document.body); return out.join('\n'); });
+        await report.close();
+        return Object.fromEntries(['Canvas', 'Compositing'].map(feature => [feature, new RegExp(`${feature}:\\n([^\\n]*)`).exec(text)?.[1] ?? 'not reported']));
+      });
+      assert.ok(/^Software only/.test(status.Canvas) && /^Software only/.test(status.Compositing), `Chromium reports ${JSON.stringify(status)}`);
+      // The GPU process may still open the render node to read device info; rendering does not use it. Recorded, not asserted.
+      const gpu = gpuHolders(marker);
+      await directBoth(pages, ids);
+      const via = [];
+      for (let n = 1; n <= 5; n++) {
+        via.push(await sendPlain(pages[0], pages[1], ids[0], ids[1], {n}, until));
+        via.push(await sendPlain(pages[1], pages[0], ids[1], ids[0], {n: 100 + n}, until));
+      }
+      assert.ok(via.every(kind => kind === 'direct'), `frames did not use the data channel: ${via}`);
+      const pairs = await Promise.all(pages.map((page, i) => selectedPair(page, ids[1 - i])));
+      pairs.forEach((pair, i) => assert.notEqual(pair.local?.type, 'relay', `${ids[i]} went through a relay: ${JSON.stringify(pair)}`));
+      const record = await recordSoftwareGame(soft).catch(error => `not recorded: ${error.message.slice(0, 120)}`);
+      console.log(`INFO game on software rendering (not a pass or fail) | ${record}`);
+      return `renderer "${gl}"; chrome://gpu: canvas "${status.Canvas}", compositing "${status.Compositing}" (${gpu.processes} browser processes${gpu.holders.length ? `, ${gpu.holders.join(' ')} opened a DRM node for device info only` : ', no DRM node open'}); selected pair ${pairs.map(pair => `${pair.local.type}/${pair.remote.type}`).join(' and ')}, ${via.length} frames ${[...new Set(via)].join('/')}`;
+    } finally {
+      await Promise.all(contexts.map(context => context.close().catch(() => {})));
+      await soft.close().catch(() => {});
+    }
+  });
+
+  /** What the full game does on software rendering. Never throws on a bad result: it describes it. */
+  async function recordSoftwareGame(soft) {
+    const bridge = await startBridge(portSoft, central.address, centralToken, {LIVEENGINE_HUB_ID: 'gogh-soft', GOGH_LIVE_LINK: 'peer'});
+    await bridge.warm();
+    const started = Date.now();
+    const seconds = () => `${((Date.now() - started) / 1000).toFixed(0)}s`;
+    const notes = [];
+    const run = async () => {
+      const [a, b] = await Promise.all(['soft-game-a', 'soft-game-b'].map(label => openPlayer(label, bridge.base, {browser: soft})));
+      notes.push(`both lobbies loaded in ${seconds()}`);
+      await a.deploy();
+      await sleep(300);
+      await b.deploy();
+      await Promise.all([a.playing(), b.playing()]);
+      notes.push(`both reached play in ${seconds()}`);
+      await Promise.all([instrument(a), instrument(b)]);
+      await sleep(5000);
+      const fps = await Promise.all([a, b].map(player => player.page.evaluate(() => window.vanGoghStrike?.state?.fps)));
+      const [ia, ib] = await Promise.all([sessionInfo(a), sessionInfo(b)]);
+      notes.push(`fps reported ${fps.map(value => (typeof value === 'number' ? value.toFixed(1) : value)).join('/')}`);
+      notes.push(`transport ${ia.transport[ib.id] ?? 'none'}/${ib.transport[ia.id] ?? 'none'}`);
+      const [countsA, countsB] = await Promise.all([counts(a), counts(b)]);
+      notes.push(`frames heard a=${JSON.stringify(countsA)} b=${JSON.stringify(countsB)}`);
+    };
+    const outcome = await Promise.race([run().then(() => 'ok', error => `stopped: ${error.message.split('\n')[0].slice(0, 100)}`), sleep(200_000).then(() => 'still not playing after 200s')]);
+    const where = outcome === 'ok' ? '' : `; pages then: ${(await diagnose().catch(() => '')).replace(/ console=.*?(?= \|\||$)/g, '').slice(0, 500)}`;
+    return `${outcome}; ${notes.join('; ') || 'nothing reached'}${where}`;
+  }
+
+  await crowdScenario(26, 20, 7, 'j');
 
 }
 
@@ -1390,7 +1650,7 @@ try {
   await closeAll();
 }
 // A scenario that never ran (its setup broke) is a failure, not a skip.
-for (let number = 1; number <= 23; number++) {
+for (let number = 1; number <= 26; number++) {
   if (results.some(result => result.name.startsWith(`${number} `))) continue;
   results.push({name: `${number}`, ok: false});
   console.log(`FAIL ${number} | did not run: setup failed`);

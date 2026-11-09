@@ -19,13 +19,16 @@ async function example() {
   await client.connect();
   client.on('message', frame => console.log(frame.payload));
   client.send({ text: 'hello' }, { channel: 'chat' });
-  client.connectPeer('bob').close();
+  client.connectPeer('bob', { iceTransportPolicy: 'relay' }).close();
+  new LiveClient(descriptor, { iceTransportPolicy: 'relay' }).close();
   await connectLive({ pairUrl: '/api/pair', body: { id: 'alice' } });
   await watchHubs({ watchUrl: '/api/watch' });
   createHubApi({ client: hub, hubId: 'game', allowedOrigins: ['https://example.com'] });
   console.log(HUB_PROTOCOL, nativeVersion);
 }
 void example;
+// @ts-expect-error only "all" and "relay" exist
+new LiveClient({ ticket: 'x' }, { iceTransportPolicy: 'public' });
 // @ts-expect-error user ids are strings
 engine.upsertUser({ id: 1 });
 // @ts-expect-error unknown delivery mode

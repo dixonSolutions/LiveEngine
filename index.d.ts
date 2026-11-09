@@ -338,6 +338,11 @@ export interface LiveClientOptions {
   connectTimeoutMs?: number;
   directTimeoutMs?: number;
   /**
+   * `"relay"` gathers only TURN candidates, so a direct link goes through a TURN server and
+   * exposes no peer address. Default `"all"` (the browser's own default).
+   */
+  iceTransportPolicy?: 'all' | 'relay';
+  /**
    * Send broadcasts over each open data channel and relay a targeted copy only to the peers
    * without one. Default false: a broadcast goes through the hub, which fans it out.
    */
@@ -406,5 +411,6 @@ export interface LiveClient {
 export interface ConnectPeerOptions {
   RTCPeerConnection?: typeof RTCPeerConnection;
   iceServers?: unknown[];
+  iceTransportPolicy?: 'all' | 'relay';
   directTimeoutMs?: number;
 }

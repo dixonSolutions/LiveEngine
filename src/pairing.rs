@@ -65,11 +65,6 @@ impl Default for PendingPairs {
     }
 }
 
-/// Marks the answer of a pairing attempt that found a candidate it could not yet use, because a
-/// password hub needs that candidate's own session and the candidate had not queued its request.
-#[derive(Clone)]
-struct CredentialBlocked;
-
 /// How long a waiting peer lets a burst of arrivals settle before it looks again.
 const RECHECK_DELAY: Duration = Duration::from_millis(100);
 
@@ -669,18 +664,18 @@ pub(crate) async fn pair(
             }
             // Either no partner exists yet, or another peer took this seat and will wake it.
             // A peer taken after a failed attempt of its own is still matched.
-            let blocked = response.extensions().get::<CredentialBlocked>().is_some();
             let woken = match wake.try_recv() {
                 Ok(matched) => Woken::Matched(matched),
                 Err(oneshot::error::TryRecvError::Closed) => Woken::Dropped,
                 Err(oneshot::error::TryRecvError::Empty) => {
-                    let watch = blocked.then_some(&mut changes);
+                    // Every waiter watches the queue: a room that opens after this peer looked
+                    // (its candidates were mid-claim, or it lacked a credential) is worth joining.
                     wait_for(
                         &mut wake,
                         deadline,
                         &seat,
                         state.config.request_timeout,
-                        watch,
+                        Some(&mut changes),
                     )
                     .await
                 }
@@ -742,8 +737,8 @@ async fn wait_for(
         Ok(matched) => Woken::Matched(matched),
         Err(_) => Woken::Dropped,
     };
-    // A peer blocked on a candidate's missing credential also watches the queue: the candidate may
-    // queue, or a room may open, while it sleeps, and nobody else will come looking for it.
+    // A waiting peer also watches the queue: a candidate may queue, or a room may open, while it
+    // sleeps, and nobody else will come looking for it.
     if let Some(changes) = changes {
         loop {
             tokio::select! {
@@ -1190,9 +1185,7 @@ async fn pair_once(
         // room is checked on its own session above and needs nothing from the seated peer.
         if info["kind"] == "password" && existing.is_none() {
             if target_credential.is_null() && seat.is_some() {
-                let mut blocked = error(StatusCode::NOT_FOUND, "no matching authenticated peer");
-                blocked.extensions_mut().insert(CredentialBlocked);
-                return blocked;
+                return error(StatusCode::NOT_FOUND, "no matching authenticated peer");
             }
             if let Err(e) = authorize_proof(
                 &state,

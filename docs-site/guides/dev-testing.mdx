@@ -19,15 +19,29 @@ The game is fetched automatically. `integrations/gogh-strike/setup.mjs` clones u
 
 If Playwright is missing the test says so and prints the install command above. To reuse an existing install, set `PLAYWRIGHT_PATH` (a module that exports `chromium`) and `CHROMIUM_PATH`.
 
+### Which Chromium runs
+
+Some Chromium builds abort on any text input on some machines (fontconfig reports `SkFontMgr_FontConfigInterface: Not implemented`). So the test does not trust the newest build. `CHROMIUM_PATH`, when set, is used as it is. Otherwise `test/support/browser.mjs` looks at every `chromium-*` build already in the Playwright cache, newest first, launches each headless on a tiny page containing a text input, types into it, and keeps the first build that renders it. The run prints the build it chose and why each newer one was skipped, for example `browser: skipped chromium-1248: the browser crashed on a page with a text input` followed by `browser: chromium-1194 (...)`. It never installs a browser. If no build works the test fails and lists each one it tried. The older `integrations/gogh-strike/e2e.mjs` browser step uses the same choice.
+
 ## Run the end-to-end test
 
 ```sh
 npm run test:e2e
 ```
 
-It prints one `PASS` or `FAIL` line per scenario (14 of them) and exits non-zero on any failure. `GOGH_E2E_ONLY=9,10` runs a subset for debugging and still exits non-zero. Everything binds to free loopback ports and stops at the end, even on failure. Scenario 14 binds the machine's first non-loopback, non-Tailscale IPv4 address instead; it fails, not skips, if there is none.
+It prints one `PASS` or `FAIL` line per scenario (27 of them, including the seat-impersonation check) and exits non-zero on any failure. `GOGH_E2E_ONLY=9,10` runs a subset for debugging and still exits non-zero. Everything binds to free loopback ports and stops at the end, even on failure. Scenario 14 binds the machine's first non-loopback, non-Tailscale IPv4 address instead; it fails, not skips, if there is none.
 
 Scenarios 9 to 14 drive the lobby's **Play online** panel by clicking and typing: two users matching and reaching a direct WebRTC connection, four users at once, cancelling a search, an API on another origin, a wrong address, and the LAN address.
+
+Scenarios 24 to 26 go beyond the game:
+
+- **24 TURN.** It runs a real coturn in a podman container (`--memory=1g --memory-swap=1g`, bound to 127.0.0.1 on random ports, shared-secret mode), starts a hub with `LIVEENGINE_ICE_SERVERS` and `LIVEENGINE_TURN_SECRET`, and connects two browsers with `iceTransportPolicy: 'relay'` so TURN is the only path. It checks, through `getStats()`, that the selected candidate pair is a relay candidate on both sides and that every gathered candidate is a relay, that frames cross the data channel, that the coturn log shows an allocation for each user, and that the credentials expire as documented: the hub-issued one is accepted, one whose timestamp has passed, one signed with another secret, and one that lapses five seconds after it was made are refused with 401. As a control, a relay-only link with no TURN server stays on the hub relay. The image (`docker.io/coturn/coturn:4.6.3`, or `LIVEENGINE_TEST_COTURN_IMAGE`) is pulled once if it is not local; if it cannot be pulled or started the scenario fails with the reason. It needs podman.
+- **25 No GPU.** A Chromium with `--disable-gpu`, software compositing and SwiftShader loads a plain page with no game; two `LiveClient`s pair and exchange data over a direct data channel. It asserts that Chromium reports canvas and compositing as software only. After that it opens the full game in the same browser and prints an `INFO` line, which is a record and never a pass or fail.
+- **26 Twenty users.** The ten-user signed-in scenario again, with twenty users in rooms of five, each under their own name, all exchanging data.
+
+## Memory
+
+The suite starts many real browsers, so it is heavy. Three things keep it down: everything a scenario starts (bridges, extra hubs, contexts, containers) is stopped when that scenario ends rather than at the end of the run; shared players are closed after the last scenario that uses them; and the browser runs with `--enable-low-end-device-mode`, which makes each game page about a third smaller. Run it under a memory limit of at least 10 GB. The twenty-user scenario is the peak: twenty game pages at once, about 6.6 GB of renderer processes.
 
 ## Run a dev stack
 

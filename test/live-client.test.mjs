@@ -501,6 +501,27 @@ describe('connectPeer negotiation and fallback (injected RTCPeerConnection)', ()
     assert.ok([...s.net.pcs.values()].every(pc => pc.candidates.length >= 1));
   });
 
+  test('iceTransportPolicy reaches the RTCPeerConnection config from the client option or the link option, and only when set', async () => {
+    const s = setup();
+    stubHost('a', s.router, s.rtc);
+    const b = stubHost('b', s.router, s.rtc, { iceTransportPolicy: 'relay' });
+    const viaHost = connectPeer(b, 'a', { directTimeoutMs: 600 });
+    assert.equal(viaHost.pc.config.iceTransportPolicy, 'relay');
+    assert.equal(await viaHost.ready, 'direct');
+    const c = stubHost('c', s.router, s.rtc);
+    const viaLink = connectPeer(c, 'a', { directTimeoutMs: 600, iceTransportPolicy: 'relay' });
+    assert.equal(viaLink.pc.config.iceTransportPolicy, 'relay');
+    const d = stubHost('d', s.router, s.rtc);
+    assert.ok(!('iceTransportPolicy' in connectPeer(d, 'a', { directTimeoutMs: 600 }).pc.config));
+  });
+
+  test('LiveClient rejects an iceTransportPolicy other than "all" or "relay"', () => {
+    const descriptor = { ticket: 'x', url: 'ws://127.0.0.1:1/v1/live', userId: 'u', link: 'peer-peer', room: 'pair:r', transports: ['webrtc', 'websocket'] };
+    assert.throws(() => new LiveClient(descriptor, { iceTransportPolicy: 'turn' }), /iceTransportPolicy must be "all" or "relay"/);
+    assert.doesNotThrow(() => new LiveClient(descriptor, { iceTransportPolicy: 'relay' }));
+    assert.doesNotThrow(() => new LiveClient(descriptor, { iceTransportPolicy: 'all' }));
+  });
+
   test('simultaneous offers collide, the polite side rolls back, and one channel results', async () => {
     const s = setup();
     const a = stubHost('a', s.router, s.rtc);
