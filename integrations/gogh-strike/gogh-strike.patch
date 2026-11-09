@@ -1,8 +1,8 @@
 diff --git a/index.html b/index.html
-index 3d9d4e7..6dfa559 100644
+index 3d9d4e7..4623144 100644
 --- a/index.html
 +++ b/index.html
-@@ -31,7 +31,17 @@
+@@ -31,7 +31,23 @@
            <div class="secondary-kit"><span class="eyebrow">SIDEARM</span><div id="secondary-preview" class="weapon-preview"></div><b id="selected-sidearm">Atelier</b><span>Pistol</span></div>
            <div class="art-kit"><span class="eyebrow">YOUR ART TAG</span><img id="selected-art-tag" alt="" width="68" height="68"><b id="selected-tag-name"></b><span><kbd>T</kbd> Spray a wall</span></div>
          </div>
@@ -14,6 +14,12 @@ index 3d9d4e7..6dfa559 100644
 +        <form id="online-form" class="online-form" novalidate><label for="online-address">Hub API address</label><input id="online-address" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="http://192.168.1.20:8967"><button id="online-connect" class="secondary-button" type="submit">Connect</button></form>
 +        <p id="online-status" class="online-status" role="status" aria-live="polite">Enter the address of a hub API and press Connect.</p>
 +        <p id="online-error" class="online-error" role="alert" hidden></p>
++        <div id="online-account" class="online-account" hidden>
++          <form id="signin-form" class="online-signin" novalidate><label for="signin-username">Username</label><input id="signin-username" type="text" autocomplete="username" autocapitalize="off" spellcheck="false"><label for="signin-password">Password</label><input id="signin-password" type="password" autocomplete="current-password"><button id="signin-submit" class="secondary-button" type="submit">Sign in</button></form>
++          <div id="signedin" class="online-signedin" hidden><p id="signedin-as" class="online-signedin-as" role="status"></p><a id="admin-link" class="quiet-button online-admin-link" href="#" target="_blank" rel="noopener" hidden>Admin console</a><button id="signout" class="quiet-button" type="button">Sign out</button>
++            <details id="password-change" class="online-password"><summary>Change password</summary><form id="password-form" class="online-signin" novalidate><label for="password-current">Current password</label><input id="password-current" type="password" autocomplete="current-password"><label for="password-next">New password</label><input id="password-next" type="password" autocomplete="new-password" minlength="10"><button id="password-submit" class="secondary-button" type="submit">Change password</button></form></details></div>
++          <p id="account-note" class="online-account-note" role="status" aria-live="polite"></p>
++        </div>
 +        <div id="online-body" class="online-body" hidden>
 +          <div class="online-hubs"><span class="eyebrow">HUBS ONLINE</span><ul id="online-hubs" aria-label="Hubs online"></ul></div>
 +          <div class="online-match"><p id="online-match" class="online-match-text" role="status" aria-live="polite">Find match pairs you with another player.</p><div class="online-actions"><button id="online-find" class="secondary-button" type="button">Find match</button><button id="online-cancel" class="quiet-button" type="button" hidden>Cancel</button></div></div>
@@ -53,14 +59,14 @@ index 21fbb2b..5458f04 100644
     plan.responders.clear();
     if(info&&now-info.at<5.5){
 diff --git a/src/game.js b/src/game.js
-index 22dacf2..dec3c57 100644
+index 22dacf2..6a5bf91 100644
 --- a/src/game.js
 +++ b/src/game.js
 @@ -21,6 +21,8 @@ import {bodyProfile} from './actor-profile.js';
  import {actorPose,bodyPoint,intersectActorBody} from './actor-body.js';
  import {UtilitySystem} from './utility.js';
  import {initEquipment,equip,stashMagazine,absorbDamage} from './loadout.js';
-+import {joinLiveEngineMatch,leaveLiveEngineMatch,getLiveSession,hasLiveMatch,connectOnline,findOnlineMatch,cancelFind,onOnlineChange,savedHubAddress} from './liveengine-matchmaking.js';
++import {joinLiveEngineMatch,leaveLiveEngineMatch,getLiveSession,hasLiveMatch,connectOnline,findOnlineMatch,cancelFind,onOnlineChange,savedHubAddress,signIn,signOut,changePassword} from './liveengine-matchmaking.js';
 +import {STATE_HZ,RemoteTrack,encodeState,decodeState,encodeShot,encodeHit,encodeDown,decodeEvent,pickRemoteSlot,applyRemoteState} from './liveengine-net.js';
  
  const V=(x=0,y=0,z=0)=>new THREE.Vector3(x,y,z),clamp=THREE.MathUtils.clamp,lerp=THREE.MathUtils.lerp;
@@ -70,7 +76,7 @@ index 22dacf2..dec3c57 100644
  ];
  const objectives=[];
 -const ui=new GameUI({weapons:WEAPONS,settings,onStart:startMatch,onRestart:startMatch,onMenu:showMenu,onPauseChange:setPause,onSettings:applySettings,
-+const ui=new GameUI({weapons:WEAPONS,settings,onStart:startMatch,onRestart:startMatch,onMenu:showMenu,onPauseChange:setPause,onSettings:applySettings,onMatchmaking:joinLiveEngineMatch,hasLiveMatch,online:{connect:connectOnline,find:findOnlineMatch,cancel:cancelFind,subscribe:onOnlineChange,address:savedHubAddress},
++const ui=new GameUI({weapons:WEAPONS,settings,onStart:startMatch,onRestart:startMatch,onMenu:showMenu,onPauseChange:setPause,onSettings:applySettings,onMatchmaking:joinLiveEngineMatch,hasLiveMatch,online:{connect:connectOnline,find:findOnlineMatch,cancel:cancelFind,subscribe:onOnlineChange,address:savedHubAddress,signIn,signOut,changePassword},
   onWeaponSelect:value=>{if(controlsReady())switchWeapon(typeof value==='number'?player?.carriedWeapons[value]:value);}});
  const pointerCapture=new PointerCapture({element:renderer.domElement,document,
   canCapture:()=>phase==='playing'&&!paused&&!document.hidden&&document.hasFocus(),
@@ -177,10 +183,10 @@ index 22dacf2..dec3c57 100644
  }
 diff --git a/src/liveengine-matchmaking.js b/src/liveengine-matchmaking.js
 new file mode 100644
-index 0000000..0f481ac
+index 0000000..4cd8a3b
 --- /dev/null
 +++ b/src/liveengine-matchmaking.js
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,344 @@
 +const USER_KEY = 'gogh-strike-liveengine-user';
 +const CREDENTIAL_KEY = 'gogh-strike-liveengine-credential';
 +const HUB_KEY = 'gogh-strike-liveengine-hub-api';
@@ -250,12 +256,16 @@ index 0000000..0f481ac
 +// Everything the "Play online" panel shows comes from this state. Pairing, tickets, retries and the
 +// WebRTC link are LiveClient and connectLive, loaded from the hub API itself, so the page needs no copy.
 +
++// `auth` is 'password' when the hub asks players to sign in; `account` is who is signed in ({username, role}).
++// Signing in, the session cookie, polling and plain-word errors are LiveEngine's hubSession and explainHubError.
 +const online = {phase: 'idle', address: '', base: '', pingMs: null, hubPingMs: null, waiting: null, seats: null,
-+  hubs: [], hubsLive: false, match: null, error: ''};
++  hubs: [], hubsLive: false, match: null, error: '', notice: '', auth: '', account: null, adminUrl: ''};
 +const onlineListeners = new Set();
 +let pinger;
 +let hubWatch;
 +let search;
++let accounts;
++let explain = () => undefined;
 +
 +function setOnline(change) {
 +  Object.assign(online, change);
@@ -293,6 +303,55 @@ index 0000000..0f481ac
 +
 +async function readJson(response) {
 +  try { return await response.json(); } catch { return null; }
++}
++
++/** Stop a match or a search the signed-in account can no longer hold. */
++async function dropMatch() {
++  await cancelFind();
++  if (online.phase === 'matched') leaveLiveEngineMatch();
++}
++
++function accountChanged(account, reason, status) {
++  const adminUrl = account?.role === 'admin' && status.adminConsole ? `${online.base}/admin` : '';
++  setOnline({account, adminUrl, notice: reason === 'signed-in' ? '' : online.notice});
++  if (account) return;
++  const words = 'You were signed out. Your password changed or your session ended. Sign in again.';
++  dropMatch().then(() => { if (reason === 'ended') setOnline({error: online.error || words}); });
++}
++
++async function startAccounts(base, status) {
++  const {hubSession, explainHubError} = await importClient(base);
++  explain = explainHubError;
++  const current = hubSession({base});
++  accounts = current;
++  current.on('change', ({account, reason}) => { if (accounts === current && online.base === base) accountChanged(account, reason, status); });
++  await current.refresh().catch(() => {});
++  if (accounts === current && online.base === base) setOnline({account: current.account, adminUrl: current.account?.role === 'admin' && status.adminConsole ? `${base}/admin` : ''});
++}
++
++/** Sign in to a hub that asks for it. Resolves when signed in; throws the plain-word reason. */
++export async function signIn(username, password) {
++  if (!accounts) throw new Error('Connect to a hub API first.');
++  setOnline({error: '', notice: ''});
++  try { await accounts.login(String(username || '').trim(), String(password || '')); }
++  catch (error) { setOnline({error: error.message}); throw error; }
++}
++
++/** Leave any match, then end the sign-in. */
++export async function signOut() {
++  await dropMatch();
++  await accounts?.logout();
++  setOnline({error: '', notice: 'Signed out.'});
++}
++
++/** Change the signed-in account's password. Every session of the account ends, so the player signs in again. */
++export async function changePassword(current, next) {
++  if (!accounts) throw new Error('Connect to a hub API first.');
++  setOnline({error: '', notice: ''});
++  try { await accounts.changePassword(String(current || ''), String(next || '')); }
++  catch (error) { setOnline({error: error.message}); throw error; }
++  await dropMatch();
++  setOnline({notice: 'Password changed. Sign in again with the new one.'});
 +}
 +
 +function closeWatchers() {
@@ -338,7 +397,7 @@ index 0000000..0f481ac
 +  let base;
 +  try { base = hubApiBase(address); }
 +  catch (error) { setOnline({phase: 'idle', error: error.message}); throw error; }
-+  setOnline({phase: 'connecting', address, base: '', error: '', pingMs: null, hubPingMs: null, waiting: null, seats: null, hubs: [], hubsLive: false});
++  setOnline({phase: 'connecting', address, base: '', error: '', notice: '', auth: '', account: null, adminUrl: '', pingMs: null, hubPingMs: null, waiting: null, seats: null, hubs: [], hubsLive: false});
 +  let status;
 +  try {
 +    const response = await fetch(`${base}/status`, {headers: {Accept: 'application/json'}, signal: AbortSignal.timeout(8000)});
@@ -358,7 +417,8 @@ index 0000000..0f481ac
 +    throw new Error(message);
 +  }
 +  try { localStorage.setItem(HUB_KEY, address.trim()); } catch { /* the address is just not remembered */ }
-+  setOnline({phase: 'connected', base, hubId: status.hubId});
++  setOnline({phase: 'connected', base, hubId: status.hubId, auth: status.auth === 'password' ? 'password' : ''});
++  if (status.auth === 'password') await startAccounts(base, status).catch(() => setOnline({error: 'Sign-in is not available: the hub API did not load its sign-in code.'}));
 +  await pingOnce(base);
 +  pinger = setInterval(() => pingOnce(base), PING_EVERY_MS);
 +  startHubList(base);
@@ -369,11 +429,15 @@ index 0000000..0f481ac
 +  await cancelFind();
 +  if (online.phase === 'matched') leaveLiveEngineMatch();
 +  closeWatchers();
-+  if (online.phase !== 'idle') setOnline({phase: 'idle', base: '', match: null, hubs: [], hubsLive: false, pingMs: null, waiting: null});
++  accounts?.close();
++  accounts = undefined;
++  if (online.phase !== 'idle') setOnline({phase: 'idle', base: '', match: null, hubs: [], hubsLive: false, pingMs: null, waiting: null, auth: '', account: null, adminUrl: ''});
 +}
 +
 +function findFailure(error, base) {
 +  const host = new URL(base).host;
++  const plain = explain(error);
++  if (plain) return plain;
 +  if (error.status === 408) return 'No other player arrived in time. Press Find match again, or ask a friend to press it too.';
 +  if (error.status === 403) return `${host} refused your credential: ${error.message}. Check the credential saved for this game.`;
 +  if (error.status === 429) return 'Too many requests from this device. Wait a minute, then press Find match again.';
@@ -385,10 +449,12 @@ index 0000000..0f481ac
 +
 +function describeMatch(client) {
 +  const peers = client.peers();
++  // Under a hub that verifies sign-ins, a player is shown by the name the hub verified.
++  const names = peers.map(peer => { const who = client.identityOf(peer); return who ? `${who.identity}${who.claims?.role ? ` (${who.claims.role})` : ''}` : peer; });
 +  const kinds = peers.map(peer => client.transportOf(peer));
 +  const direct = peers.length > 0 && kinds.every(kind => kind === 'direct');
 +  const connection = peers.length === 0 ? 'waiting' : direct ? 'direct' : kinds.includes('direct') ? 'mixed' : 'relay';
-+  return {peers, connection, room: client.room, id: client.id};
++  return {peers, names, connection, room: client.room, id: client.id};
 +}
 +
 +/** Pair with another player through the hub API (waiting up to FIND_WAIT_MS), then connect. */
@@ -396,15 +462,21 @@ index 0000000..0f481ac
 +  if (online.phase !== 'connected') throw new Error('Press Connect first.');
 +  const base = online.base;
 +  const controller = new AbortController();
-+  const userId = localUserId();
++  if (online.auth === 'password' && !online.account) {
++    const message = 'Sign in first, then press Find match.';
++    setOnline({error: message});
++    throw new Error(message);
++  }
++  // A hub that verifies sign-ins takes the account name as the player id.
++  const userId = online.account?.username || localUserId();
 +  search = controller;
-+  setOnline({phase: 'searching', error: '', match: null});
++  setOnline({phase: 'searching', error: '', notice: '', match: null});
 +  try {
 +    const {connectLive} = await importClient(base);
 +    const client = await connectLive({
 +      pairUrl: `${base}/pair`, renewUrl: `${base}/renew`,
 +      body: {userId, team: config.team, role: config.role, waitMs: FIND_WAIT_MS}, credential: storedCredential(),
-+      directBroadcast: true, fetch: (url, init) => fetch(url, {...init, signal: controller.signal}),
++      directBroadcast: true, fetch: (url, init) => fetch(url, {...init, ...(online.auth ? {credentials: 'include'} : {}), signal: controller.signal}),
 +    });
 +    if (controller.signal.aborted) { client.close(); return null; }
 +    session = client;
@@ -415,7 +487,18 @@ index 0000000..0f481ac
 +    const refresh = () => { if (session === client) setOnline({match: describeMatch(client)}); };
 +    client.on('presence', refresh);
 +    client.on('transport', refresh);
-+    client.on('close', () => { if (session === client && online.phase === 'matched') setOnline({phase: 'connected', match: null, error: 'The match connection closed. Press Find match to play again.'}); });
++    // A kick, a ban or a changed password arrives as an error with a code; the hub then closes the connection.
++    client.on('error', error => {
++      const plain = explain(error);
++      if (!plain || session !== client) return;
++      setOnline({error: plain});
++      if (!['kicked', 'banned'].includes(error.code)) accounts?.refresh().catch(() => {});
++    });
++    client.on('close', () => {
++      if (session !== client) return;
++      clearInterval(heartbeat);
++      if (online.phase === 'matched') setOnline({phase: 'connected', match: null, error: online.error || 'The match connection closed. Press Find match to play again.'});
++    });
 +    setOnline({phase: 'matched', match: describeMatch(client)});
 +    return {userId, serverId: client.room};
 +  } catch (error) {
@@ -604,7 +687,7 @@ index 0000000..622c8a8
 +  if (state.weapon && state.weapon !== actor.weaponId && knownWeapon(state.weapon)) actor.weaponId = state.weapon;
 +}
 diff --git a/src/style.css b/src/style.css
-index b41b102..fa96e41 100644
+index b41b102..18d0574 100644
 --- a/src/style.css
 +++ b/src/style.css
 @@ -40,6 +40,7 @@
@@ -615,7 +698,7 @@ index b41b102..fa96e41 100644
  .cosmetic-hud{position:absolute;left:50%;bottom:120px;transform:translateX(-50%);display:flex;align-items:center;gap:8px;height:29px;z-index:3}.cosmetic-hud .spray-hud{position:static;transform:none}.taunt-hud{display:flex;align-items:center;gap:6px;height:29px;padding:2px 8px 2px 4px;border-radius:4px;background:#0c25369c;color:#cddcca;font-size:10px;white-space:nowrap}.taunt-hud>kbd{font-size:9px;padding:2px 4px}.taunt-hud>svg{width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.taunt-hud>svg circle{fill:currentColor;stroke:none}.taunt-hud.unavailable{color:#90a9a9}.taunt-hud.unavailable>svg{opacity:.4}.taunt-hud.active{color:var(--friendly)}.taunt-hud.active>svg{animation:taunt-step .5s ease-in-out infinite alternate}.taunt-hud.active>kbd{border-color:#a6e7b480;color:var(--friendly)}@keyframes taunt-step{from{transform:rotate(-9deg)}to{transform:rotate(9deg)}}
  #crosshair>i{transition:left .1s ease-out,right .1s ease-out,top .1s ease-out,bottom .1s ease-out,color .1s}
  .killer-avatar{width:76px;height:88px}.killer-avatar .portrait img{transform:scale(1.35);transform-origin:center 20%}.death-credit{gap:15px}.death-credit>span{display:flex;flex-direction:column;align-items:flex-start;gap:4px;font-size:12px}.death-credit b{font-size:24px;line-height:1.15;font-weight:600}.respawn-message>p{margin-bottom:16px}.kill-entry .portrait{width:30px;height:34px}.is-dead #cosmetic-hud{display:none!important}
-@@ -158,3 +159,16 @@ summary:focus-visible{outline:2px solid var(--brand-gold);outline-offset:4px}
+@@ -158,3 +159,23 @@ summary:focus-visible{outline:2px solid var(--brand-gold);outline-offset:4px}
  @media(max-width:380px){.modal-card{padding:23px}.controls-details .controls-grid{grid-template-columns:1fr;gap:11px}.controls-grid>span{font-size:11px}.lobby-heading h1{font-size:34px}.panel-wordmark{font-size:20px}.results-card h2{font-size:38px}.results-score{gap:13px}.results-score small{font-size:9px}.results-score>span{min-width:80px}}
  @media(prefers-reduced-motion:reduce){.controls-details>summary>span{transition:none}}
  @media(max-width:600px){.scoreboard-card{padding:23px}.scoreboard-card .panel-brand{margin-bottom:10px}.scoreboard-card .modal-heading{margin-bottom:12px}.scoreboard-teams{gap:12px}}
@@ -631,9 +714,16 @@ index b41b102..fa96e41 100644
 +.online-body{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:20px;margin-top:13px;padding-top:12px;border-top:1px solid var(--line)}.online-hubs .eyebrow{font-size:9px}
 +.online-hubs ul{list-style:none;margin:7px 0 0;padding:0;max-height:78px;overflow-y:auto;scrollbar-width:thin}.online-hub{display:flex;justify-content:space-between;gap:10px;padding:4px 0;font-size:12px;color:#d4dfd1;border-bottom:1px solid #e9efd01a}.online-hub b{font-weight:500}.online-hub span,.online-hub.empty{color:#9fb7b9}
 +.online-match-text{margin:0 0 9px;font-size:12px;line-height:1.45;color:#d4dfd1}.online-actions{display:flex;align-items:center;gap:8px}.online-actions .quiet-button{margin:0;font-size:12px}
-+@media(max-width:700px){.online-form{grid-template-columns:minmax(0,1fr) auto}.online-form label{grid-column:1/-1}.online-body{grid-template-columns:1fr;gap:10px}}
++/* Play online: sign-in, shown only when the hub asks for it. */
++.online-account{margin-top:12px;padding-top:11px;border-top:1px solid var(--line)}
++.online-signin{display:grid;grid-template-columns:auto minmax(0,1fr) auto minmax(0,1fr) auto;align-items:center;gap:8px 10px}.online-signin label{font-size:11px;color:#a9bfc4}
++.online-signin input{min-width:0;padding:9px 11px;border:1px solid #b7d2c440;border-radius:5px;background:#061a2a99;color:var(--paper);font-size:13px}.online-signin .secondary-button{margin:0;width:auto;padding:9px 18px}
++.online-signedin{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px}.online-signedin-as{margin:0;font-size:13px;color:var(--friendly)}.online-signedin .quiet-button{margin:0;font-size:12px}.online-admin-link{text-decoration:underline}
++.online-password{flex-basis:100%;font-size:12px;color:#b6c9ca}.online-password summary{cursor:pointer;width:max-content}.online-password .online-signin{margin-top:8px}
++.online-account-note{margin:8px 0 0;font-size:12px;color:#b6c9ca}.online-account-note:empty{display:none}
++@media(max-width:700px){.online-signin{grid-template-columns:auto minmax(0,1fr)}.online-signin .secondary-button{grid-column:1/-1}.online-form{grid-template-columns:minmax(0,1fr) auto}.online-form label{grid-column:1/-1}.online-body{grid-template-columns:1fr;gap:10px}}
 diff --git a/src/ui.js b/src/ui.js
-index cf1f87b..b147684 100644
+index cf1f87b..af6798c 100644
 --- a/src/ui.js
 +++ b/src/ui.js
 @@ -48,7 +48,7 @@ export class GameUI{
@@ -645,7 +735,7 @@ index cf1f87b..b147684 100644
   }
   listen(target,event,handler){target?.addEventListener(event,handler);this.listeners.push([target,event,handler]);}
   bindEvents(){
-@@ -112,7 +112,32 @@ export class GameUI{
+@@ -112,7 +112,45 @@ export class GameUI{
    document.querySelectorAll('[data-graphics]').forEach(button=>{const selected=button.dataset.graphics===this.settings.graphics;button.classList.toggle('selected',selected);button.setAttribute('aria-pressed',String(selected));});
   }
   changeSettings(next){Object.assign(this.settings,next);this.config.settings={...this.settings};this.syncSettings();try{localStorage.setItem('vgs-settings',JSON.stringify(this.settings));}catch{}this.options.onSettings?.({...this.settings});}
@@ -656,6 +746,13 @@ index cf1f87b..b147684 100644
 +  this.listen($('online-form'),'submit',event=>{event.preventDefault();online.connect(address.value).catch(()=>{});});
 +  this.listen(find,'click',()=>online.find({...this.config}).then(match=>{if(match)this.showToast('Matched. Press Play to start.',3200);}).catch(()=>{}));
 +  this.listen($('online-cancel'),'click',()=>online.cancel());
++  if(online.signIn){
++   const user=$('signin-username'),pass=$('signin-password');
++   this.listen($('signin-form'),'submit',event=>{event.preventDefault();online.signIn(user.value,pass.value).then(()=>{pass.value='';}).catch(()=>{});});
++   this.listen($('signout'),'click',()=>online.signOut().catch(()=>{}));
++   const current=$('password-current'),next=$('password-next');
++   this.listen($('password-form'),'submit',event=>{event.preventDefault();online.changePassword(current.value,next.value).then(()=>{current.value='';next.value='';$('password-change').open=false;}).catch(()=>{});});
++  }
 +  online.subscribe(state=>this.renderOnline(state));
 + }
 + renderOnline(s){
@@ -667,12 +764,18 @@ index cf1f87b..b147684 100644
 +  else if(s.phase==='connecting')line='Contacting the hub API…';
 +  text('online-status',line);
 +  const error=$('online-error');error.hidden=!s.error;text('online-error',s.error);
++  const gated=s.auth==='password',signed=Boolean(s.account);
++  $('online-account').hidden=!(live&&gated);$('signin-form').hidden=signed;$('signedin').hidden=!signed;
++  text('signedin-as',signed?`Signed in as ${s.account.username} (${s.account.role})`:'');
++  const admin=$('admin-link');admin.hidden=!s.adminUrl;if(s.adminUrl)admin.href=s.adminUrl;
++  text('account-note',s.notice||(gated&&!signed&&!s.error?'This hub asks you to sign in. Ask its admin for an account.':''));
 +  $('online-body').hidden=!live;$('online-connect').disabled=busy;$('online-address').disabled=s.phase==='searching'||s.phase==='matched';
-+  $('online-find').disabled=s.phase!=='connected';$('online-find').textContent=s.phase==='searching'?'Searching…':'Find match';$('online-cancel').hidden=s.phase!=='searching';
++  $('online-find').disabled=s.phase!=='connected'||(gated&&!signed);$('online-find').textContent=s.phase==='searching'?'Searching…':'Find match';$('online-cancel').hidden=s.phase!=='searching';
 +  const hubs=$('online-hubs');hubs.replaceChildren(...(s.hubs.length?s.hubs.map(hub=>{const item=node('li','online-hub');item.append(node('b','',hub.id),node('span','',`${hub.status==='ok'?'':`${hub.status} · `}${hub.memberCount} playing`));return item;}):[node('li','online-hub empty',s.hubsLive?'No hubs listed.':'Hub list unavailable.')]));
 +  const match=s.match;let note='Find match pairs you with another player.';
 +  if(s.phase==='searching')note='Waiting for another player… press Cancel to stop.';
-+  else if(match)note=match.connection==='waiting'?'Matched. Opening the connection…':match.connection==='direct'?`Matched with ${match.peers.join(', ')}. Direct connection (peer to peer). Press Play.`:match.connection==='relay'?`Matched with ${match.peers.join(', ')}. Relay connection through the hub, direct is not available. Press Play.`:`Matched with ${match.peers.join(', ')}. Some connections are direct, some relayed. Press Play.`;
++  else if(gated&&!signed)note='Sign in to find a match.';
++  else if(match)note=match.connection==='waiting'?'Matched. Opening the connection…':match.connection==='direct'?`Matched with ${(match.names||match.peers).join(', ')}. Direct connection (peer to peer). Press Play.`:match.connection==='relay'?`Matched with ${(match.names||match.peers).join(', ')}. Relay connection through the hub, direct is not available. Press Play.`:`Matched with ${(match.names||match.peers).join(', ')}. Some connections are direct, some relayed. Press Play.`;
 +  text('online-match',note);
 + }
 + async launch(restart=false){if(!this.isReady)return;this.config.settings={...this.settings};const callback=restart?(this.options.onRestart||this.options.onStart):this.options.onStart;const config={...this.config,mode:'tdm',attachments:{...this.config.attachments},settings:{...this.settings}};const deploy=$('deploy-button');try{if(($('liveengine-matchmaking')?.checked||this.options.hasLiveMatch?.())&&this.options.onMatchmaking){deploy.disabled=true;const match=await this.options.onMatchmaking(config);this.showToast(`Joined ${match.serverId} with ${match.peers} other ${match.peers===1?'player':'players'}.`,3600);}const result=callback?.(config);result?.catch?.(error=>this.showError(error));}catch(error){this.showError(error);}finally{if(this.isReady)deploy.disabled=false;}}

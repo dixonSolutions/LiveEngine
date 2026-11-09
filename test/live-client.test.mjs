@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { after, before, describe, test } from 'node:test';
 import http from 'node:http';
-import { LiveClient, connectLive, connectPeer } from '../lib/live-client.mjs';
+import { LiveClient, connectLive, connectPeer, explainHubError, hubSession } from '../lib/live-client.mjs';
 import { FakeNet } from './support/fake-rtc.mjs';
 import { ADMIN_TOKEN, startHub, startProxy } from './support/hub-process.mjs';
 
@@ -926,4 +926,83 @@ test('a real account ban emits banned and stops retries', async () => {
   await sleep(100);
   assert.deepEqual(errors, ['banned']);
   assert.equal(renewals, 0);
+});
+
+// A hub API stand-in with one account, a session cookie and the routes hubSession calls.
+function fakeAccountApi({ password = 'right-password-123' } = {}) {
+  const state = { signedIn: false, calls: [], failLogin: 401, role: 'user' };
+  const reply = (status, body) => ({ ok: status < 400, status, json: async () => body });
+  const fetch = async (url, init = {}) => {
+    const route = url.split('/').pop();
+    const body = init.body ? JSON.parse(init.body) : {};
+    state.calls.push({ route, method: init.method, credentials: init.credentials, body });
+    if (route === 'login') {
+      if (body.password !== password) return reply(state.failLogin, { error: 'invalid username or password' });
+      state.signedIn = true;
+      return reply(200, { account: { username: body.username, role: state.role } });
+    }
+    if (route === 'me') return state.signedIn ? reply(200, { username: 'alice', role: state.role }) : reply(401, { error: 'Sign in required' });
+    if (route === 'logout') { state.signedIn = false; return reply(200, { ok: true }); }
+    if (route === 'password') {
+      if (!state.signedIn) return reply(401, { error: 'Sign in required' });
+      if (body.current !== password) return reply(401, { error: 'invalid username or password' });
+      state.signedIn = false;
+      return reply(200, { ok: true });
+    }
+    return reply(404, { error: 'Not found' });
+  };
+  return { state, fetch };
+}
+
+test('hubSession signs in, reports changes, signs out and says what went wrong in plain words', async () => {
+  const api = fakeAccountApi();
+  const session = hubSession({ base: '/api/liveengine/', fetch: api.fetch, pollMs: 20 });
+  const changes = [];
+  session.on('change', change => changes.push([change.account?.username ?? null, change.reason]));
+  try {
+    assert.equal(await session.refresh(), null);
+    await assert.rejects(session.login('alice', 'wrong-password-123'), error => error.message === 'Wrong username or password.' && error.status === 401);
+    api.state.failLogin = 429;
+    await assert.rejects(session.login('alice', 'wrong-password-123'), /Too many sign-in attempts/);
+    assert.equal(session.account, null);
+    assert.deepEqual(changes, []);
+    await session.login('alice', 'right-password-123');
+    assert.deepEqual(session.account, { username: 'alice', role: 'user' });
+    assert.ok(api.state.calls.every(call => call.credentials === 'include'), 'a request left out the session cookie');
+    assert.equal(api.state.calls.findLast(call => call.route === 'login').body.password, 'right-password-123');
+    // The session ends elsewhere (a password change in another tab, a reset or a ban): the next check says so.
+    api.state.signedIn = false;
+    await until(() => session.account === null, { what: 'the poll to notice the session ended' });
+    assert.deepEqual(changes, [['alice', 'signed-in'], [null, 'ended']]);
+    await session.login('alice', 'right-password-123');
+    await session.logout();
+    assert.equal(session.account, null);
+    assert.deepEqual(changes.at(-1), [null, 'signed-out']);
+    const polled = api.state.calls.length;
+    await sleep(80);
+    assert.equal(api.state.calls.length, polled, 'a signed-out session kept polling');
+  } finally { session.close(); }
+});
+
+test('hubSession changes a password, ends the session and refuses a wrong current password', async () => {
+  const api = fakeAccountApi();
+  const session = hubSession({ base: '/api/liveengine', fetch: api.fetch });
+  try {
+    await session.login('alice', 'right-password-123');
+    await assert.rejects(session.changePassword('not-the-password-1', 'new-password-12345'), error => error.message === 'The current password is wrong.');
+    assert.equal(session.account?.username, 'alice');
+    await session.changePassword('right-password-123', 'new-password-12345');
+    assert.equal(session.account, null);
+    assert.deepEqual(api.state.calls.at(-1).body, { current: 'right-password-123', next: 'new-password-12345' });
+  } finally { session.close(); }
+});
+
+test('explainHubError gives plain words for removal, disabling and ended sign-ins', () => {
+  assert.equal(explainHubError({ code: 'kicked' }), 'You were removed from the match by an admin.');
+  assert.equal(explainHubError('banned'), 'Your account was disabled by an admin.');
+  assert.match(explainHubError({ code: 'credentials-changed' }), /signed out/);
+  assert.match(explainHubError({ code: 'account-deleted' }), /removed by an admin/);
+  assert.match(explainHubError({ status: 401 }), /signed out/);
+  assert.equal(explainHubError({ code: 'rate' }), undefined);
+  assert.equal(explainHubError(undefined), undefined);
 });

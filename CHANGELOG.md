@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Gogh Strike: a sign-in area in the Play online panel (opt-in `GOGH_HUB_AUTH_PASSWORD`, `npm run dev:gogh -- --password`), `hubSession` and `explainHubError` in the live client, a `password` route in the hub API, and end-to-end scenarios 16 to 23. Fixes found on the way: the admin console's create form threw after creating an account, an external hub's accounts now live on the remote service, logging out a session the service already ended clears the cookie, honest parallel logins from one address are no longer refused, and password-hub pairings no longer leave a peer waiting while a room has space.
+
 - Revoke password-hub tickets and live connections on credential changes, bound concurrent login attempts, and upgrade password hashes on login.
 
 - Add account and connection clients, browser sessions, and an optional administrator console.

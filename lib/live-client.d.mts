@@ -38,4 +38,26 @@ export interface WatchHubsOptions {
 }
 /** Watch the live hub list with a ticket from the application's own route. Resolves after the first snapshot. */
 export declare function watchHubs(options: WatchHubsOptions): Promise<HubWatch>;
+/** Plain words for a refusal from the hub (`kicked`, `banned`, `credentials-changed`, `account-deleted`, `auth`) or a 401 from the hub API. */
+export declare function explainHubError(error: { code?: string; status?: number } | string | null | undefined): string | undefined;
+export interface HubSessionAccount { username: string; role: string; enabled?: boolean; claims?: Record<string, unknown>; [key: string]: unknown }
+export interface HubSessionChange { account: HubSessionAccount | null; reason: 'signed-in' | 'signed-out' | 'ended' }
+export interface HubSessionOptions {
+  /** The hub API address with its path, for example `/api/liveengine`. */
+  base: string;
+  fetch?: typeof fetch;
+  /** How often a signed-in session is re-checked. Default 5000. */
+  pollMs?: number;
+}
+export interface HubSession {
+  readonly account: HubSessionAccount | null;
+  on(event: 'change', listener: (change: HubSessionChange) => void): () => void;
+  refresh(): Promise<HubSessionAccount | null>;
+  login(username: string, password: string): Promise<HubSessionAccount | null>;
+  logout(): Promise<void>;
+  changePassword(current: string, next: string): Promise<void>;
+  close(): void;
+}
+/** Password sign-in from a page against a hub API; the hub session stays in the API's HttpOnly cookie. */
+export declare function hubSession(options: HubSessionOptions): HubSession;
 export default LiveClient;

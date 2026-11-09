@@ -408,3 +408,50 @@ test('browser session authenticates password hub pair and renewal', async () => 
   assert.equal(renewed.status, 200, renewed.text);
   assert.ok(renewed.body.ticket);
 });
+
+test('a password change ends the browser session and clears its cookie; a wrong current password changes nothing', async () => {
+  await admin.createAccount({ username: 'api-change', role: 'user', password: 'test-password-change-123' });
+  const app = await serve({ hubId: 'api-change' });
+  const login = await app.request('login', { body: { username: 'api-change', password: 'test-password-change-123' } });
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  assert.equal((await app.request('password', { body: { current: 'test-password-change-123', next: 'x' } })).status, 401, 'a change without a session');
+  const wrong = await app.request('password', { headers: { cookie }, body: { current: 'not-the-password-123', next: 'test-password-new-12345' } });
+  assert.equal(wrong.status, 401);
+  assert.equal((await app.request('me', { method: 'GET', headers: { cookie } })).status, 200, 'a refused change ended the session');
+  assert.equal((await app.request('password', { headers: { cookie }, body: { current: 'test-password-change-123' } })).status, 400);
+  const changed = await app.request('password', { headers: { cookie }, body: { current: 'test-password-change-123', next: 'test-password-new-12345' } });
+  assert.equal(changed.status, 200, changed.text);
+  assert.match(changed.headers.get('set-cookie'), /Max-Age=0/);
+  assert.equal((await app.request('me', { method: 'GET', headers: { cookie } })).status, 401);
+  assert.equal((await app.request('login', { body: { username: 'api-change', password: 'test-password-change-123' } })).status, 401);
+  assert.equal((await app.request('login', { body: { username: 'api-change', password: 'test-password-new-12345' } })).status, 200);
+  for (const text of seen) assert.ok(!text.includes('test-password-'), 'a password reached a response');
+});
+
+test('logging out a session the service already ended still clears the cookie', async () => {
+  await admin.createAccount({ username: 'api-ended', role: 'user', password: 'test-password-ended-123' });
+  const app = await serve({ hubId: 'api-ended' });
+  const login = await app.request('login', { body: { username: 'api-ended', password: 'test-password-ended-123' } });
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  await admin.updateAccount('api-ended', { password: 'test-password-reset-12345' });
+  assert.equal((await app.request('me', { method: 'GET', headers: { cookie } })).status, 401);
+  const out = await app.request('logout', { headers: { cookie }, body: {} });
+  assert.equal(out.status, 200, out.text);
+  assert.match(out.headers.get('set-cookie'), /Max-Age=0/);
+});
+
+test('an external hub keeps its sign-ins on the remote service that owns the accounts', async () => {
+  const remote = await startHub({ LIVEENGINE_RATE_LIMIT_REQUESTS: '10000' });
+  try {
+    const owner = new HubClient(remote.address, { token: ADMIN_TOKEN });
+    await owner.createAccount({ username: 'api-remote', role: 'user', password: 'test-password-remote-123' });
+    const app = await serve({ hubId: 'api-external', mode: 'external', remote: { address: remote.address, hubId: 'api-external', token: ADMIN_TOKEN } });
+    const login = await app.request('login', { body: { username: 'api-remote', password: 'test-password-remote-123' } });
+    assert.equal(login.status, 200, login.text);
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+    assert.equal((await app.request('me', { method: 'GET', headers: { cookie } })).body.username, 'api-remote');
+    await assert.rejects(admin.login('api-remote', 'test-password-remote-123'), error => error.status === 401, 'the central service knows the remote account');
+    assert.equal((await app.request('logout', { headers: { cookie }, body: {} })).status, 200);
+    assert.equal((await app.request('me', { method: 'GET', headers: { cookie } })).status, 401);
+  } finally { await remote.stop(); }
+});

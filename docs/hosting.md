@@ -323,7 +323,8 @@ can administer the service. Keep session tokens secret.
 `LIVEENGINE_PASSWORD_ITERATIONS` defaults to 310000 (minimum 100000),
 `LIVEENGINE_SESSION_TTL_SECONDS` defaults to 43200, and
 `LIVEENGINE_LOGIN_MAX_FAILURES` defaults to 5 in 15 minutes. Failed logins
-are subject to per-name and per-address backoff. With `LIVEENGINE_STATE_FILE`,
+are subject to per-name and per-address backoff; an address may hold ten times a
+name's budget, because many people sign in through one hub API address. With `LIVEENGINE_STATE_FILE`,
 accounts and hashed session tokens persist in the protected state file; they
 are never included in registry exports.
 

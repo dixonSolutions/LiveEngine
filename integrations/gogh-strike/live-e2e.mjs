@@ -66,6 +66,7 @@ const remoteToken = secret();
 const USER_TOKEN = `gogh-player-${secret()}`;
 const AUTH_USER = 'gogh-e2e-auth-player';
 const WRONG_TOKEN = `wrong-${secret()}`;
+const authToken = secret();
 
 // A TCP proxy for the hub's live socket. Each connection is tagged with the User-Agent of the
 // browser context that opened it, so one player's connection can be cut or held down alone.
@@ -336,6 +337,57 @@ async function exchange(from, to, n) {
   return frame.via;
 }
 
+// ---- password sign-in: the panel's sign-in area and the hub API's admin console ----
+
+const secrets = new Set();
+/** A throwaway password, made per run and masked in any failure line. */
+function password() { const value = secret(); secrets.add(value); return value; }
+const mask = text => [...secrets].reduce((out, value) => out.replaceAll(value, '[secret]'), String(text));
+const shotDir = process.env.GOGH_E2E_SHOTS;
+/** Save a screenshot when GOGH_E2E_SHOTS names a directory. */
+async function shot(target, name) { if (shotDir) await target.screenshot({path: path.join(shotDir, `auth-${name}.png`)}); }
+/** Click into a field and type into it, key by key, as typeAddress does: this Chromium ignores fill with a value. */
+async function enter(field, value) {
+  await field.click();
+  await field.fill('');
+  await field.pressSequentially(value);
+  assert.equal(await field.inputValue(), value, 'the field did not take what was typed');
+}
+async function signIn(player, username, secretWord) {
+  await enter(player.page.locator('#signin-username'), username);
+  await enter(player.page.locator('#signin-password'), secretWord);
+  await player.page.locator('#signin-submit').click();
+}
+const signedInAs = (player, name, role) => player.page.waitForFunction(text => document.querySelector('#signedin-as')?.textContent === text, `Signed in as ${name} (${role})`, {timeout: 30_000})
+  .catch(async error => { throw new Error(`${player.label} never showed "Signed in as ${name} (${role})": ${await panelText(player)}; ${error.message.split('\n')[0]}`); });
+const waitError = (player, pattern, ms = 30_000) => player.page.waitForFunction(([source, flags]) => new RegExp(source, flags).test(document.querySelector('#online-error')?.hidden ? '' : document.querySelector('#online-error')?.textContent || ''), [pattern.source, pattern.flags], {timeout: ms})
+  .catch(async error => { throw new Error(`${player.label} never showed an error matching ${pattern}: ${await panelText(player)}; ${error.message.split('\n')[0]}`); });
+/** Open the admin console from the signed-in admin's link. It opens in a new tab of the same browser. */
+async function openConsole(player) {
+  const [popup] = await Promise.all([player.context.waitForEvent('page'), player.page.locator('#admin-link').click()]);
+  popup.setDefaultTimeout(30_000);
+  popup.on('pageerror', error => { player.errors.push(`console: ${error.message}`); pageErrors.push(`${player.label} console: ${error.message}`); });
+  await popup.waitForLoadState('domcontentloaded');
+  await popup.getByRole('heading', {name: 'Hub administration'}).waitFor();
+  return popup;
+}
+const accountRow = (popup, name) => popup.locator('#accounts tr').filter({has: popup.getByRole('cell', {name, exact: true})});
+async function createAccount(popup, username, secretWord, role) {
+  await enter(popup.locator('input[name=username]'), username);
+  await enter(popup.locator('input[name=password]'), secretWord);
+  await popup.locator('select[name=role]').selectOption(role);
+  await popup.getByRole('button', {name: 'Create account'}).click();
+  await popup.waitForFunction(() => /Account created/.test(document.querySelector('#message')?.textContent || ''), null, {timeout: 20_000})
+    .catch(async error => { throw new Error(`the console did not confirm creating ${username}; it says "${await popup.locator('#message').textContent()}"; ${error.message.split('\n')[0]}`); });
+}
+/** Kick a player from the console's connection list, refreshing until their connection shows. */
+async function kick(popup, user) {
+  const button = popup.getByRole('button', {name: `Kick ${user}`, exact: true});
+  await until(async () => { await popup.locator('#refresh-connections').click(); await sleep(250); return button.isVisible(); }, `${user} in the console's connection list`, 20_000);
+  await button.click();
+  await popup.waitForFunction(() => /Connection kicked/.test(document.querySelector('#message')?.textContent || ''), null, {timeout: 20_000});
+}
+
 // ---- scenarios ----
 
 const results = [];
@@ -357,7 +409,7 @@ async function scenario(name, run) {
     results.push({name, ok: false});
     const where = await diagnose();
     await finish();
-    console.log(`FAIL ${name} | ${String(error?.message || error).replaceAll(centralToken, '[token]').replaceAll(remoteToken, '[token]')}${where ? `\n  pages: ${where}` : ''} (${((Date.now() - started) / 1000).toFixed(1)}s)`);
+    console.log(`FAIL ${name} | ${mask(String(error?.message || error).replaceAll(centralToken, '[token]').replaceAll(remoteToken, '[token]').replaceAll(authToken, '[token]'))}${where ? `\n  pages: ${where}` : ''} (${((Date.now() - started) / 1000).toFixed(1)}s)`);
   }
 }
 
@@ -366,9 +418,9 @@ const once = factory => { let promise; return () => (promise ||= factory()); };
 
 async function main() {
   const chromium = await loadChromium();
-  const ports = await Promise.all(Array.from({length: 19}, () => freePort()));
+  const ports = await Promise.all(Array.from({length: 20}, () => freePort()));
   const [portNested, portPeer, portRelay, portLinkA, portLinkB, portReconnect, portWatch, portSchema,
-    portUi, portFour, portCancel, portPage, portApi, portOther, portWrongPath, portCorrect, portClosed, portSeat, portCapacity] = ports;
+    portUi, portFour, portCancel, portPage, portApi, portOther, portWrongPath, portCorrect, portClosed, portSeat, portCapacity, portExternal] = ports;
   const origins = ports.map(port => `http://127.0.0.1:${port}`).join(',');
   const common = {LIVEENGINE_LIVE_ALLOWED_ORIGINS: origins, LIVEENGINE_ALLOWED_REMOTE_HOSTS: '127.0.0.1', LIVEENGINE_ICE_SERVERS: '[]',
     // One bridge, the test and every player share the loopback address, so the default budget of 120 requests a minute is too small.
@@ -949,19 +1001,395 @@ async function main() {
     return 'three rooms of two; the waiting player matched with the sixth';
   });
 
+  // ---- Password sign-in: accounts, roles and admin tools, driven through the front screen and the admin console ----
+  // One extra service owns the accounts for 16 to 21 and 23; 22 uses the second service ("remote"), which owns an external hub's accounts.
+  const authPorts = await Promise.all(Array.from({length: 9}, () => freePort()));
+  const authSetup = once(async () => {
+    const service = await startHub({LIVEENGINE_TOKEN: authToken, LIVEENGINE_PASSWORD_ITERATIONS: '100000', LIVEENGINE_ALLOWED_REMOTE_HOSTS: '127.0.0.1',
+      LIVEENGINE_LIVE_ALLOWED_ORIGINS: authPorts.map(port => `http://127.0.0.1:${port}`).join(','), LIVEENGINE_ICE_SERVERS: '[]', LIVEENGINE_RATE_LIMIT_REQUESTS: '100000'});
+    onClose(() => service.stop());
+    const admin = new HubClient(service.address, {token: authToken});
+    const adminPassword = password();
+    await admin.createAccount({username: 'root-e2e', password: adminPassword, role: 'admin'});
+    return {service, admin, adminPassword};
+  });
+  const authBridge = async (port, hubId, env = {}) => {
+    const {service} = await authSetup();
+    return startBridge(port, service.address, authToken, {LIVEENGINE_HUB_ID: hubId, GOGH_HUB_AUTH_PASSWORD: '1', GOGH_LIVE_LINK: 'peer', ...env});
+  };
+  /** An account made through the API, as an admin would have made it in the console. Returns its password. */
+  const makeUser = async (name, role = 'user', admin) => {
+    const secretWord = password();
+    await (admin || (await authSetup()).admin).createAccount({username: name, password: secretWord, role});
+    return secretWord;
+  };
+  /** The admin signs in on the front screen and opens the console from its link. */
+  async function adminConsole(label, bridge) {
+    const {adminPassword} = await authSetup();
+    const admin = await openPlayer(label, bridge.base, {online: true});
+    await connectPanel(admin, bridge.base);
+    await signIn(admin, 'root-e2e', adminPassword);
+    await signedInAs(admin, 'root-e2e', 'admin');
+    const popup = await openConsole(admin);
+    return {admin, popup};
+  }
+
+  await scenario('16 sign-in: an admin creates accounts in the console, a user signs in, a wrong password is refused, a user cannot open the console', async () => {
+    const bridge = await authBridge(authPorts[0], 'gogh-auth-a');
+    const {adminPassword} = await authSetup();
+    const admin = await openPlayer('auth-admin', bridge.base, {online: true});
+    await admin.page.setViewportSize({width: 1000, height: 900});
+    await connectPanel(admin, bridge.base);
+    // Signed out: the sign-in area is there, the hub says what it needs and Find match waits for a sign-in.
+    assert.equal(await admin.page.locator('#signin-form').isVisible(), true, 'no sign-in form');
+    assert.equal(await admin.page.locator('#signedin').isVisible(), false);
+    assert.equal(await admin.page.locator('#online-find').isDisabled(), true, 'Find match is open to a signed-out player');
+    assert.match(await matchText(admin), /Sign in to find a match/);
+    await shot(admin.page.locator('#online-panel'), 'signed-out');
+    // The wrong password, and an unknown user, get the same plain words.
+    await signIn(admin, 'root-e2e', password());
+    await waitError(admin, /Wrong username or password/);
+    await signIn(admin, 'nobody-e2e', password());
+    await waitError(admin, /^Wrong username or password\.$/);
+    assert.equal(await admin.page.locator('#signedin').isVisible(), false);
+    await signIn(admin, 'root-e2e', adminPassword);
+    await signedInAs(admin, 'root-e2e', 'admin');
+    assert.equal(await admin.page.locator('#admin-link').isVisible(), true, 'an admin sees no link to the console');
+    assert.equal(await admin.page.locator('#online-error').isHidden(), true, 'the error stayed after signing in');
+    // The hub API keeps the hub session in an HttpOnly cookie; the page never holds it.
+    assert.equal(await admin.page.evaluate(() => document.cookie), '', 'a cookie is readable by the page');
+    const cookie = (await admin.context.cookies()).find(entry => entry.name === 'liveengine_session');
+    assert.ok(cookie?.httpOnly && cookie.sameSite === 'Strict', `session cookie: ${JSON.stringify(cookie && {...cookie, value: '[value]'})}`);
+    await shot(admin.page.locator('#online-panel'), 'signed-in');
+    // The console: create two accounts.
+    const popup = await openConsole(admin);
+    const aliceSecret = password(), bobSecret = password();
+    await createAccount(popup, 'alice-a', aliceSecret, 'user');
+    await createAccount(popup, 'bob-a', bobSecret, 'admin');
+    await accountRow(popup, 'alice-a').waitFor();
+    assert.match(await accountRow(popup, 'bob-a').innerText(), /bob-a\s+Yes\s+admin/);
+    await shot(popup, 'admin-console');
+    // A password under ten characters is not accepted: the form will not send it and no account appears.
+    await enter(popup.locator('input[name=username]'), 'short-a');
+    await enter(popup.locator('input[name=password]'), 'short');
+    await popup.getByRole('button', {name: 'Create account'}).click();
+    await sleep(500);
+    assert.equal(await accountRow(popup, 'short-a').count(), 0, 'an account with a short password was created');
+    // The new user signs in on the front screen. No admin link; the console refuses them.
+    const alice = await openPlayer('auth-alice', bridge.base, {online: true});
+    await connectPanel(alice, bridge.base);
+    await signIn(alice, 'alice-a', aliceSecret);
+    await signedInAs(alice, 'alice-a', 'user');
+    assert.equal(await alice.page.locator('#admin-link').isVisible(), false, 'a user sees the console link');
+    const probe = await alice.context.newPage();
+    const refused = await probe.goto(`${bridge.base}/api/liveengine/admin`);
+    assert.equal(refused.status(), 403);
+    assert.match(await probe.locator('body').innerText(), /Administrator access required/);
+    const listed = await probe.evaluate(async () => (await fetch('/api/liveengine/admin/accounts')).status);
+    assert.equal(listed, 403, 'a user listed accounts through the console route');
+    const signedOutContext = await browser.newContext();
+    onClose(() => signedOutContext.close());
+    const anonymous = await signedOutContext.newPage();
+    assert.equal((await anonymous.goto(`${bridge.base}/api/liveengine/admin`)).status(), 401);
+    // Sign out puts the form back and drops the cookie.
+    await alice.page.locator('#signout').click();
+    await alice.page.waitForSelector('#signin-form:not([hidden])');
+    assert.equal((await alice.context.cookies()).some(entry => entry.name === 'liveengine_session' && entry.value), false, 'the cookie survived signing out');
+    assert.equal(await alice.page.evaluate(async () => (await fetch('/api/liveengine/me')).status), 401);
+    assert.equal(admin.errors.length + alice.errors.length, 0, `page errors: ${[...admin.errors, ...alice.errors].join('; ')}`);
+    return 'wrong password and unknown user refused alike; two accounts created in the console; user refused the console (403), anonymous 401; HttpOnly SameSite=Strict cookie';
+  });
+
+  await scenario('17 two signed-in users find a match peer to peer and each sees the other\'s username', async () => {
+    const bridge = await authBridge(authPorts[1], 'gogh-auth-b');
+    const [passA, passB] = [await makeUser('alice-b'), await makeUser('bob-b')];
+    const [a, b] = await twoPlayers(['auth-b-alice', 'auth-b-bob'], bridge.base, [{online: true}, {online: true}]);
+    await Promise.all([connectPanel(a, bridge.base), connectPanel(b, bridge.base)]);
+    await signIn(a, 'alice-b', passA);
+    await signIn(b, 'bob-b', passB);
+    await Promise.all([signedInAs(a, 'alice-b', 'user'), signedInAs(b, 'bob-b', 'user')]);
+    await findMatch(a);
+    await waitPhase(a, 'searching');
+    await findMatch(b);
+    await Promise.all([reachDirect(a), reachDirect(b)]);
+    assert.match(await matchText(a), /Matched with bob-b \(user\)\./);
+    assert.match(await matchText(b), /Matched with alice-b \(user\)\./);
+    await Promise.all([instrument(a), instrument(b)]);
+    const [ia, ib] = await Promise.all([sessionInfo(a), sessionInfo(b)]);
+    assert.deepEqual([ia.id, ib.id], ['alice-b', 'bob-b'], 'the player ids are not the usernames');
+    assert.deepEqual(ia.identity, {identity: 'alice-b', claims: {role: 'user'}});
+    assert.equal(await a.page.evaluate(() => window.__e2e.session.identityOf('bob-b')?.identity), 'bob-b');
+    assert.equal(await b.page.evaluate(() => window.__e2e.session.identityOf('alice-b')?.identity), 'alice-b');
+    const via = [await exchange(a, b, 31), await exchange(b, a, 32)];
+    assert.deepEqual(via, ['direct', 'direct'], 'frames did not travel peer to peer');
+    // Without a session the hub API refuses to pair, whatever id is asked for.
+    const unsigned = await bridge.post('pair', {userId: 'mallory-b'});
+    assert.equal(unsigned.status, 403, `an unsigned pair answered ${unsigned.status}: ${JSON.stringify(unsigned.body)}`);
+    const ids = await playBoth(a, b);
+    const moved = await seeEachOther(a, b, ids);
+    assert.equal(a.errors.length + b.errors.length, 0, `page errors: ${[...a.errors, ...b.errors].join('; ')}`);
+    return `alice-b and bob-b matched directly, each shown by name; ${moved}`;
+  });
+
+  await scenario('18 the admin kicks one player in the console: they see they were removed and can rejoin', async () => {
+    const bridge = await authBridge(authPorts[2], 'gogh-auth-c');
+    const [passA, passB] = [await makeUser('alice-c'), await makeUser('bob-c')];
+    const {popup} = await adminConsole('auth-c-admin', bridge);
+    const [a, b] = await twoPlayers(['auth-c-alice', 'auth-c-bob'], bridge.base, [{online: true}, {online: true}]);
+    await Promise.all([connectPanel(a, bridge.base), connectPanel(b, bridge.base)]);
+    await signIn(a, 'alice-c', passA);
+    await signIn(b, 'bob-c', passB);
+    await Promise.all([signedInAs(a, 'alice-c', 'user'), signedInAs(b, 'bob-c', 'user')]);
+    await findMatch(a);
+    await waitPhase(a, 'searching');
+    await findMatch(b);
+    await Promise.all([reachDirect(a), reachDirect(b)]);
+    await Promise.all([instrument(a), instrument(b)]);
+    await kick(popup, 'alice-c');
+    await waitError(a, /You were removed from the match by an admin/);
+    await waitPhase(a, 'connected');
+    assert.equal(await a.page.evaluate(() => window.__e2e.session.state), 'closed');
+    // It stays down: no reconnect, and she is still signed in.
+    const before = a.requests.filter(url => /\/(pair|renew)$/.test(url)).length;
+    await sleep(3000);
+    assert.equal(a.requests.filter(url => /\/(pair|renew)$/.test(url)).length, before, 'the kicked player reconnected by itself');
+    assert.equal(await a.page.evaluate(() => window.__e2e.session.state), 'closed');
+    assert.equal(await a.page.locator('#signedin-as').textContent(), 'Signed in as alice-c (user)');
+    await until(async () => !(await sessionInfo(b)).peers.includes('alice-c'), 'bob to see alice leave');
+    // She can rejoin: Find match pairs her with bob again.
+    await findMatch(a);
+    await Promise.all([reachDirect(a), reachDirect(b)]);
+    await instrument(a);
+    await until(async () => (await sessionInfo(b)).peers.includes('alice-c'), 'bob to see alice return');
+    assert.equal(await a.page.locator('#online-error').isHidden(), true, 'the removal notice stayed after rejoining');
+    const via = [await exchange(a, b, 41), await exchange(b, a, 42)];
+    assert.deepEqual(via, ['direct', 'direct']);
+    assert.equal(a.errors.length + b.errors.length, 0, `page errors: ${[...a.errors, ...b.errors].join('; ')}`);
+    return `alice-c removed (no reconnect, still signed in), then matched with bob-c again; frames ${via.join('/')}`;
+  });
+
+  await scenario('19 the admin disables one player: thrown out with the disabled message, cannot sign in, can after re-enabling', async () => {
+    const bridge = await authBridge(authPorts[3], 'gogh-auth-d');
+    const [passA, passB] = [await makeUser('alice-d'), await makeUser('bob-d')];
+    const {popup} = await adminConsole('auth-d-admin', bridge);
+    const [a, b] = await twoPlayers(['auth-d-alice', 'auth-d-bob'], bridge.base, [{online: true}, {online: true}]);
+    await Promise.all([connectPanel(a, bridge.base), connectPanel(b, bridge.base)]);
+    await signIn(a, 'alice-d', passA);
+    await signIn(b, 'bob-d', passB);
+    await Promise.all([signedInAs(a, 'alice-d', 'user'), signedInAs(b, 'bob-d', 'user')]);
+    await findMatch(a);
+    await waitPhase(a, 'searching');
+    await findMatch(b);
+    await Promise.all([reachDirect(a), reachDirect(b)]);
+    await Promise.all([instrument(a), instrument(b)]);
+    await accountRow(popup, 'alice-d').getByRole('button', {name: 'Disable'}).click();
+    await popup.waitForFunction(() => /Account updated/.test(document.querySelector('#message')?.textContent || ''));
+    await waitError(a, /Your account was disabled by an admin/);
+    await a.page.waitForSelector('#signin-form:not([hidden])', {timeout: 20_000});
+    assert.equal(await a.page.evaluate(() => window.__e2e.session.state), 'closed');
+    assert.equal(await a.page.locator('#online-find').isDisabled(), true, 'a disabled player can search');
+    assert.match(await a.page.locator('#online-error').textContent(), /disabled by an admin/, 'the notice was replaced');
+    await until(async () => !(await sessionInfo(b)).peers.includes('alice-d'), 'bob to see alice leave');
+    // She cannot sign in, and the page says so without saying why.
+    await signIn(a, 'alice-d', passA);
+    await waitError(a, /^Wrong username or password\.$/);
+    assert.equal(await a.page.locator('#signedin').isVisible(), false);
+    // Re-enabled, she signs in and plays with bob again.
+    await accountRow(popup, 'alice-d').getByRole('button', {name: 'Enable'}).click();
+    await popup.waitForFunction(() => /Account updated/.test(document.querySelector('#message')?.textContent || ''));
+    await signIn(a, 'alice-d', passA);
+    await signedInAs(a, 'alice-d', 'user');
+    await findMatch(a);
+    await Promise.all([reachDirect(a), reachDirect(b)]);
+    await instrument(a);
+    const via = [await exchange(a, b, 51), await exchange(b, a, 52)];
+    assert.deepEqual(via, ['direct', 'direct']);
+    assert.equal(a.errors.length + b.errors.length, 0, `page errors: ${[...a.errors, ...b.errors].join('; ')}`);
+    return `alice-d thrown out with the disabled message and signed out, refused at sign-in, back after enabling; frames ${via.join('/')}`;
+  });
+
+  await scenario('20 a password changed in one tab signs the other tab out and closes its live connection', async () => {
+    const bridge = await authBridge(authPorts[4], 'gogh-auth-e');
+    const [passA, passB] = [await makeUser('alice-e'), await makeUser('bob-e')];
+    const [a, b] = await twoPlayers(['auth-e-alice', 'auth-e-bob'], bridge.base, [{online: true}, {online: true}]);
+    await Promise.all([connectPanel(a, bridge.base), connectPanel(b, bridge.base)]);
+    await signIn(a, 'alice-e', passA);
+    await signIn(b, 'bob-e', passB);
+    await Promise.all([signedInAs(a, 'alice-e', 'user'), signedInAs(b, 'bob-e', 'user')]);
+    await findMatch(a);
+    await waitPhase(a, 'searching');
+    await findMatch(b);
+    await Promise.all([reachDirect(a), reachDirect(b)]);
+    await Promise.all([instrument(a), instrument(b)]);
+    // A second tab of the same browser: it shares the sign-in.
+    const tab = await a.context.newPage();
+    tab.setDefaultTimeout(90_000);
+    const tabErrors = [];
+    tab.on('pageerror', error => tabErrors.push(error.message));
+    await tab.goto(`${bridge.base}/?test`, {waitUntil: 'domcontentloaded'});
+    await tab.waitForSelector('#deploy-button:not(:disabled)');
+    await tab.locator('#online-connect').click();
+    await tab.waitForFunction(() => /^Signed in as alice-e \(user\)$/.test(document.querySelector('#signedin-as')?.textContent || ''), null, {timeout: 30_000});
+    // A wrong current password is refused and changes nothing.
+    const fresh = password();
+    await tab.locator('#password-change summary').click();
+    await enter(tab.locator('#password-current'), password());
+    await enter(tab.locator('#password-next'), fresh);
+    await tab.locator('#password-submit').click();
+    await tab.waitForFunction(() => /current password is wrong/.test(document.querySelector('#online-error')?.textContent || ''), null, {timeout: 20_000});
+    assert.equal(await a.page.evaluate(() => window.__e2e.session.state), 'open', 'a refused change closed the match connection');
+    await enter(tab.locator('#password-current'), passA);
+    await tab.locator('#password-submit').click();
+    await tab.waitForSelector('#signin-form:not([hidden])', {timeout: 20_000});
+    assert.match(await tab.locator('#account-note').textContent(), /Password changed\. Sign in again/);
+    // The first tab is signed out and its live connection is closed, with a reason in plain words.
+    await a.page.waitForSelector('#signin-form:not([hidden])', {timeout: 30_000});
+    await until(async () => (await a.page.evaluate(() => window.__e2e.session.state)) !== 'open', 'the first tab\'s live connection to close', 20_000);
+    await waitError(a, /password or role was changed, so you were signed out/);
+    await waitPhase(a, 'connected');
+    assert.equal(await a.page.evaluate(async () => (await fetch('/api/liveengine/me')).status), 401, 'the old session still works');
+    await until(async () => !(await sessionInfo(b)).peers.includes('alice-e'), 'bob to see alice leave');
+    // The old password no longer signs in; the new one does, and she matches with bob again.
+    await signIn(a, 'alice-e', passA);
+    await waitError(a, /^Wrong username or password\.$/);
+    await signIn(a, 'alice-e', fresh);
+    await signedInAs(a, 'alice-e', 'user');
+    // Her seat went with her session; she searches afresh and joins bob's room again.
+    await findMatch(a);
+    await Promise.all([reachDirect(a), reachDirect(b)]);
+    await instrument(a);
+    const via = [await exchange(a, b, 71), await exchange(b, a, 72)];
+    assert.deepEqual(via, ['direct', 'direct']);
+    assert.equal(tabErrors.length + a.errors.length + b.errors.length, 0, `page errors: ${[...tabErrors, ...a.errors, ...b.errors].join('; ')}`);
+    return 'wrong current password refused; after the change the other tab was signed out and closed, the old password was refused and the new one signed in and rejoined bob';
+  });
+
+  await scenario('21 the admin resets a password while the player is mid-match: the connection closes and the old session is dead', async () => {
+    const bridge = await authBridge(authPorts[5], 'gogh-auth-f');
+    const [passA, passB] = [await makeUser('alice-f'), await makeUser('bob-f')];
+    const {popup} = await adminConsole('auth-f-admin', bridge);
+    const [a, b] = await twoPlayers(['auth-f-alice', 'auth-f-bob'], bridge.base, [{online: true}, {online: true}]);
+    await Promise.all([connectPanel(a, bridge.base), connectPanel(b, bridge.base)]);
+    await signIn(a, 'alice-f', passA);
+    await signIn(b, 'bob-f', passB);
+    await Promise.all([signedInAs(a, 'alice-f', 'user'), signedInAs(b, 'bob-f', 'user')]);
+    await findMatch(a);
+    await waitPhase(a, 'searching');
+    await findMatch(b);
+    await Promise.all([reachDirect(a), reachDirect(b)]);
+    const ids = await playBoth(a, b);
+    await seeEachOther(a, b, ids);
+    const reset = password();
+    const row = accountRow(popup, 'alice-f');
+    await enter(row.getByLabel('New password for alice-f'), reset);
+    await row.getByRole('button', {name: 'Reset password'}).click();
+    await popup.waitForFunction(() => /Password reset/.test(document.querySelector('#message')?.textContent || ''));
+    await until(async () => (await a.page.evaluate(() => window.__e2e.session.state)) !== 'open', 'alice\'s live connection to close', 20_000);
+    await waitError(a, /password or role was changed, so you were signed out/, 30_000);
+    await until(async () => (await a.page.evaluate(async () => (await fetch('/api/liveengine/me')).status)) === 401, 'the old session to stop working', 20_000);
+    await until(async () => !(await sessionInfo(b)).peers.includes('alice-f'), 'bob to see alice leave');
+    const {admin} = await authSetup();
+    await assert.rejects(admin.login('alice-f', passA), /invalid username or password/, 'the old password still signs in');
+    assert.equal((await admin.login('alice-f', reset)).account.username, 'alice-f');
+    assert.equal(await b.page.evaluate(() => window.__e2e.session.state), 'open', 'bob was disturbed');
+    return 'alice-f lost her connection and her session when her password was reset in the console; old password refused, new one works; bob stayed connected';
+  });
+
+  await scenario('22 an external hub with password auth through the central: accounts live on the remote service and sign-in works end to end', async () => {
+    const hubId = 'gogh-ext-pw';
+    const net = await import(pathToFileURL(path.join(gameRoot, 'src/liveengine-net.js')).href);
+    // The remote service owns the hub, its auth and its accounts; the central only lists it.
+    const known = new Set(((await adminR.listSchemas())?.schemas || []).map(entry => entry.ref));
+    for (const schema of net.LIVE_SCHEMAS) if (!known.has(`${schema.id}@${schema.version}`)) await adminR.createSchema(schema);
+    await adminR.register({id: hubId, mode: 'internal', scopes: {game: 'gogh-strike'}, channels: net.LIVE_CHANNELS, auth: {kind: 'password'}});
+    const [passA, passB] = [await makeUser('alice-g', 'user', adminR), await makeUser('bob-g', 'user', adminR)];
+    const bridge = await startBridge(portExternal, central.address, centralToken, {LIVEENGINE_HUB_ID: hubId, LIVEENGINE_HUB_MODE: 'external',
+      LIVEENGINE_REMOTE_ADDRESS: remote.address, LIVEENGINE_REMOTE_TOKEN: remoteToken, GOGH_HUB_AUTH_PASSWORD: '1'});
+    await bridge.warm();
+    assert.equal((await adminC.list()).hubs.find(hub => hub.id === hubId)?.mode, 'external', 'the central does not list the hub as external');
+    await assert.rejects(adminC.login('alice-g', passA), /invalid username or password/, 'the central knows the remote service\'s account');
+    assert.equal((await bridge.post('pair', {userId: 'alice-g'})).status, 403, 'an unsigned player paired');
+    const [a, b] = await twoPlayers(['auth-g-alice', 'auth-g-bob'], bridge.base, [{online: true}, {online: true}]);
+    await Promise.all([connectPanel(a, bridge.base), connectPanel(b, bridge.base)]);
+    await signIn(a, 'alice-g', 'wrong-password-' + password());
+    await waitError(a, /^Wrong username or password\.$/);
+    await signIn(a, 'alice-g', passA);
+    await signIn(b, 'bob-g', passB);
+    await Promise.all([signedInAs(a, 'alice-g', 'user'), signedInAs(b, 'bob-g', 'user')]);
+    await findMatch(a);
+    await findMatch(b);
+    await Promise.all([waitPhase(a, 'matched'), waitPhase(b, 'matched')]);
+    await Promise.all([instrument(a), instrument(b)]);
+    const [ia, ib] = await Promise.all([sessionInfo(a), sessionInfo(b)]);
+    assert.deepEqual([ia.id, ib.id], ['alice-g', 'bob-g']);
+    assert.deepEqual(ia.identity, {identity: 'alice-g', claims: {role: 'user'}});
+    assert.equal(ia.room, ib.room);
+    await until(async () => (await sessionInfo(a)).peers.includes('bob-g') && (await sessionInfo(b)).peers.includes('alice-g'), 'both players to see each other');
+    await a.page.waitForFunction(() => /bob-g \(user\)/.test(document.querySelector('#online-match')?.textContent || ''), null, {timeout: 20_000});
+    const url = new URL(await a.page.evaluate(() => window.__e2e.session._descriptor.url));
+    assert.equal(`${url.protocol}//${url.host}`, remote.address.replace(/^http/, 'ws'), 'the player did not connect to the remote service');
+    const via = [await exchange(a, b, 61), await exchange(b, a, 62)];
+    assert.equal(a.errors.length + b.errors.length, 0, `page errors: ${[...a.errors, ...b.errors].join('; ')}`);
+    return `accounts on the remote service only; alice-g and bob-g signed in, matched on ${url.host}, identities verified, frames ${via.join('/')}`;
+  });
+
+  await scenario('23 ten users signed in at once, matched into rooms, every one exchanging data and shown under their own name', async () => {
+    const crowd = 10;
+    const bridge = await authBridge(authPorts[6], 'gogh-auth-h', {GOGH_MATCH_CAPACITY: '5'});
+    const names = Array.from({length: crowd}, (_, index) => `crowd-h-${index}`);
+    const secrets = new Map();
+    for (const name of names) secrets.set(name, await makeUser(name));
+    const users = await Promise.all(names.map(name => openPlayer(`auth-${name}`, bridge.base, {online: true})));
+    await Promise.all(users.map(user => connectPanel(user, bridge.base)));
+    await Promise.all(users.map((user, index) => signIn(user, names[index], secrets.get(names[index]))));
+    await Promise.all(users.map((user, index) => signedInAs(user, names[index], 'user')));
+    await Promise.all(users.map(findMatch));
+    await Promise.all(users.map(reachDirect));
+    await Promise.all(users.map(instrument));
+    const infos = await Promise.all(users.map(sessionInfo));
+    infos.forEach((info, index) => assert.equal(info.id, names[index], `${users[index].label} plays as ${info.id}`));
+    const rooms = new Map();
+    infos.forEach((info, index) => rooms.set(info.room, [...(rooms.get(info.room) || []), index]));
+    assert.equal([...rooms.values()].flat().length, crowd, 'a player is in no room or in two');
+    for (const [room, members] of rooms) {
+      assert.ok(members.length >= 2, `room ${room} holds a lone player`);
+      const seated = (await (await authSetup()).admin.call('gogh-auth-h', 'getServer', [room])).members;
+      assert.deepEqual([...seated].sort(), members.map(index => names[index]).sort(), `the hub's members of ${room} differ from the pages'`);
+    }
+    const via = [];
+    let n = 200;
+    for (const [index, info] of infos.entries()) {
+      const mates = rooms.get(info.room).filter(other => other !== index).map(other => names[other]).sort();
+      assert.deepEqual([...info.peers].sort(), mates, `${users[index].label} does not see exactly its roommates`);
+      // Every roommate is shown under its own verified name, in the panel and in the session.
+      const text = await matchText(users[index]);
+      for (const mate of mates) {
+        assert.ok(text.includes(`${mate} (user)`), `${users[index].label} does not show ${mate}: ${text}`);
+        assert.equal(await users[index].page.evaluate(id => window.__e2e.session.identityOf(id)?.identity, mate), mate);
+      }
+      assert.equal(await users[index].page.locator('#signedin-as').textContent(), `Signed in as ${names[index]} (user)`);
+    }
+    for (const members of rooms.values()) for (const from of members) for (const to of members) if (from !== to) via.push(await exchange(users[from], users[to], n++));
+    assert.ok(via.every(kind => kind === 'direct'), `frames did not travel over the data channel: ${via}`);
+    const ping = await apiPing(bridge);
+    assert.deepEqual([ping.waiting, ping.seats], [0, crowd]);
+    assert.equal(users.reduce((sum, user) => sum + user.errors.length, 0), 0, 'page errors');
+    return `rooms ${[...rooms.values()].map(members => members.length).join('+')}, ${via.length} pairwise frames ${[...new Set(via)].join('/')}, ten names shown`;
+  });
+
 }
 
 for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => closeAll().finally(() => process.exit(130)));
 try {
   await main();
 } catch (error) {
-  console.log(`FAIL setup | ${String(error?.stack || error).replaceAll(centralToken, '[token]').replaceAll(remoteToken, '[token]')}`);
+  console.log(`FAIL setup | ${mask(String(error?.stack || error).replaceAll(centralToken, '[token]').replaceAll(remoteToken, '[token]').replaceAll(authToken, '[token]'))}`);
   results.push({name: 'setup', ok: false});
 } finally {
   await closeAll();
 }
 // A scenario that never ran (its setup broke) is a failure, not a skip.
-for (let number = 1; number <= 15; number++) {
+for (let number = 1; number <= 23; number++) {
   if (results.some(result => result.name.startsWith(`${number} `))) continue;
   results.push({name: `${number}`, ok: false});
   console.log(`FAIL ${number} | did not run: setup failed`);

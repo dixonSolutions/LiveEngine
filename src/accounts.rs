@@ -105,6 +105,17 @@ impl Accounts {
             max_failures: setting("LIVEENGINE_LOGIN_MAX_FAILURES", 5, 1, 1000)? as u32,
         })
     }
+    /// Most attempts one key may hold, in flight or failed, within the window. A username gets
+    /// `max_failures`. An address gets ten times that, because many people share one (a hub API in
+    /// front of the service, a NAT) and sign in together; their attempts reserve budget while
+    /// they hash, so a tight address budget would refuse honest, concurrent logins.
+    fn failure_limit(&self, key: &str) -> u32 {
+        if key.starts_with("p:") {
+            self.max_failures.saturating_mul(10)
+        } else {
+            self.max_failures
+        }
+    }
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -450,9 +461,9 @@ pub(crate) async fn login(
                 until: 0,
             });
             entry.count = entry.count.saturating_add(1);
-            if entry.count >= s.accounts.max_failures {
-                entry.until = time
-                    .saturating_add(1 + (1u64 << (entry.count - s.accounts.max_failures).min(10)));
+            let limit = s.accounts.failure_limit(key);
+            if entry.count >= limit {
+                entry.until = time.saturating_add(1 + (1u64 << (entry.count - limit).min(10)));
             }
         }
     }
@@ -522,7 +533,7 @@ pub(crate) async fn login(
         for key in &keys {
             if let Some(entry) = failures.get_mut(key) {
                 entry.count = entry.count.saturating_sub(1);
-                if entry.count < s.accounts.max_failures {
+                if entry.count < s.accounts.failure_limit(key) {
                     entry.until = 0;
                 }
             }
@@ -681,6 +692,43 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             state.accounts.max_failures as usize
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn honest_logins_from_one_address_in_parallel_are_not_refused() {
+        let state = setup().await;
+        let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 4000));
+        let mut tasks = Vec::new();
+        for i in 0..12 {
+            let state = state.clone();
+            tasks.push(tokio::spawn(async move {
+                let created = create(
+                    State(state.clone()),
+                    Json(Create {
+                        username: format!("player-{i}"),
+                        password: "correct-password-123".into(),
+                        role: "user".into(),
+                        enabled: true,
+                        claims: None,
+                    }),
+                )
+                .await;
+                assert_eq!(created.status(), StatusCode::CREATED);
+                login(
+                    State(state),
+                    Some(axum::Extension(ConnectInfo(peer))),
+                    Json(Login {
+                        username: format!("player-{i}"),
+                        password: "correct-password-123".into(),
+                    }),
+                )
+                .await
+                .status()
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), StatusCode::OK);
+        }
     }
 
     #[tokio::test]

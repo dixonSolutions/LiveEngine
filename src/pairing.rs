@@ -49,10 +49,29 @@ fn seat_key(id: &str, scopes: &Value) -> SeatKey {
 
 /// Peers whose `pair` request is waiting for a partner. Guarded by one mutex that is
 /// never held across an await, so a claim removes the waiter and the claimer together.
-#[derive(Default)]
 pub(crate) struct PendingPairs {
     state: Mutex<(u64, HashMap<SeatKey, Waiting>)>,
+    /// Counts the changes a waiting peer may want to look again for: a peer joined the queue, or a
+    /// pairing completed. A waiter that could not use a candidate yet watches it.
+    changes: tokio::sync::watch::Sender<u64>,
 }
+
+impl Default for PendingPairs {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new((0, HashMap::new())),
+            changes: tokio::sync::watch::channel(0).0,
+        }
+    }
+}
+
+/// Marks the answer of a pairing attempt that found a candidate it could not yet use, because a
+/// password hub needs that candidate's own session and the candidate had not queued its request.
+#[derive(Clone)]
+struct CredentialBlocked;
+
+/// How long a waiting peer lets a burst of arrivals settle before it looks again.
+const RECHECK_DELAY: Duration = Duration::from_millis(100);
 
 pub(crate) enum Claim {
     /// The caller was itself claimed meanwhile and will be woken.
@@ -99,6 +118,15 @@ impl PendingPairs {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn changed(&self) {
+        self.changes
+            .send_modify(|count| *count = count.wrapping_add(1));
+    }
+
     fn remove(&self, key: &SeatKey, token: u64) -> bool {
         let mut guard = self.lock();
         if guard.1.get(key).is_some_and(|w| w.token == token) {
@@ -139,6 +167,7 @@ impl PendingPairs {
         }
         guard.0 += 1;
         let token = guard.0;
+        self.changed();
         let (wake, receiver) = oneshot::channel();
         guard.1.insert(
             key.clone(),
@@ -607,38 +636,60 @@ pub(crate) async fn pair(
                 return error(StatusCode::SERVICE_UNAVAILABLE, "pairing queue is full")
             }
         };
-        let mut races = 0;
-        let response = loop {
-            let response = pair_once(
-                state.clone(),
-                headers.clone(),
-                &body,
-                inherited.clone(),
-                inherited_channels.clone(),
-                Some(&seat),
-            )
-            .await;
-            // Losing a race for a partner is not "no partner": look again at once.
-            if response.status() == StatusCode::CONFLICT && seat.holds() && races < RACE_RETRIES {
-                races += 1;
-                continue;
+        let mut changes = state.pending.subscribe();
+        let (response, woken) = loop {
+            changes.borrow_and_update();
+            let mut races = 0;
+            let response = loop {
+                let response = pair_once(
+                    state.clone(),
+                    headers.clone(),
+                    &body,
+                    inherited.clone(),
+                    inherited_channels.clone(),
+                    Some(&seat),
+                )
+                .await;
+                // Losing a race for a partner is not "no partner": look again at once.
+                if response.status() == StatusCode::CONFLICT && seat.holds() && races < RACE_RETRIES
+                {
+                    races += 1;
+                    continue;
+                }
+                break response;
+            };
+            let retry = matches!(
+                response.status(),
+                StatusCode::NOT_FOUND | StatusCode::CONFLICT
+            );
+            if seat.holds() && !retry {
+                break (response, None);
             }
-            break response;
-        };
-        let retry = matches!(
-            response.status(),
-            StatusCode::NOT_FOUND | StatusCode::CONFLICT
-        );
-        if !seat.holds() || retry {
             // Either no partner exists yet, or another peer took this seat and will wake it.
             // A peer taken after a failed attempt of its own is still matched.
+            let blocked = response.extensions().get::<CredentialBlocked>().is_some();
             let woken = match wake.try_recv() {
                 Ok(matched) => Woken::Matched(matched),
                 Err(oneshot::error::TryRecvError::Closed) => Woken::Dropped,
                 Err(oneshot::error::TryRecvError::Empty) => {
-                    wait_for(&mut wake, deadline, &seat, state.config.request_timeout).await
+                    let watch = blocked.then_some(&mut changes);
+                    wait_for(
+                        &mut wake,
+                        deadline,
+                        &seat,
+                        state.config.request_timeout,
+                        watch,
+                    )
+                    .await
                 }
             };
+            // A candidate that could not be used yet may be usable now: look again.
+            if matches!(woken, Woken::Recheck) {
+                continue;
+            }
+            break (response, Some(woken));
+        };
+        if let Some(woken) = woken {
             match woken {
                 Woken::Matched(matched) => {
                     return deliver(
@@ -660,6 +711,7 @@ pub(crate) async fn pair(
                         "no matching peer arrived in time",
                     )
                 }
+                Woken::Recheck => unreachable!("a recheck looks again before this point"),
             }
         }
         return response;
@@ -667,6 +719,8 @@ pub(crate) async fn pair(
 }
 
 enum Woken {
+    /// The queue changed while this peer waited on a candidate it could not use yet.
+    Recheck,
     Matched(Matched),
     /// The peer that claimed this one failed before the pairing held.
     Dropped,
@@ -680,11 +734,35 @@ async fn wait_for(
     deadline: Instant,
     seat: &Seat,
     grace: Duration,
+    changes: Option<&mut tokio::sync::watch::Receiver<u64>>,
 ) -> Woken {
     let settle = |result: Result<Matched, oneshot::error::RecvError>| match result {
         Ok(matched) => Woken::Matched(matched),
         Err(_) => Woken::Dropped,
     };
+    // A peer blocked on a candidate's missing credential also watches the queue: the candidate may
+    // queue, or a room may open, while it sleeps, and nobody else will come looking for it.
+    if let Some(changes) = changes {
+        loop {
+            tokio::select! {
+                result = &mut *wake => return settle(result),
+                _ = tokio::time::sleep(deadline.saturating_duration_since(Instant::now())) => break,
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    // Let a burst of arrivals settle, then look again.
+                    tokio::select! {
+                        result = &mut *wake => return settle(result),
+                        _ = tokio::time::sleep(RECHECK_DELAY) => {}
+                    }
+                    if seat.holds() {
+                        return Woken::Recheck;
+                    }
+                }
+            }
+        }
+    }
     match tokio::time::timeout(
         deadline.saturating_duration_since(Instant::now()),
         &mut *wake,
@@ -1100,9 +1178,13 @@ async fn pair_once(
             Ok(info) => info,
             Err(e) => return *e,
         };
-        if info["kind"] == "password" {
+        // A target already seated in a room was authorized when it joined; a newcomer joining that
+        // room is checked on its own session above and needs nothing from the seated peer.
+        if info["kind"] == "password" && existing.is_none() {
             if target_credential.is_null() && seat.is_some() {
-                return error(StatusCode::NOT_FOUND, "no matching authenticated peer");
+                let mut blocked = error(StatusCode::NOT_FOUND, "no matching authenticated peer");
+                blocked.extensions_mut().insert(CredentialBlocked);
+                return blocked;
             }
             if let Err(e) = authorize_proof(
                 &state,
@@ -1150,6 +1232,8 @@ async fn pair_once(
             }
             return *e;
         }
+        // Peers waiting on a candidate they could not use may find this room worth joining.
+        state.pending.changed();
         // The waiter is told as soon as the engine holds the pairing; if it already left, the
         // pairing is undone for it.
         if let Some(wake) = taken.take() {

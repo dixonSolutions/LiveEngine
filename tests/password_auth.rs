@@ -326,6 +326,112 @@ async fn peer_pair_requires_both_sessions_and_reports_verified_identities() {
 }
 
 #[tokio::test]
+async fn a_waiting_peer_joins_a_seated_room_with_only_its_own_session() {
+    let s = std::sync::Arc::new(server().await);
+    let sessions = [
+        account(&s, "alice", "user").await,
+        account(&s, "bob", "user").await,
+        account(&s, "carol", "user").await,
+    ];
+    assert_eq!(
+        post(
+            &s,
+            "/v1/hubs",
+            json!({"id":"game","mode":"internal","auth":{"kind":"password"}})
+        )
+        .await
+        .0,
+        201
+    );
+    for u in ["alice", "bob", "carol"] {
+        call(
+            &s,
+            "game",
+            "upsertUser",
+            json!([{"id":u,"scopes":{"game":"g"}}]),
+        )
+        .await;
+    }
+    let pair = |id: &str, credential: &str, wait| json!({"subject":{"kind":"peer","id":id,"scopes":{"game":"g"},"credential":credential},"target":{"kind":"peer","requirements":{"game":"g"},"capacity":3},"waitMs":wait});
+    let waiting = {
+        let s = s.clone();
+        let body = pair("alice", &sessions[0], 5000);
+        tokio::spawn(async move { post(&s, "/v1/pair", body).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (status, bob) = post(&s, "/v1/pair", pair("bob", &sessions[1], 5000)).await;
+    assert_eq!(status, 200, "{bob}");
+    let (status, alice) = waiting.await.unwrap();
+    assert_eq!(status, 200, "{alice}");
+    // Carol waits like a page does. She finds a seated room with a free place and joins it; the
+    // seated peers' sessions are not hers to present.
+    let (status, carol) = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        post(&s, "/v1/pair", pair("carol", &sessions[2], 5000)),
+    )
+    .await
+    .expect("carol was left waiting for a partner who is already seated");
+    assert_eq!(status, 200, "{carol}");
+    assert_eq!(carol["room"], alice["room"]);
+    assert_eq!(carol["identity"]["identity"], "carol");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peers_pairing_at_once_under_a_password_hub_all_find_a_room() {
+    let s = std::sync::Arc::new(server().await);
+    assert_eq!(
+        post(
+            &s,
+            "/v1/hubs",
+            json!({"id":"game","mode":"internal","auth":{"kind":"password"}})
+        )
+        .await
+        .0,
+        201
+    );
+    let names: Vec<String> = (0..8).map(|i| format!("crowd-{i}")).collect();
+    let mut sessions = Vec::new();
+    for name in &names {
+        sessions.push(account(&s, name, "user").await);
+        call(
+            &s,
+            "game",
+            "upsertUser",
+            json!([{"id":name,"scopes":{"game":"g"}}]),
+        )
+        .await;
+    }
+    // Every page asks at the same moment, as a crowd pressing Find match does. A peer that finds a
+    // candidate which has not queued yet (or a room with a free place) must not be left waiting.
+    let mut tasks = Vec::new();
+    for (name, session) in names.iter().zip(&sessions) {
+        let s = s.clone();
+        let body = json!({"subject":{"kind":"peer","id":name,"scopes":{"game":"g"},"credential":session},"target":{"kind":"peer","requirements":{"game":"g"},"capacity":4},"waitMs":6000});
+        tasks.push(tokio::spawn(
+            async move { post(&s, "/v1/pair", body).await },
+        ));
+    }
+    let started = std::time::Instant::now();
+    let mut rooms = std::collections::HashMap::<String, usize>::new();
+    for task in tasks {
+        let (status, answer) = task.await.unwrap();
+        assert_eq!(status, 200, "{answer}");
+        *rooms
+            .entry(answer["room"].as_str().unwrap().to_owned())
+            .or_default() += 1;
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "a peer waited out its time"
+    );
+    assert_eq!(rooms.values().sum::<usize>(), 8);
+    assert!(
+        rooms.values().all(|members| (2..=4).contains(members)),
+        "{rooms:?}"
+    );
+}
+
+#[tokio::test]
 async fn connections_kick_ban_and_unban() {
     let s = server().await;
     let session = account(&s, "alice", "user").await;

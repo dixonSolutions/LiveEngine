@@ -1,18 +1,22 @@
-// npm run dev:gogh [-- --lan] [-- --no-build]
+// npm run dev:gogh [-- --lan] [-- --no-build] [-- --password]
 //
 // Builds the debug hub from this checkout, starts it and the Node API (lib/hub-api.mjs through
 // integrations/gogh-strike/bridge.mjs) beside the Gogh Strike game, and prints the URLs. Nothing
 // here uses the published package. Keys are generated into .dev/keys.json (gitignored). Ctrl-C
 // stops both processes. Loopback by default; --lan binds the machine's LAN address instead
-// (never a Tailscale one) so another device on the network can open the game.
+// (never a Tailscale one) so another device on the network can open the game. --password makes the hub
+// ask players to sign in: it creates an admin account, prints its username and a generated password
+// once (they are kept in the keys file) and opens the admin console at /api/liveengine/admin.
 import {spawn, spawnSync} from 'node:child_process';
 import {randomBytes} from 'node:crypto';
 import {existsSync, mkdirSync, readFileSync, writeFileSync} from 'node:fs';
+import {createRequire} from 'node:module';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {ensureGame, lanAddress} from '../integrations/gogh-strike/setup.mjs';
 import {freePort} from '../test/support/hub-process.mjs';
 
+const {HubClient} = createRequire(import.meta.url)('../lib/hubs.js');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = new Set(process.argv.slice(2));
 const suffix = process.platform === 'win32' ? '.exe' : '';
@@ -34,7 +38,8 @@ catch (error) { console.error(error.message); process.exit(1); }
 const keyFile = path.join(root, '.dev', 'keys.json');
 mkdirSync(path.dirname(keyFile), {recursive: true});
 if (!existsSync(keyFile)) writeFileSync(keyFile, JSON.stringify({adminToken: randomBytes(24).toString('hex')}, null, 2), {mode: 0o600});
-const {adminToken} = JSON.parse(readFileSync(keyFile, 'utf8'));
+const keys = JSON.parse(readFileSync(keyFile, 'utf8'));
+const {adminToken} = keys;
 
 let host = '127.0.0.1';
 try { if (args.has('--lan')) host = lanAddress(); }
@@ -45,6 +50,7 @@ const pagePort = await pick('DEV_GOGH_PORT');
 const origins = [`http://${host}:${pagePort}`, `http://127.0.0.1:${pagePort}`, `http://localhost:${pagePort}`].join(',');
 
 const children = [];
+const adminAccount = {username: 'admin', password: keys.adminAccount?.password || randomBytes(16).toString('hex')};
 const stop = code => {
   for (const child of children) child.kill('SIGTERM');
   setTimeout(() => process.exit(code), 500).unref();
@@ -61,14 +67,26 @@ for (let i = 0; i < 100; i++) {
   try { if ((await fetch(`http://${host}:${hubPort}/health`)).ok) break; } catch { /* not listening yet */ }
   await new Promise(resolve => setTimeout(resolve, 100));
 }
+let accountNote = '';
+if (args.has('--password')) {
+  const hub = new HubClient(`http://${host}:${hubPort}`, {token: adminToken});
+  let created;
+  try { created = await hub.createAccount({...adminAccount, role: 'admin'}).then(() => true, error => { if (error.status === 409) return false; throw error; }); }
+  catch (error) { console.error(`Could not create the admin account: ${error.message}`); stop(1); await new Promise(() => {}); }
+  const stored = Boolean(keys.adminAccount?.password);
+  if (!stored) writeFileSync(keyFile, JSON.stringify({...keys, adminAccount}, null, 2), {mode: 0o600});
+  accountNote = !stored ? `\n  Admin account:     ${adminAccount.username} / ${adminAccount.password}   (shown once; kept in the keys file)`
+    : created ? `\n  Admin account:     ${adminAccount.username} (created again; its password is in the keys file)` : `\n  Admin account:     ${adminAccount.username} (password in the keys file)`;
+}
 run('bridge', process.execPath, [path.join(root, 'integrations/gogh-strike/bridge.mjs')], {PORT: String(pagePort), HOST: host, GOGH_STRIKE_ROOT: game,
-  LIVEENGINE_URL: `http://${host}:${hubPort}`, LIVEENGINE_TOKEN: adminToken, LIVEENGINE_HUB_ID: 'gogh-dev', GOGH_LIVE_LINK: 'peer', GOGH_REQUEST_LIMIT: '1000'});
+  LIVEENGINE_URL: `http://${host}:${hubPort}`, LIVEENGINE_TOKEN: adminToken, LIVEENGINE_HUB_ID: 'gogh-dev', GOGH_LIVE_LINK: 'peer', GOGH_REQUEST_LIMIT: '1000',
+  ...(args.has('--password') ? {GOGH_HUB_AUTH_PASSWORD: '1'} : {})});
 
 console.log(`
 Gogh Strike on this checkout of LiveEngine
   Game and hub API:  http://${host}:${pagePort}/        (hub API address for "Play online": http://${host}:${pagePort})
   Hub (debug build): http://${host}:${hubPort}/
   Game files:        ${game}
-  Keys:              ${keyFile}
+  Keys:              ${keyFile}${accountNote}
 Open the game in two browser tabs, press Connect and then Find match in each. Ctrl-C stops everything.`);
 for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => stop(0));

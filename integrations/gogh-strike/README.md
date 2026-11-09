@@ -100,6 +100,17 @@ npm run test:integration
 | 7 | Live hub list: a page opens the registry with a watch ticket and sees hubs, also a nested one, added and removed |
 | 8 | Schema rejection: five malformed frames are each refused by the hub (it closes the sender, which reconnects), none reaches the other player, and play continues |
 
+| 16 | Sign-in: an admin signs in on the front screen, opens the admin console and creates accounts; a wrong password and an unknown user are refused in the same plain words; a user cannot open the console (403, anonymous 401); the session cookie is HttpOnly and SameSite=Strict |
+| 17 | Two signed-in users find a match peer to peer; each is shown by the other's verified username and role, the player ids are the usernames, frames travel directly, and an unsigned pair is refused |
+| 18 | The admin kicks one player in the console: that player sees they were removed, does not reconnect by itself, is still signed in and rejoins |
+| 19 | The admin disables one player: thrown out with the disabled message and signed out, refused at sign-in, back after re-enabling |
+| 20 | A password changed in one tab signs the other tab out and closes its live connection; the old password is refused, the new one works |
+| 21 | The admin resets a password in the console while the player is mid-match: the connection closes and the old session stops working |
+| 22 | An external hub with password auth reached through the central: the accounts live on the remote service only and sign-in works end to end |
+| 23 | Ten users signed in at once are matched into rooms, every pair exchanges data and each is shown under its own name |
+
+Set `GOGH_HUB_AUTH_PASSWORD=1` on the bridge (or run `npm run dev:gogh -- --password`, which also creates an `admin` account and prints its generated password once) to make players sign in with an account on the hub's service and to serve the admin console at `/api/liveengine/admin`. The Play online panel then shows a sign-in form, "Signed in as NAME (role)", Sign out, Change password and, for admins, a link to the console. Scenarios 16 to 23 use it. `GOGH_E2E_SHOTS` (a directory) saves screenshots of the signed-out and signed-in panel and the console as `auth-*.png`.
+
 Environment: `PLAYWRIGHT_PATH` (a Playwright module; `require('playwright')` is tried first), `CHROMIUM_PATH` (browser executable), `GOGH_STRIKE_ROOT` (the game checkout), `GOGH_E2E_CHROMIUM_ARGS` (replaces the Chromium flags) and `GOGH_E2E_ONLY` (for example `2,3`, a debugging filter: skipped scenarios print `SKIP` and the exit code is non-zero). Chromium runs with `--disable-features=WebRtcHideLocalIpsWithMdns --allow-loopback-in-peer-connection` so two contexts find each other's local candidates. Software GL draws the town at under one frame a second, which starves the page's WebRTC callbacks, so when `/dev/dri/renderD128` exists it also passes `--use-gl=angle --use-angle=vulkan --enable-features=Vulkan --ignore-gpu-blocklist --enable-gpu` to render on the GPU, still headless.
 
 ## Service validation

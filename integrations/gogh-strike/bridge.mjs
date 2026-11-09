@@ -26,6 +26,10 @@ const hubId = process.env.LIVEENGINE_HUB_ID || 'gogh-strike';
 const hubMode = process.env.LIVEENGINE_HUB_MODE || 'internal';
 // Slash-separated central IDs; an empty path selects the root registry.
 const hubPath = (process.env.LIVEENGINE_HUB_PATH || '').split('/').filter(Boolean);
+// GOGH_HUB_AUTH_PASSWORD=1: players sign in with an account on the hub's service (docs/hosting.md). The hub
+// takes the "password" auth kind, the hub API gets its administrator console, and the status says so for the page.
+// With an external hub, the remote service owns the hub's auth and its accounts; this only tells the page.
+const passwordAuth = ['1', 'true', 'yes'].includes(String(process.env.GOGH_HUB_AUTH_PASSWORD || '').toLowerCase());
 const remoteHubId = process.env.LIVEENGINE_REMOTE_HUB_ID || hubId;
 const positive = (value, fallback) => (Number.isInteger(Number(value)) && Number(value) > 0 ? Number(value) : fallback);
 // Gogh Strike's own DTO schemas and channels live in the game, so the game stays the one owner.
@@ -39,7 +43,8 @@ const api = createHubApi({
   remote: {address: process.env.LIVEENGINE_REMOTE_ADDRESS || '', hubId: remoteHubId, token: process.env.LIVEENGINE_REMOTE_TOKEN || ''},
   schemas: net?.LIVE_SCHEMAS, channels: net?.LIVE_CHANNELS,
   // A verifier for the hub's `auth` (see docs/hosting.md), as JSON. Unset leaves the hub open.
-  auth: process.env.GOGH_HUB_AUTH ? JSON.parse(process.env.GOGH_HUB_AUTH) : undefined,
+  auth: passwordAuth ? {kind: 'password'} : process.env.GOGH_HUB_AUTH ? JSON.parse(process.env.GOGH_HUB_AUTH) : undefined,
+  adminConsole: passwordAuth, statusExtra: passwordAuth ? {auth: 'password', adminConsole: true} : undefined,
   // "hub" pairs every player with the hub's shared room. "peer" pairs players with each other
   // (the hub is still the signalling and fallback path); the first player waits for the next.
   peerLink: {kind: process.env.GOGH_LIVE_LINK === 'peer' ? 'peer' : 'hub', waitMs: positive(process.env.GOGH_PEER_WAIT_MS, 30_000)},

@@ -127,4 +127,17 @@ See [Gogh Strike integration](/guides/gogh-strike) for a game built on it, and [
 
 Set `adminConsole: true` on `createHubApi` to enable the console at the API's `/admin` path. An administrator signs in through `POST /login` with `username` and `password`; `GET /me` returns the account and `POST /logout` ends the session. The browser receives an HttpOnly, SameSite=Strict cookie containing an opaque API session identifier. The hub session stays on the API server. HTTPS adds the Secure cookie attribute. An explicit hub session bearer token can also be supplied in the Authorization header. Configure allowed origins and HTTPS for the host serving the API.
 
+`POST /password` takes `{ current, next }` for the signed-in account and ends every session of it, this one included, so the page signs in again. With an external hub the accounts live on the remote service that owns the hub, so `login`, `me`, `logout`, `password` and the console talk to that service (`remote.address`), and the central only forwards the session on a pair.
+
+A page signs in with `hubSession` from the same `live-client.mjs`. It holds only the signed-in account and re-checks the session every few seconds, so a password change in another tab, a reset or a ban shows up as a `change` with `reason: 'ended'`; `explainHubError` gives plain words for `kicked`, `banned` and `credentials-changed` errors from a `LiveClient`.
+
+```js
+import { connectLive, explainHubError, hubSession } from '/api/liveengine/live-client.mjs';
+const session = hubSession({ base: '/api/liveengine' });
+session.on('change', ({ account, reason }) => console.log(account?.username ?? 'signed out', reason));
+await session.login('alice', password);
+const client = await connectLive({ pairUrl: '/api/liveengine/pair', body: { userId: session.account.username } });
+client.on('error', error => console.log(explainHubError(error) ?? error.message));
+```
+
 The console lists and manages accounts and connections. It checks the current account's administrator role for every request. Pair and renew pass the signed-in hub session to password-authenticated hubs. Sessions in the API are held in memory, so users sign in again after an API restart.
