@@ -28,6 +28,12 @@ async fn environment_configuration_and_cli() {
             |c| c.call_queue.as_millis() as u64,
             true,
         ),
+        (
+            "LIVEENGINE_LOGIN_LOCKOUT_SECONDS",
+            37,
+            |c| c.login_lockout_seconds,
+            false,
+        ),
         ("LIVEENGINE_MAX_ARGS", 37, |c| c.max_args as u64, false),
         (
             "LIVEENGINE_MAX_BODY_BYTES",

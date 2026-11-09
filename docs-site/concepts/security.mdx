@@ -34,6 +34,10 @@ The host ignores `X-Forwarded-For` and does not trust proxy headers for identity
 Behind a shared reverse proxy, the socket peer is the proxy. All public clients share one peer budget. Apply public-client rate limits at the proxy as well, or give the service a dedicated reachable address.
 </Warning>
 
+## Login backoff
+
+`LIVEENGINE_LOGIN_MAX_FAILURES` defaults to 5 failures per username in a 15-minute tracking window. Reaching that budget starts a `LIVEENGINE_LOGIN_LOCKOUT_SECONDS` lock (default 30 seconds, minimum 1). Each further failure after a lock ends doubles the lock, capped at 15 minutes. With defaults, up to 9 guesses per username can be verified in the first 15 minutes: 5 initially, then one after each of the 30, 60, 120 and 240 second locks. A separate per-address failure budget, ten times the username budget, also applies.
+
 ## Remote-host allowlist
 
 Remote registrations and registry imports are only allowed for hosts listed in `LIVEENGINE_ALLOWED_REMOTE_HOSTS` (comma-separated, case-insensitive, trimmed). Validation runs **before** any outbound connection, so a disallowed host is rejected with `400` rather than attempted.

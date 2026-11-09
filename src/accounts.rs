@@ -72,6 +72,7 @@ struct Failure {
     count: u32,
     first: u64,
     until: u64,
+    in_flight: u32,
 }
 pub(crate) struct Accounts {
     pub data: RwLock<Data>,
@@ -79,6 +80,7 @@ pub(crate) struct Accounts {
     iterations: u32,
     ttl: u64,
     max_failures: u32,
+    lockout_seconds: u64,
     #[cfg(test)]
     verifications: std::sync::atomic::AtomicUsize,
 }
@@ -94,7 +96,7 @@ fn setting(name: &str, default: u64, min: u64, max: u64) -> Result<u64, String> 
     }
 }
 impl Accounts {
-    pub fn new(data: Data) -> Result<Self, String> {
+    pub fn new(data: Data, lockout_seconds: u64) -> Result<Self, String> {
         Ok(Self {
             data: RwLock::new(data),
             failures: Default::default(),
@@ -103,6 +105,7 @@ impl Accounts {
             iterations: setting("LIVEENGINE_PASSWORD_ITERATIONS", 310000, 100000, 10000000)? as u32,
             ttl: setting("LIVEENGINE_SESSION_TTL_SECONDS", 43200, 1, 31536000)?,
             max_failures: setting("LIVEENGINE_LOGIN_MAX_FAILURES", 5, 1, 1000)? as u32,
+            lockout_seconds,
         })
     }
     /// Most attempts one key may hold, in flight or failed, within the window. A username gets
@@ -122,6 +125,13 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 fn valid_name(s: &str) -> bool {
     (3..=64).contains(&s.len())
@@ -430,6 +440,7 @@ pub(crate) async fn login(
         .unwrap_or_else(|| "unknown".into());
     let keys = [format!("u:{}", hash_token(&key)), format!("p:{peer}")];
     let time = now();
+    let failure_time = now_millis();
     // Reserve both budgets before starting expensive work, including work already in flight.
     {
         let mut failures = s
@@ -437,34 +448,47 @@ pub(crate) async fn login(
             .failures
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        failures.retain(|_, v| time.saturating_sub(v.first) < 900 || v.until > time);
-        if keys
-            .iter()
-            .any(|k| failures.get(k).is_some_and(|v| v.until > time))
-        {
+        failures.retain(|_, v| {
+            v.in_flight > 0
+                || failure_time.saturating_sub(v.first) < 900_000
+                || v.until > failure_time
+        });
+        if keys.iter().any(|k| {
+            failures.get(k).is_some_and(|v| {
+                let limit = s.accounts.failure_limit(k);
+                v.until > failure_time
+                    || if v.count >= limit {
+                        v.in_flight > 0
+                    } else {
+                        v.count.saturating_add(v.in_flight) >= limit
+                    }
+            })
+        }) {
             return error(StatusCode::UNAUTHORIZED, "invalid username or password");
         }
+        let needed = keys
+            .iter()
+            .filter(|key| !failures.contains_key(*key))
+            .count();
+        while failures.len().saturating_add(needed) > 8192 {
+            let Some(oldest) = failures
+                .iter()
+                .filter(|(k, v)| !keys.contains(k) && v.in_flight == 0)
+                .min_by_key(|(_, v)| v.first)
+                .map(|(k, _)| k.clone())
+            else {
+                return error(StatusCode::UNAUTHORIZED, "invalid username or password");
+            };
+            failures.remove(&oldest);
+        }
         for key in &keys {
-            if !failures.contains_key(key) && failures.len() >= 8192 {
-                if let Some(oldest) = failures
-                    .iter()
-                    .filter(|(k, _)| !keys.contains(k))
-                    .min_by_key(|(_, v)| v.first)
-                    .map(|(k, _)| k.clone())
-                {
-                    failures.remove(&oldest);
-                }
-            }
             let entry = failures.entry(key.clone()).or_insert(Failure {
                 count: 0,
-                first: time,
+                first: failure_time,
                 until: 0,
+                in_flight: 0,
             });
-            entry.count = entry.count.saturating_add(1);
-            let limit = s.accounts.failure_limit(key);
-            if entry.count >= limit {
-                entry.until = time.saturating_add(1 + (1u64 << (entry.count - limit).min(10)));
-            }
+            entry.in_flight = entry.in_flight.saturating_add(1);
         }
     }
     let (saved, dummy_cost) = {
@@ -495,6 +519,40 @@ pub(crate) async fn login(
     )
     .await
         && saved.as_ref().is_some_and(|a| a.enabled);
+    {
+        let mut failures = s
+            .accounts
+            .failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let finished = now_millis();
+        for key in &keys {
+            if let Some(entry) = failures.get_mut(key) {
+                entry.in_flight = entry.in_flight.saturating_sub(1);
+                if !valid {
+                    entry.count = entry.count.saturating_add(1);
+                    let limit = s.accounts.failure_limit(key);
+                    if entry.count >= limit {
+                        let exponent = entry.count - limit;
+                        let seconds = if exponent == 0 {
+                            s.accounts.lockout_seconds
+                        } else {
+                            s.accounts
+                                .lockout_seconds
+                                .saturating_mul(1u64 << exponent.min(10))
+                                .min(900)
+                        };
+                        entry.until =
+                            entry
+                                .until
+                                .max(finished.saturating_add(
+                                    seconds.saturating_mul(1000).saturating_add(1),
+                                ));
+                    }
+                }
+            }
+        }
+    }
     if !valid {
         return error(StatusCode::UNAUTHORIZED, "invalid username or password");
     }
@@ -524,21 +582,6 @@ pub(crate) async fn login(
         a.password_hash = hash;
     }
     let account = Account::from(&*a);
-    {
-        let mut failures = s
-            .accounts
-            .failures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for key in &keys {
-            if let Some(entry) = failures.get_mut(key) {
-                entry.count = entry.count.saturating_sub(1);
-                if entry.count < s.accounts.failure_limit(key) {
-                    entry.until = 0;
-                }
-            }
-        }
-    }
     let expiry = time.saturating_add(s.accounts.ttl);
     d.sessions.retain(|_, v| v.expires_at > time);
     while d.sessions.len() >= 10000
@@ -741,8 +784,9 @@ mod tests {
                     format!("old:{i}"),
                     Failure {
                         count: 1,
-                        first: now(),
+                        first: now_millis(),
                         until: 0,
+                        in_flight: 0,
                     },
                 );
             }

@@ -29,6 +29,10 @@ These variables are read by `liveengine-hub` or `HubConfig::from_env()`.
 | `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` | integer | `60` | Rate window in seconds |
 | `LIVEENGINE_RATE_LIMIT_PEERS` | positive integer | `4096` | Maximum tracked peers |
 | `LIVEENGINE_SEED` | unsigned integer | `0` | Seed for internally created engines |
+| `LIVEENGINE_LOGIN_MAX_FAILURES` | positive integer | `5` | Username failures before lockout; address budget is ten times this value |
+| `LIVEENGINE_LOGIN_LOCKOUT_SECONDS` | positive integer | `30` | Initial lock in seconds; subsequent failures double it, capped at 15 minutes |
+
+With the default login settings, up to 9 guesses per username can be verified in the first 15 minutes: 5 initially, then one after each of the 30, 60, 120 and 240 second locks. Per-address budgets also apply.
 
 `LIVEENGINE_BIND` must parse as a Rust `SocketAddr` (an IP literal plus port), not a DNS name. For example, `0.0.0.0:8787` or `[::1]:8787`.
 

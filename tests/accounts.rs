@@ -13,7 +13,13 @@ impl Drop for Server {
     }
 }
 async fn server(file: Option<PathBuf>) -> Server {
+    server_with_lockout(file, 30).await
+}
+async fn server_with_lockout(file: Option<PathBuf>, lockout: u64) -> Server {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| std::env::set_var("LIVEENGINE_PASSWORD_ITERATIONS", "100000"));
     let config = HubConfig {
+        login_lockout_seconds: lockout,
         token: ADMIN.into(),
         state_file: file,
         rate_limit_requests: 10000,
@@ -334,13 +340,13 @@ async fn login_lockout_backoff_recovers_and_expired_session_is_denied() {
         std::env::temp_dir().join(format!("liveengine-expiry-{:032x}", rand::random::<u128>()));
     std::fs::create_dir(&dir).unwrap();
     let path = dir.join("state.json");
-    let s = server(Some(path.clone())).await;
+    let s = server_with_lockout(Some(path.clone()), 4).await;
     create(&s, "Dave", "user").await;
     for _ in 0..5 {
         assert_eq!(login(&s, "Dave", "incorrect-password").await.0, 401);
     }
     assert_eq!(login(&s, "Dave", "long-password-123").await.0, 401);
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     let (status, value) = login(&s, "Dave", "long-password-123").await;
     assert_eq!(status, 200);
     let token = value["token"].as_str().unwrap().to_owned();
@@ -477,4 +483,37 @@ async fn account_administration_revokes_sessions_and_validates_input() {
         .0,
         401
     );
+}
+
+#[tokio::test]
+async fn login_lockout_doubles_after_another_failure() {
+    let s = server_with_lockout(None, 1).await;
+    create(&s, "Backoff", "user").await;
+    for _ in 0..5 {
+        assert_eq!(login(&s, "Backoff", "incorrect-password").await.0, 401);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(login(&s, "Backoff", "incorrect-password").await.0, 401);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(login(&s, "Backoff", "long-password-123").await.0, 401);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(login(&s, "Backoff", "long-password-123").await.0, 200);
+}
+
+#[tokio::test]
+async fn default_login_lockout_refuses_correct_password_for_thirty_seconds() {
+    let s = server(None).await;
+    create(&s, "DefaultLock", "user").await;
+    for _ in 0..5 {
+        assert_eq!(login(&s, "DefaultLock", "incorrect-password").await.0, 401);
+    }
+    let start = std::time::Instant::now();
+    assert_eq!(login(&s, "DefaultLock", "long-password-123").await.0, 401);
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        start + std::time::Duration::from_secs(29),
+    ))
+    .await;
+    assert_eq!(login(&s, "DefaultLock", "long-password-123").await.0, 401);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(login(&s, "DefaultLock", "long-password-123").await.0, 200);
 }

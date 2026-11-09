@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Start login lockout after failed password verification, with a configurable 30-second initial lock and exponential backoff.
+
 - Cover environment configuration, deterministic reseeding, and CLI watch tickets with integration tests; clarify zero timeout settings.
 
 - Make standalone Rust documentation samples compile against the current API and mark contextual excerpts.

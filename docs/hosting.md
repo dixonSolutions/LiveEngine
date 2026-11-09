@@ -325,9 +325,7 @@ can administer the service. Keep session tokens secret.
 
 `LIVEENGINE_PASSWORD_ITERATIONS` defaults to 310000 (minimum 100000),
 `LIVEENGINE_SESSION_TTL_SECONDS` defaults to 43200, and
-`LIVEENGINE_LOGIN_MAX_FAILURES` defaults to 5 in 15 minutes. Failed logins
-are subject to per-name and per-address backoff; an address may hold ten times a
-name's budget, because many people sign in through one hub API address. With `LIVEENGINE_STATE_FILE`,
+`LIVEENGINE_LOGIN_MAX_FAILURES` defaults to 5 failures per username in a 15-minute tracking window. Reaching the budget starts a `LIVEENGINE_LOGIN_LOCKOUT_SECONDS` lock (default 30 seconds, minimum 1). Each further failure after a lock ends doubles the lock, capped at 15 minutes. With the defaults, up to 9 guesses per username can be verified in the first 15 minutes: 5 initially and one after each of the 30, 60, 120 and 240 second locks. Failed logins also have a per-address budget of ten times the username budget, because many people sign in through one hub API address. With `LIVEENGINE_STATE_FILE`,
 accounts and hashed session tokens persist in the protected state file; they
 are never included in registry exports.
 

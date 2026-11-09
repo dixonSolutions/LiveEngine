@@ -104,6 +104,8 @@ pub struct HubConfig {
     pub max_pending_pairs: usize,
     /// Maximum requested pair room capacity.
     pub max_room_capacity: usize,
+    /// Initial login lockout duration; subsequent failures double it up to 15 minutes.
+    pub login_lockout_seconds: u64,
     pub rate_limit_requests: usize,
     pub rate_limit_window: Duration,
     pub rate_limit_peers: usize,
@@ -144,6 +146,7 @@ impl Default for HubConfig {
             max_pair_wait: Duration::from_secs(30),
             max_pending_pairs: 1024,
             max_room_capacity: 64,
+            login_lockout_seconds: 30,
             rate_limit_requests: 120,
             rate_limit_window: Duration::from_secs(60),
             rate_limit_peers: 4096,
@@ -228,6 +231,10 @@ impl HubConfig {
         )? as u64);
         config.max_queued_calls =
             env_limit("LIVEENGINE_MAX_QUEUED_CALLS", config.max_queued_calls)?;
+        config.login_lockout_seconds = env_limit(
+            "LIVEENGINE_LOGIN_LOCKOUT_SECONDS",
+            config.login_lockout_seconds as usize,
+        )? as u64;
         config.rate_limit_requests =
             env_limit("LIVEENGINE_RATE_LIMIT_REQUESTS", config.rate_limit_requests)?;
         config.rate_limit_peers =
@@ -299,6 +306,7 @@ impl HubConfig {
             || self.max_room_capacity < 2
             || self.max_room_capacity > u32::MAX as usize
             || self.max_queued_calls == 0
+            || self.login_lockout_seconds == 0
             || self.rate_limit_requests == 0
             || self.rate_limit_peers == 0
             || self.rate_limit_window.is_zero()
@@ -771,6 +779,7 @@ impl HubService {
                         .as_ref()
                         .map(|s| s.accounts.clone())
                         .unwrap_or_default(),
+                    config.login_lockout_seconds,
                 )?),
                 config,
                 hubs: RwLock::new(HashMap::new()),
