@@ -3,6 +3,10 @@
 //
 //   npm run test:e2e
 //
+// GOGH_E2E_SERVER=package runs every scenario against the game's own server-live.mjs, built only from the
+// @dixonsolutions/liveengine package installed in the game (GOGH_STRIKE_ROOT must have it); the default is
+// this checkout's bridge. A scenario that cannot run in package mode fails with the reason.
+//
 // The game is fetched once into .cache/ (upstream Gogh Strike at the validated commit plus gogh-strike.patch);
 // GOGH_STRIKE_ROOT overrides it. Playwright: npm install --no-save playwright && npx playwright install chromium,
 // or PLAYWRIGHT_PATH and CHROMIUM_PATH for an existing install. Without CHROMIUM_PATH, the newest installed
@@ -33,11 +37,19 @@ import {ensureGame, lanAddress} from './setup.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const {HubClient} = require('../../lib/hubs.js');
-const bridgeScript = path.resolve(here, 'bridge.mjs');
+const serverMode = process.env.GOGH_E2E_SERVER || 'bridge';
+if (!['bridge', 'package'].includes(serverMode)) { console.log(`FAIL setup | GOGH_E2E_SERVER must be "bridge" or "package", not "${serverMode}"`); process.exit(1); }
 // GOGH_STRIKE_ROOT, else the patched upstream clone setup.mjs keeps in .cache/ (fetched on first use).
 let gameRoot;
 try { gameRoot = ensureGame(); }
 catch (error) { console.log(`FAIL setup | ${error.message}`); process.exit(1); }
+const bridgeScript = serverMode === 'package' ? path.join(gameRoot, 'server-live.mjs') : path.resolve(here, 'bridge.mjs');
+if (serverMode === 'package') {
+  // The version the game resolved is the one under test; without the package or the server file nothing can run.
+  const installed = path.join(gameRoot, 'node_modules/@dixonsolutions/liveengine/package.json');
+  if (!existsSync(bridgeScript) || !existsSync(installed)) { console.log(`FAIL setup | package mode needs ${bridgeScript} and the installed @dixonsolutions/liveengine in ${gameRoot} (npm install there)`); process.exit(1); }
+  console.log(`INFO package mode: Gogh Strike resolved @dixonsolutions/liveengine ${JSON.parse(readFileSync(installed, 'utf8')).version} from ${path.dirname(installed)}`);
+}
 const WEBRTC_ARGS = ['--disable-features=WebRtcHideLocalIpsWithMdns', '--allow-loopback-in-peer-connection'];
 // Software GL draws the town at under one frame a second here, which starves the page's WebRTC
 // callbacks; on a machine with a render node, ANGLE over Vulkan uses the GPU, still headless.

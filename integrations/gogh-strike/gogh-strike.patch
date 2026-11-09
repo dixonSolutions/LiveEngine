@@ -1,3 +1,15 @@
+diff --git a/.gitignore b/.gitignore
+index 661514b..d8d9968 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -13,6 +13,7 @@
+ !/package.json
+ !/package-lock.json
+ !/server.mjs
++!/server-live.mjs
+ !/index.html
+ !/character-studio.html
+ !/.github/
 diff --git a/index.html b/index.html
 index 3d9d4e7..4623144 100644
 --- a/index.html
@@ -27,6 +39,277 @@ index 3d9d4e7..4623144 100644
        </section>
        <div class="rival-preview"><div id="enemy-portraits" class="enemy-portraits" aria-hidden="true"></div><p>Against <strong id="enemy-faction-name">The Independents</strong><span>Real artists. An entirely imagined paint fight.</span></p></div>
      </main>
+diff --git a/package-lock.json b/package-lock.json
+index 2c9caba..437c142 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -7,14 +7,28 @@
+     "": {
+       "name": "van-gogh-strike",
+       "version": "8.1.1",
++      "license": "MIT",
+       "dependencies": {
++        "@dixonsolutions/liveengine": "^0.4.0",
+         "three": "0.170.0"
+       },
+-      "license": "MIT",
+       "engines": {
+         "node": ">=20"
+       }
+     },
++    "node_modules/@dixonsolutions/liveengine": {
++      "version": "0.4.0",
++      "resolved": "https://registry.npmjs.org/@dixonsolutions/liveengine/-/liveengine-0.4.0.tgz",
++      "integrity": "sha512-mHXcfojKDFmFKUJWyLvLWo7eKx+aZHAW4ywzdrDvVV8pY6Ip9fTrDz3qtLNtZ9Ys0axU3/YuLrjlWIg1ETIlwg==",
++      "hasInstallScript": true,
++      "license": "MIT",
++      "bin": {
++        "liveengine-hub": "bin/liveengine-hub.js"
++      },
++      "engines": {
++        "node": ">=22"
++      }
++    },
+     "node_modules/three": {
+       "version": "0.170.0",
+       "resolved": "https://registry.npmjs.org/three/-/three-0.170.0.tgz",
+diff --git a/package.json b/package.json
+index c711141..5694b6f 100644
+--- a/package.json
++++ b/package.json
+@@ -5,12 +5,14 @@
+   "type": "module",
+   "scripts": {
+     "start": "node server.mjs",
++    "live": "node server-live.mjs",
+     "test": "node --test tests/*.test.js",
+     "verify:source": "shasum -a 256 reference/van-goghs-town.original.html",
+     "build": "node tools/build-site.mjs",
+     "optimize:characters": "node tools/optimize-character-assets.mjs"
+   },
+   "dependencies": {
++    "@dixonsolutions/liveengine": "^0.4.0",
+     "three": "0.170.0"
+   },
+   "description": "A painterly six-versus-six browser shooter with twelve historical artists.",
+diff --git a/server-live.mjs b/server-live.mjs
+new file mode 100644
+index 0000000..da7818d
+--- /dev/null
++++ b/server-live.mjs
+@@ -0,0 +1,212 @@
++// Gogh Strike on LiveEngine, built only from the installed package "@dixonsolutions/liveengine".
++//
++//   npm run live                  loopback only
++//   npm run live -- --lan         bind this machine's LAN address (never a Tailscale one)
++//   npm run live -- --password    players sign in; an admin account is made and the admin console opens
++//
++// It starts the package's liveengine-hub binary on a free port (or uses LIVEENGINE_URL with LIVEENGINE_TOKEN
++// when you give them), mounts the package's hub API with this game's schemas and channels, and serves the game
++// and the package's live client. Nothing here reads a LiveEngine checkout.
++//
++// Options, as environment variables: PORT, HOST, LIVEENGINE_URL, LIVEENGINE_TOKEN, LIVEENGINE_HUB_ID,
++// LIVEENGINE_HUB_MODE, LIVEENGINE_HUB_PATH, LIVEENGINE_REMOTE_ADDRESS, LIVEENGINE_REMOTE_HUB_ID,
++// LIVEENGINE_REMOTE_TOKEN, LIVEENGINE_WATCH_URL, GOGH_LIVE_LINK (hub or peer), GOGH_MATCH_CAPACITY,
++// GOGH_MATCH_SERVER_ID, GOGH_PEER_WAIT_MS, GOGH_REQUEST_LIMIT, GOGH_IDLE_MS, GOGH_ALLOWED_HOSTS,
++// GOGH_ALLOWED_ORIGINS, GOGH_HUB_AUTH (a verifier as JSON) and GOGH_HUB_AUTH_PASSWORD=1.
++import {spawn} from 'node:child_process';
++import {randomBytes} from 'node:crypto';
++import {existsSync, mkdirSync, readFileSync, writeFileSync} from 'node:fs';
++import {readFile, stat} from 'node:fs/promises';
++import http from 'node:http';
++import {createRequire} from 'node:module';
++import net from 'node:net';
++import os from 'node:os';
++import path from 'node:path';
++import {fileURLToPath} from 'node:url';
++import {createHubApi} from '@dixonsolutions/liveengine/hub-api';
++
++const require = createRequire(import.meta.url);
++const {HubClient} = require('@dixonsolutions/liveengine/hubs');
++const root = path.dirname(fileURLToPath(import.meta.url));
++const flags = new Set(process.argv.slice(2));
++const list = value => (value || '').split(',').map(entry => entry.trim().toLowerCase()).filter(Boolean);
++const positive = (value, fallback) => (Number.isInteger(Number(value)) && Number(value) > 0 ? Number(value) : fallback);
++// Ports other work on this machine uses; never picked for the hub.
++const RESERVED = new Set([8787, 8788, 8967, 9222, 9225]);
++
++/** The first IPv4 address of a real interface: not loopback, not Tailscale (by name or by its 100.64.0.0/10 range). */
++function lanAddress() {
++  for (const [name, entries] of Object.entries(os.networkInterfaces())) {
++    if (/^(lo|tailscale)/i.test(name)) continue;
++    for (const entry of entries || []) {
++      if (entry.family !== 'IPv4' || entry.internal) continue;
++      const [first, second] = entry.address.split('.').map(Number);
++      if (first === 127 || (first === 100 && second >= 64 && second <= 127)) continue;
++      return entry.address;
++    }
++  }
++  throw new Error('this machine has no non-loopback, non-Tailscale IPv4 address to bind to');
++}
++
++async function freePort() {
++  for (;;) {
++    const probe = net.createServer();
++    const port = await new Promise((resolve, reject) => { probe.once('error', reject); probe.listen(0, '127.0.0.1', () => resolve(probe.address().port)); });
++    await new Promise(resolve => probe.close(resolve));
++    if (!RESERVED.has(port)) return port;
++  }
++}
++
++const port = Number(process.env.PORT || 8967);
++let host = process.env.HOST || '127.0.0.1';
++try { if (flags.has('--lan')) host = lanAddress(); }
++catch (error) { console.error(error.message); process.exit(1); }
++const passwordAuth = flags.has('--password') || ['1', 'true', 'yes'].includes(String(process.env.GOGH_HUB_AUTH_PASSWORD || '').toLowerCase());
++const allowedHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`, ...list(process.env.GOGH_ALLOWED_HOSTS)]);
++if (!['127.0.0.1', 'localhost', '0.0.0.0', '::'].includes(host)) allowedHosts.add(`${host.toLowerCase()}:${port}`);
++// Pages allowed to call the API: this one, and any other page the owner lists (GOGH_ALLOWED_ORIGINS).
++const allowedOrigins = [...list(process.env.GOGH_ALLOWED_ORIGINS), ...[...allowedHosts].map(value => `http://${value}`)];
++const hubId = process.env.LIVEENGINE_HUB_ID || 'gogh-strike';
++const hubMode = process.env.LIVEENGINE_HUB_MODE || 'internal';
++// Slash-separated central IDs; an empty path selects the root registry.
++const hubPath = (process.env.LIVEENGINE_HUB_PATH || '').split('/').filter(Boolean);
++const remoteHubId = process.env.LIVEENGINE_REMOTE_HUB_ID || hubId;
++const liveNet = await import(new URL('./src/liveengine-net.js', import.meta.url));
++
++// Keys are made once and kept in a gitignored file: the hub's administrator token and, with --password, the admin account.
++const keyFile = path.join(root, '.liveengine', 'keys.json');
++mkdirSync(path.dirname(keyFile), {recursive: true});
++const keys = existsSync(keyFile) ? JSON.parse(readFileSync(keyFile, 'utf8')) : {};
++const saveKeys = () => writeFileSync(keyFile, JSON.stringify(keys, null, 2), {mode: 0o600});
++
++const children = [];
++let server;
++let stopping = false;
++const stop = code => {
++  if (stopping) return;
++  stopping = true;
++  for (const child of children) child.kill('SIGTERM');
++  server?.close();
++  server?.closeAllConnections?.();
++  setTimeout(() => process.exit(code), 500).unref();
++};
++for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => stop(0));
++
++// An existing hub (LIVEENGINE_URL), or the package's own binary on a free port.
++let apiBase = (process.env.LIVEENGINE_URL || '').replace(/\/$/, '');
++let token = process.env.LIVEENGINE_TOKEN || '';
++let hubNote;
++let accountNote = '';
++if (!apiBase) {
++  if (!keys.adminToken) { keys.adminToken = randomBytes(24).toString('hex'); saveKeys(); }
++  token = token || keys.adminToken;
++  // The hub shares this host unless it is a wildcard, which is not an address to reach it by.
++  const hubHost = ['0.0.0.0', '::'].includes(host) ? '127.0.0.1' : host;
++  const hubPort = Number(process.env.GOGH_HUB_PORT) || await freePort();
++  apiBase = `http://${hubHost}:${hubPort}`;
++  const bin = path.join(path.dirname(require.resolve('@dixonsolutions/liveengine/package.json')), 'bin', 'liveengine-hub.js');
++  const origins = [...new Set([`http://${hubHost}:${port}`, ...allowedOrigins])].join(',');
++  const hub = spawn(process.execPath, [bin, 'serve'], {
++    stdio: ['ignore', 'inherit', 'inherit'],
++    env: {LIVEENGINE_ICE_SERVERS: '[]', LIVEENGINE_RATE_LIMIT_REQUESTS: '100000', ...process.env,
++      LIVEENGINE_TOKEN: token, LIVEENGINE_BIND: `${hubHost}:${hubPort}`, LIVEENGINE_PUBLIC_URL: `ws://${hubHost}:${hubPort}/v1/live`,
++      LIVEENGINE_LIVE_ALLOWED_ORIGINS: origins},
++  });
++  children.push(hub);
++  hub.on('exit', (code, signal) => { if (!stopping) { console.error(`The LiveEngine hub exited (${signal || code}); stopping.`); stop(code || 1); } });
++  for (let attempt = 0; ; attempt++) {
++    try { if ((await fetch(`${apiBase}/health`)).ok) break; } catch { /* not listening yet */ }
++    if (attempt >= 200) { console.error(`The LiveEngine hub did not answer at ${apiBase}.`); stop(1); await new Promise(() => {}); }
++    await new Promise(resolve => setTimeout(resolve, 100));
++  }
++  hubNote = `Hub (package):     ${apiBase}/`;
++  if (passwordAuth) {
++    const admin = {username: 'admin', password: keys.adminAccount?.password || randomBytes(16).toString('hex')};
++    const created = await new HubClient(apiBase, {token}).createAccount({...admin, role: 'admin'}).then(() => true, error => { if (error.status === 409) return false; throw error; })
++      .catch(error => { console.error(`Could not create the admin account: ${error.message}`); stop(1); return new Promise(() => {}); });
++    const stored = Boolean(keys.adminAccount?.password);
++    if (!stored) { keys.adminAccount = admin; saveKeys(); }
++    accountNote = !stored ? `\n  Admin account:     ${admin.username} / ${admin.password}   (shown once; kept in ${path.relative(root, keyFile)})`
++      : created ? `\n  Admin account:     ${admin.username} (created again; its password is in ${path.relative(root, keyFile)})` : `\n  Admin account:     ${admin.username} (password in ${path.relative(root, keyFile)})`;
++  }
++} else {
++  hubNote = `Hub (external):    ${apiBase}/`;
++}
++
++const api = createHubApi({
++  client: apiBase && token ? new HubClient(apiBase, {token}) : undefined,
++  notConfigured: 'Set LIVEENGINE_URL and LIVEENGINE_TOKEN to enable matchmaking.',
++  hubId, hubPath, mode: hubMode, scopes: {game: 'gogh-strike'},
++  remote: {address: process.env.LIVEENGINE_REMOTE_ADDRESS || '', hubId: remoteHubId, token: process.env.LIVEENGINE_REMOTE_TOKEN || ''},
++  schemas: liveNet.LIVE_SCHEMAS, channels: liveNet.LIVE_CHANNELS,
++  // A verifier for the hub's `auth` as JSON. Unset leaves the hub open.
++  auth: passwordAuth ? {kind: 'password'} : process.env.GOGH_HUB_AUTH ? JSON.parse(process.env.GOGH_HUB_AUTH) : undefined,
++  adminConsole: passwordAuth, statusExtra: passwordAuth ? {auth: 'password', adminConsole: true} : undefined,
++  // "hub" pairs every player with the hub's shared room. "peer" pairs players with each other
++  // (the hub is still the signalling and fallback path); the first player waits for the next.
++  peerLink: {kind: process.env.GOGH_LIVE_LINK === 'peer' ? 'peer' : 'hub', waitMs: positive(process.env.GOGH_PEER_WAIT_MS, 30_000)},
++  roomCapacity: positive(process.env.GOGH_MATCH_CAPACITY, 12),
++  allowedOrigins, basePath: '/api/liveengine',
++  limits: {requestsPerMinute: positive(process.env.GOGH_REQUEST_LIMIT, 10), readsPerMinute: positive(process.env.GOGH_REQUEST_LIMIT, 300), idleMs: positive(process.env.GOGH_IDLE_MS, 3 * 60_000)},
++  // What a request says about the player, as the scopes the hub matches on.
++  subject: input => ({game: 'gogh-strike', mode: 'tdm', team: input.team === 1 ? 1 : 0, artist: typeof input.role === 'string' ? input.role.slice(0, 40) : 'vanguard'}),
++  join: {server: {id: process.env.GOGH_MATCH_SERVER_ID || 'gogh-strike-local', capacity: positive(process.env.GOGH_MATCH_CAPACITY, 12), minMembers: 2,
++    scopes: {game: 'gogh-strike', mode: 'tdm', map: 'van-goghs-town', region: 'local'}}},
++  // Where the browser opens the live registry; the hub's own address unless it is reached another way.
++  watchUrl: process.env.LIVEENGINE_WATCH_URL || undefined,
++});
++
++const mime = {
++  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
++  '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
++  '.json': 'application/json', '.png': 'image/png', '.webp': 'image/webp',
++  '.svg': 'image/svg+xml', '.glb': 'model/gltf-binary', '.woff2': 'font/woff2',
++};
++const liveClientFile = require.resolve('@dixonsolutions/liveengine/live-client');
++
++function json(res, status, value) {
++  res.writeHead(status, {'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store'});
++  res.end(JSON.stringify(value));
++}
++
++server = http.createServer(async (req, res) => {
++  try {
++    const hostHeader = req.headers.host?.toLowerCase();
++    if (!allowedHosts.has(hostHeader)) return json(res, 403, {error: 'Invalid Host header'});
++    const url = new URL(req.url, `http://${host}:${port}`);
++    if (url.pathname === '/liveengine/live-client.mjs' && req.method === 'GET') {
++      res.writeHead(200, {'Content-Type': mime['.mjs'], 'Cache-Control': 'no-cache'});
++      return res.end(await readFile(liveClientFile));
++    }
++    if (url.pathname === '/health') return json(res, 200, {app: 'Gogh Strike on the LiveEngine package', hubId});
++    if (url.pathname.startsWith('/api/liveengine/')) return await api(req, res);
++    if (url.pathname.startsWith('/api/') && req.headers.origin && !allowedOrigins.includes(req.headers.origin)) {
++      return json(res, 403, {error: 'Cross-origin request rejected'});
++    }
++    if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, {error: 'Method not allowed'});
++    let pathname = decodeURIComponent(url.pathname);
++    if (pathname.endsWith('/')) pathname += 'index.html';
++    // Dot files and folders (the keys file lives in one) and installed packages are never served.
++    if (pathname.split('/').some(part => part.startsWith('.') || part === 'node_modules')) return json(res, 404, {error: 'Not found'});
++    const file = path.resolve(root, `.${pathname}`);
++    if (!file.startsWith(root + path.sep)) return json(res, 400, {error: 'Invalid path'});
++    const info = await stat(file);
++    if (!info.isFile()) return json(res, 404, {error: 'Not found'});
++    res.writeHead(200, {'Content-Type': mime[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache'});
++    if (req.method === 'HEAD') return res.end();
++    res.end(await readFile(file));
++  } catch (error) {
++    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return json(res, 404, {error: 'Not found'});
++    return json(res, error.status || 502, {error: error.message || 'Server request failed'});
++  }
++});
++
++server.on('error', error => { console.error(`Cannot listen on ${host}:${port}: ${error.message}`); stop(1); });
++server.listen(port, host, () => {
++  console.log(`
++Gogh Strike on the published LiveEngine package
++  Game and hub API:  http://${host}:${port}/        (hub API address for "Play online": http://${host}:${port})
++  ${hubNote}
++  Allowed hosts:     ${[...allowedHosts].join(', ')}${accountNote}
++Open the game in two browser tabs, press Connect and then Find match in each. Ctrl-C stops everything.`);
++});
 diff --git a/src/bots.js b/src/bots.js
 index 21fbb2b..5458f04 100644
 --- a/src/bots.js

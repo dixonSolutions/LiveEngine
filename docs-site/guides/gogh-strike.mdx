@@ -61,6 +61,22 @@ Open `http://127.0.0.1:8967/`, select **Find a LiveEngine match**, then press **
 
 The bridge validates Host and Origin, limits request bodies to 16 KiB, and rate-limits joins. It has no player authentication. The upstream game's own `npm start` does not include the proxy; use the bridge command so credentials are not placed in browser storage.
 
+## Run from the published package
+
+The patched game depends on `@dixonsolutions/liveengine` and carries `server-live.mjs`, a server built only from the installed package. Nothing in it reads a LiveEngine checkout.
+
+```sh
+cd ../gogh-strike
+npm install
+npm run live                    # loopback
+npm run live -- --lan           # the LAN address, never a Tailscale one
+npm run live -- --password      # players sign in; admin console at /api/liveengine/admin
+```
+
+It starts the package's `liveengine-hub` binary on a free port (or uses `LIVEENGINE_URL` and `LIVEENGINE_TOKEN`), mounts `createHubApi` from `@dixonsolutions/liveengine/hub-api` with the game's schemas and channels, serves the game and the package's live client, and prints the URLs. With `--password` it creates an `admin` account and prints a generated password once; it is kept in `.liveengine/keys.json`, which is gitignored and never served. It takes the same options as the bridge (see [Bridge configuration](#bridge-configuration)). The game's own `npm start` is unchanged.
+
+`npm run dev:gogh` in the LiveEngine repository differs: it builds the debug hub from the checkout and runs `bridge.mjs` against its `lib/`, so it exercises unreleased changes, while `npm run live` exercises what is published. `GOGH_E2E_SERVER=package npm run test:e2e` (with `GOGH_STRIKE_ROOT` set to a game that has the package installed) runs every browser scenario against `server-live.mjs`; the default, `bridge`, uses `bridge.mjs`.
+
 ## Hosting on a network
 
 By default the bridge binds to `127.0.0.1`. To serve the game over a trusted LAN, bind the LAN address and keep the allowlist narrow:

@@ -85,6 +85,22 @@ npm run test:integration
 
 `bridge.test.mjs` uses a local fake HTTP hub and verifies the contract handshake, internal and external registration, matchmaking call sequence, and rejection of hostile Host and Origin headers. `bridge-live.test.mjs` starts a real `liveengine-hub` (`npm run build:hub` first) and real WebSockets and checks schema and channel registration, serving of `LiveClient`, two players pairing into one room and exchanging both channels, schema enforcement by the hub, renewal and reconnect, discovery, hub auth (good, missing, wrong and mismatched credentials) and that the administrator token never appears in a response. The game side is covered in the Gogh Strike repository by `tests/liveengine-net.test.js`.
 
+## Running from the published package
+
+`server-live.mjs` in the Gogh Strike checkout is the same server built only from the installed `@dixonsolutions/liveengine` package (`dependencies`: `^0.4.0`, locked to the exact version in `package-lock.json`). Nothing in it imports from a LiveEngine checkout. The patch adds it, the dependency and the `live` script.
+
+```sh
+cd ../gogh-strike
+npm install
+npm run live                    # loopback
+npm run live -- --lan           # this machine's LAN address (never a Tailscale one)
+npm run live -- --password      # players sign in; the admin console opens at /api/liveengine/admin
+```
+
+It starts the package's `liveengine-hub` binary on a free port, mounts `createHubApi` from `@dixonsolutions/liveengine/hub-api` with the schemas and channels from `src/liveengine-net.js`, serves the game and the package's live client, and prints the URLs. With `--password` it also creates an `admin` account and prints its generated password once; it is kept, with the hub's administrator token, in `.liveengine/keys.json` (gitignored and never served). Set `LIVEENGINE_URL` and `LIVEENGINE_TOKEN` to use an existing hub instead of starting one. It reads the same options as `bridge.mjs`: `PORT`, `HOST`, `LIVEENGINE_HUB_ID`, `LIVEENGINE_HUB_MODE`, `LIVEENGINE_HUB_PATH`, `LIVEENGINE_REMOTE_*`, `LIVEENGINE_WATCH_URL`, `GOGH_LIVE_LINK`, `GOGH_MATCH_CAPACITY`, `GOGH_ALLOWED_ORIGINS`, `GOGH_ALLOWED_HOSTS`, `GOGH_HUB_AUTH`, `GOGH_HUB_AUTH_PASSWORD=1` and the rest listed at the top of the file. The game's own `npm start` is unchanged.
+
+`npm run dev:gogh` differs: it builds the debug hub from this LiveEngine checkout and runs `bridge.mjs` against `lib/`, so it tests unreleased changes. `npm run live` tests what is on npm. To run the end-to-end test against the package, use `GOGH_E2E_SERVER=package GOGH_STRIKE_ROOT=../gogh-strike npm run test:e2e`; it prints the package version the game resolved and fails every scenario it cannot run in that mode. The default, `GOGH_E2E_SERVER=bridge`, uses `bridge.mjs`. The test's own central hubs and Node `LiveClient` still come from this checkout in both modes.
+
 ## Local end-to-end test
 
 `live-e2e.mjs` (`npm run test:e2e`, not part of `npm test`) is the real local test. It starts two `liveengine-hub` processes (build them with `npm run build:hub`), one bridge per scenario and headless Chromium, all on free loopback ports, and stops everything at the end, also on failure. It prints one `PASS` or `FAIL` line per scenario and exits non-zero if any fails; a scenario that cannot run counts as failed.
