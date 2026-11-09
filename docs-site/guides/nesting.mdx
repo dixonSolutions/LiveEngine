@@ -41,17 +41,22 @@ Registration checks the remote first: `GET /health` and `GET /v1/contract` must 
 
 ### Rust
 
-```rust fragment
+```rust
 use liveengine::hub::HubClient;
 use reqwest::Method;
 use serde_json::json;
 
-let hub = HubClient::new("http://127.0.0.1:8787", token)?;
-hub.request(Method::POST, "/v1/hubs", Some(json!({ "id": "eu", "mode": "central", "maxHubs": 32 }))).await?;
-hub.route(&["eu".to_string()], "register", json!({ "id": "games", "mode": "central" })).await?;
-hub.route(&["eu".to_string(), "games".to_string()], "register",
-    json!({ "id": "hub-a", "mode": "internal", "ifAbsent": true })).await?;
-let tree = hub.tree(3).await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let token = std::env::var("LIVEENGINE_TOKEN")?;
+    let hub = HubClient::new("http://127.0.0.1:8787", token)?;
+    hub.request(Method::POST, "/v1/hubs", Some(json!({ "id": "eu", "mode": "central", "maxHubs": 32 }))).await?;
+    hub.route(&["eu".to_string()], "register", json!({ "id": "games", "mode": "central" })).await?;
+    hub.route(&["eu".to_string(), "games".to_string()], "register",
+        json!({ "id": "hub-a", "mode": "internal", "ifAbsent": true })).await?;
+    let tree = hub.tree(3).await?;
+    Ok(())
+}
 ```
 
 ## Route operations

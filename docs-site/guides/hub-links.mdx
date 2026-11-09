@@ -85,21 +85,27 @@ The local service must list `b.example.net` in `LIVEENGINE_ALLOWED_REMOTE_HOSTS`
 
 ### Rust
 
-```rust fragment
+```rust
 use liveengine::hub::HubClient;
 use reqwest::Method;
 use serde_json::json;
 
-let remote = HubClient::new("https://b.example.net", remote_token)?;
-let credential = remote.request(Method::POST, "/v1/hubs/hub-a/link-credentials", None).await?;
-let link_token = credential["token"].as_str().unwrap();
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let remote_token = std::env::var("LIVEENGINE_REMOTE_TOKEN")?;
+    let local_token = std::env::var("LIVEENGINE_LOCAL_TOKEN")?;
+    let remote = HubClient::new("https://b.example.net", remote_token)?;
+    let credential = remote.request(Method::POST, "/v1/hubs/hub-a/link-credentials", None).await?;
+    let link_token = credential["token"].as_str().unwrap();
 
-let local = HubClient::new("https://a.example.net", local_token)?;
-local.request(Method::POST, "/v1/links", Some(json!({
-    "id": "to-b", "address": "https://b.example.net", "remoteToken": link_token,
-    "hubId": "hub-a", "userId": "link-to-a", "serverId": "room-1",
-    "localHubId": "hub-a", "localRoom": "room-1"
-}))).await?;
+    let local = HubClient::new("https://a.example.net", local_token)?;
+    local.request(Method::POST, "/v1/links", Some(json!({
+        "id": "to-b", "address": "https://b.example.net", "remoteToken": link_token,
+        "hubId": "hub-a", "userId": "link-to-a", "serverId": "room-1",
+        "localHubId": "hub-a", "localRoom": "room-1"
+    }))).await?;
+    Ok(())
+}
 ```
 
 ### Inspect and remove

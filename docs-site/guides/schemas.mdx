@@ -66,19 +66,24 @@ await hub.register({
 
 ### Rust
 
-```rust fragment
+```rust
 use liveengine::hub::HubClient;
 use reqwest::Method;
 use serde_json::json;
 
-let hub = HubClient::new("http://127.0.0.1:8787", token)?;
-hub.request(Method::POST, "/v1/schemas", Some(json!({
-    "id": "profile", "version": "1",
-    "schema": { "type": "object", "required": ["zone"], "properties": { "zone": { "enum": ["a", "b", "c"] } } }
-}))).await?;
-hub.request(Method::POST, "/v1/hubs", Some(json!({
-    "id": "hub-a", "mode": "internal", "schemaRef": "profile@1", "scopes": { "zone": "a" }
-}))).await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let token = std::env::var("LIVEENGINE_TOKEN")?;
+    let hub = HubClient::new("http://127.0.0.1:8787", token)?;
+    hub.request(Method::POST, "/v1/schemas", Some(json!({
+        "id": "profile", "version": "1",
+        "schema": { "type": "object", "required": ["zone"], "properties": { "zone": { "enum": ["a", "b", "c"] } } }
+    }))).await?;
+    hub.request(Method::POST, "/v1/hubs", Some(json!({
+        "id": "hub-a", "mode": "internal", "schemaRef": "profile@1", "scopes": { "zone": "a" }
+    }))).await?;
+    Ok(())
+}
 ```
 
 ## Schema registry routes

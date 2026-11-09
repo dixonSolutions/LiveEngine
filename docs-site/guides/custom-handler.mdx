@@ -80,7 +80,7 @@ Arbitrary JSON arguments and results are allowed within the configured request/r
 
 ## HubHandler
 
-```rust
+```rust fragment
 pub trait HubHandler: Send {
     fn call(&mut self, method: &str, args: Vec<Value>) -> Result<Value, String>;
     fn preflight(
@@ -103,7 +103,7 @@ pub trait HubHandler: Send {
 
 Use `preflight` for application validation that must happen before mutation. Because it runs before `call`, a rejected preflight leaves handler state unchanged.
 
-```rust
+```rust fragment
 fn preflight(&mut self, method: &str, args: &[Value], config: &HubConfig) -> Result<(), String> {
     if method != "increment" {
         return Ok(());
@@ -123,18 +123,25 @@ The error text is your own; the transport status is fixed by where it is returne
 `register_internal` requires `mode: "internal"` and rejects remote fields:
 
 ```rust
-let registration: HubRegistration = serde_json::from_value(json!({
-    "id": "counter",
-    "mode": "internal",
-    "scopes": { "kind": "custom-counter" },
-    "scopeSchema": {
-        "type": "object",
-        "required": ["region"],
-        "properties": { "region": { "type": "string" } },
-        "additionalProperties": false
-    },
-    "ttlSeconds": 3600
-}))?;
+use liveengine::hub::HubRegistration;
+use serde_json::json;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let registration: HubRegistration = serde_json::from_value(json!({
+        "id": "counter",
+        "mode": "internal",
+        "scopes": { "region": "au" },
+        "scopeSchema": {
+            "type": "object",
+            "required": ["region"],
+            "properties": { "region": { "type": "string" } },
+            "additionalProperties": false
+        },
+        "ttlSeconds": 3600
+    }))?;
+    println!("{:?}", registration.id);
+    Ok(())
+}
 ```
 
 `register_internal` returns `Err(String)` for:

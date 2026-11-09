@@ -168,38 +168,44 @@ console.log(client.identity, client.identityOf('user-b'));
 
 An embedded service can verify with its own code, such as a database lookup. Register the verifier before the hubs that name it.
 
-```rust fragment
+```rust
 use liveengine::auth::{AuthError, AuthRequest, AuthVerifier, Identity};
 use liveengine::hub::{HubConfig, HubService, HubSpec};
 use serde_json::{json, Map};
 use std::{future::Future, pin::Pin};
 
-struct Directory;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let token = std::env::var("LIVEENGINE_TOKEN")?;
+    let credential = std::env::var("LIVEENGINE_CREDENTIAL")?;
+    struct Directory { expected: String }
 
-impl AuthVerifier for Directory {
-    fn verify<'a>(
-        &'a self,
-        request: &'a AuthRequest<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<Identity, AuthError>> + Send + 'a>> {
-        Box::pin(async move {
-            // request.hub_path, hub, room, user, role, credential
-            if request.credential != "expected" {
-                return Err(AuthError);
-            }
-            let mut claims = Map::new();
-            claims.insert("tier".into(), json!("standard"));
-            Ok(Identity { identity: request.user.to_string(), claims })
-        })
+    impl AuthVerifier for Directory {
+        fn verify<'a>(
+            &'a self,
+            request: &'a AuthRequest<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<Identity, AuthError>> + Send + 'a>> {
+            Box::pin(async move {
+                // request.hub_path, hub, room, user, role, credential
+                if request.credential != self.expected {
+                    return Err(AuthError);
+                }
+                let mut claims = Map::new();
+                claims.insert("tier".into(), json!("standard"));
+                Ok(Identity { identity: request.user.to_string(), claims })
+            })
+        }
     }
-}
 
-let service = HubService::new(HubConfig { token: token.into(), ..HubConfig::default() })?;
-service.register_verifier("directory", Directory)?;
-service.register(HubSpec {
-    id: "hub-a".into(),
-    auth: Some(json!({ "kind": "custom", "name": "directory" })),
-    ..HubSpec::default()
-}).await?;
+    let service = HubService::new(HubConfig { token: token.into(), ..HubConfig::default() })?;
+    service.register_verifier("directory", Directory { expected: credential })?;
+    service.register(HubSpec {
+        id: "hub-a".into(),
+        auth: Some(json!({ "kind": "custom", "name": "directory" })),
+        ..HubSpec::default()
+    }).await?;
+    Ok(())
+}
 ```
 
 `register_verifier` takes a name of 1 to 64 characters of `A-Z a-z 0-9 . _ -`. A name registered twice, or an unknown name in a hub definition, is an error (`auth verifier is not registered`). Nested centrals share the registry. Verifiers live in memory: register them again on every start.

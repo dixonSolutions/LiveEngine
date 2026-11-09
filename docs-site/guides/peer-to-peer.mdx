@@ -77,20 +77,25 @@ Here `/api/ticket` is a route of yours that re-issues a ticket for a user who is
 
 The Rust `HubClient` has no `pair` method. Use `request` against `POST /v1/pair`, or `route` with the `pair` operation. The request is the same JSON:
 
-```rust fragment
+```rust
 use liveengine::hub::HubClient;
 use reqwest::Method;
 use serde_json::json;
 
-let hub = HubClient::new("http://127.0.0.1:8787", token)?;
-let scopes = json!({ "pool": "pool-1" });
-hub.request(Method::POST, "/v1/hubs/hub-a/call",
-    Some(json!({ "method": "upsertUser", "args": [{ "id": "user-a", "scopes": scopes }] }))).await?;
-let descriptor = hub.request(Method::POST, "/v1/pair", Some(json!({
-    "subject": { "kind": "peer", "id": "user-a", "scopes": scopes },
-    "target": { "kind": "peer", "requirements": { "pool": "pool-1" } },
-    "waitMs": 20000
-}))).await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let token = std::env::var("LIVEENGINE_TOKEN")?;
+    let hub = HubClient::new("http://127.0.0.1:8787", token)?;
+    let scopes = json!({ "pool": "pool-1" });
+    hub.request(Method::POST, "/v1/hubs/hub-a/call",
+        Some(json!({ "method": "upsertUser", "args": [{ "id": "user-a", "scopes": scopes }] }))).await?;
+    let descriptor = hub.request(Method::POST, "/v1/pair", Some(json!({
+        "subject": { "kind": "peer", "id": "user-a", "scopes": scopes },
+        "target": { "kind": "peer", "requirements": { "pool": "pool-1" } },
+        "waitMs": 20000
+    }))).await?;
+    Ok(())
+}
 ```
 
 A waiting `pair` can take up to the request timeout plus `waitMs`. The Rust client has a fixed five-second timeout, so a waiting pair from Rust times out on the client before the hub answers. Run the waiting call with a client you control (for example `reqwest` with a longer timeout) or keep `waitMs` under about four seconds.

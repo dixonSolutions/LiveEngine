@@ -164,22 +164,27 @@ socket.onmessage = event => {
 
 ### Rust
 
-```rust fragment
+```rust
 use liveengine::hub::HubClient;
 
-let hub = HubClient::new("http://127.0.0.1:8787", token)?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let token = std::env::var("LIVEENGINE_TOKEN")?;
+    let hub = HubClient::new("http://127.0.0.1:8787", token)?;
 
-// A ticket for a browser, from your server.
-let issued = hub.watch_ticket(&[], 3).await?; // { "ticket": ..., "expiresAt": ... }
+    // A ticket for a browser, from your server.
+    let issued = hub.watch_ticket(&[], 3).await?; // { "ticket": ..., "expiresAt": ... }
 
-// Watch in-process with the client's own token. The callback gets the snapshot first, then diffs.
-// Return false to stop.
-let mut seen = 0;
-hub.watch(&[], 3, |message| {
-    println!("{message}");
-    seen += 1;
-    seen < 10
-}).await?;
+    // Watch in-process with the client's own token. The callback gets the snapshot first, then diffs.
+    // Return false to stop.
+    let mut seen = 0;
+    hub.watch(&[], 3, |message| {
+        println!("{message}");
+        seen += 1;
+        seen < 10
+    }).await?;
+    Ok(())
+}
 ```
 
 `watch` returns when the callback returns `false` or the hub closes the stream. It does not request a resnapshot for you.

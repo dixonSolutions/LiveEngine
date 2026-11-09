@@ -50,29 +50,35 @@ If you nest the hub router under a path prefix, remote clients must include that
 
 ## Register an internal handler
 
-```rust fragment
-use liveengine::hub::{
-    HubConfig, HubHandler, HubMode, HubRegistration, HubService,
-};
-use serde_json::{json, Value};
+```rust
 
-struct Echo;
 
-impl HubHandler for Echo {
-    fn call(&mut self, method: &str, args: Vec<Value>) -> Result<Value, String> {
-        Ok(json!({ "method": method, "args": args }))
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use liveengine::hub::{
+        HubConfig, HubHandler, HubMode, HubRegistration, HubService,
+    };
+    use serde_json::{json, Value};
+
+    struct Echo;
+
+    impl HubHandler for Echo {
+        fn call(&mut self, method: &str, args: Vec<Value>) -> Result<Value, String> {
+            Ok(json!({ "method": method, "args": args }))
+        }
     }
+
+    let service = HubService::new(HubConfig::from_env()?)?;
+
+    let registration: HubRegistration = serde_json::from_value(json!({
+        "id": "echo",
+        "mode": "internal",
+        "scopes": { "kind": "echo" }
+    }))?;
+
+    service.register_internal(registration, Echo).await?;
+    Ok(())
 }
-
-let service = HubService::new(HubConfig::from_env()?)?;
-
-let registration: HubRegistration = serde_json::from_value(json!({
-    "id": "echo",
-    "mode": "internal",
-    "scopes": { "kind": "echo" }
-}))?;
-
-service.register_internal(registration, Echo).await?;
 ```
 
 `register_internal` returns `Result<HubInfo, String>` and:
@@ -87,7 +93,7 @@ Registration through HTTP (`POST /v1/hubs` with `mode: "internal"`) creates an `
 
 ## HubHandler
 
-```rust
+```rust fragment
 pub trait HubHandler: Send {
     fn call(&mut self, method: &str, args: Vec<Value>) -> Result<Value, String>;
 
@@ -113,7 +119,7 @@ See [Host a custom in-process handler](/guides/custom-handler) for a full counte
 
 ## HubService API
 
-```rust
+```rust fragment
 pub struct HubService { /* cloneable Arc state */ }
 
 impl HubService {
@@ -146,20 +152,25 @@ impl HubService {
 
 The Rust types serialize with camelCase field names:
 
-```rust fragment
+```rust
 use liveengine::hub::{HubMode, HubRegistration};
+use serde_json::json;
 
-let registration: HubRegistration = serde_json::from_value(json!({
-    "id": "remote-ranked",
-    "mode": "external",
-    "address": "https://remote.example.net",
-    "remoteHubId": "ranked-au",
-    "remoteToken": "a-remote-secret-at-least-24-bytes",
-    "scopes": { "region": "au" },
-    "ttlSeconds": 3600
-}))?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let registration: HubRegistration = serde_json::from_value(json!({
+        "id": "remote-ranked",
+        "mode": "external",
+        "address": "https://remote.example.net",
+        "remoteHubId": "ranked-au",
+        "remoteToken": "a-remote-secret-at-least-24-bytes",
+        "scopes": { "region": "au" },
+        "ttlSeconds": 3600
+    }))?;
 
-assert_eq!(registration.mode, HubMode::External);
+    assert_eq!(registration.mode, HubMode::External);
+    Ok(())
+}
 ```
 
 `HubRegistration` uses `deny_unknown_fields`, matching the HTTP JSON parser. Unknown fields are rejected.
@@ -168,12 +179,16 @@ assert_eq!(registration.mode, HubMode::External);
 
 The host exposes an unauthenticated `GET /v1/ping` route. Rust clients can use `ping_hub`, which measures round-trip time with `Instant` and returns min, average, max, and jitter:
 
-```rust fragment
+```rust
 use liveengine::hub::ping_hub;
 use std::time::Duration;
 
-let stats = ping_hub("http://127.0.0.1:8787", 5, Duration::from_secs(3)).await?;
-println!("{:.3} ms avg, {:.3} ms jitter", stats.avg_ms, stats.jitter_ms);
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let stats = ping_hub("http://127.0.0.1:8787", 5, Duration::from_secs(3)).await?;
+    println!("{:.3} ms avg, {:.3} ms jitter", stats.avg_ms, stats.jitter_ms);
+    Ok(())
+}
 ```
 
 `PingStats` serializes with camelCase field names and includes the individual `samples` plus the last `serverTimeMs`.

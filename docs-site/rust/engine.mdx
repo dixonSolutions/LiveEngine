@@ -13,7 +13,7 @@ serde_json = "1"
 
 Rust 1.88 or newer is required. The crate exports:
 
-```rust
+```rust fragment
 pub mod engine;
 #[cfg(feature = "host")] pub mod hub;
 pub mod rules;
@@ -39,7 +39,7 @@ With `default-features = false`, only `Engine`, `rules`, and `VERSION` are avail
 
 ## Engine
 
-```rust
+```rust fragment
 pub struct Engine { /* private */ }
 
 impl Engine {
@@ -49,35 +49,39 @@ impl Engine {
 }
 ```
 
-```rust fragment
+```rust
 use liveengine::Engine;
 use serde_json::json;
 
-let mut engine = Engine::new(42);
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = Engine::new(42);
 
-let added = engine.dispatch(
-    "upsertServer",
-    vec![json!({
-        "id": "room-au",
-        "capacity": 2,
-        "minMembers": 2,
-        "scopes": { "game": "chess", "region": "au" },
-        "requirements": { "rating": { "between": [1300, 1700] } }
-    })],
-)?;
-assert_eq!(added, json!(true));
+    let added = engine.dispatch(
+        "upsertServer",
+        vec![json!({
+            "id": "room-au",
+            "capacity": 2,
+            "minMembers": 2,
+            "scopes": { "game": "chess", "region": "au" },
+            "requirements": { "rating": { "between": [1300, 1700] } }
+        })],
+    )?;
+    assert_eq!(added, json!(true));
 
-engine.dispatch(
-    "upsertUser",
-    vec![json!({
-        "id": "alice",
-        "scopes": { "game": "chess", "region": "au", "rating": 1450 },
-        "requirements": { "game": "chess", "region": "au" }
-    })],
-)?;
+    engine.dispatch(
+        "upsertUser",
+        vec![json!({
+            "id": "alice",
+            "scopes": { "game": "chess", "region": "au", "rating": 1450 },
+            "requirements": { "game": "chess", "region": "au" }
+        })],
+    )?;
 
-let result = engine.dispatch("autoJoin", vec![json!("alice")])?;
-println!("{result}");
+    let result = engine.dispatch("autoJoin", vec![json!("alice")])?;
+    println!("{result}");
+    Ok(())
+}
 ```
 
 `dispatch` returns `Ok(Value)` for a successful method call, including application-level failures such as `{ "ok": false, "reason": "no_fit" }`. It returns `Err(String)` for malformed input, unknown methods, invalid requirements, invalid generators, and invalid statuses.
@@ -117,26 +121,38 @@ The method names, argument order, and result shapes match the [Node engine refer
 | `reseed` | `seed` |
 
 ```rust
-let stats = engine.dispatch("stats", vec![])?;
-let events = engine.dispatch("drainEvents", vec![])?;
-let pending = engine.dispatch("pendingEvents", vec![])?;
-engine.dispatch("reseed", vec![json!(99)])?;
+use liveengine::Engine;
+use serde_json::json;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = Engine::new(42);
+    let stats = engine.dispatch("stats", vec![])?;
+    let events = engine.dispatch("drainEvents", vec![])?;
+    let pending = engine.dispatch("pendingEvents", vec![])?;
+    engine.dispatch("reseed", vec![json!(99)])?;
+    Ok(())
+}
 ```
 
 ## Rules module
 
 `rules` exposes the requirement parser and evaluator directly:
 
-```rust fragment
+```rust
 use liveengine::rules;
 
-let requirements = rules::parse_requirements(Some(&json!({
-    "region": ["au", "nz"],
-    "rating": { "between": [1200, 1800] }
-})))?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use serde_json::json;
+    let requirements = rules::parse_requirements(Some(&json!({
+        "region": ["au", "nz"],
+        "rating": { "between": [1200, 1800] }
+    })))?;
 
-let scopes = json!({ "region": "au", "rating": 1500 });
-assert!(rules::evaluate(&requirements, &scopes));
+    let scopes = json!({ "region": "au", "rating": 1500 });
+    assert!(rules::evaluate(&requirements, &scopes));
+    Ok(())
+}
 ```
 
 - `parse_requirements(Option<&Value>) -> Result<Value, String>` normalizes shorthand, arrays, and rule sets.
@@ -150,21 +166,28 @@ The internal representation is `{ "rules": [...], "match": "all" | "any" }`. See
 The engine uses a seeded ChaCha8 RNG. `Engine::new(seed)` and `reseed(seed)` control generated users and the `random` strategy. Generation specs follow the same schema as Node:
 
 ```rust
-let users = engine.dispatch(
-    "generateUsers",
-    vec![
-        json!(100),
-        json!({
-            "idPrefix": "bot-",
-            "scopes": {
-                "rating": { "type": "int", "min": 1000, "max": 2000 },
-                "region": ["eu", "us", "apac"],
-                "tags": { "type": "tags", "values": ["a", "b", "c"], "count": 2 }
-            },
-            "requirements": { "game": "chess" }
-        }),
-    ],
-)?;
+use liveengine::Engine;
+use serde_json::json;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = Engine::new(42);
+    let users = engine.dispatch(
+        "generateUsers",
+        vec![
+            json!(100),
+            json!({
+                "idPrefix": "bot-",
+                "scopes": {
+                    "rating": { "type": "int", "min": 1000, "max": 2000 },
+                    "region": ["eu", "us", "apac"],
+                    "tags": { "type": "tags", "values": ["a", "b", "c"], "count": 2 }
+                },
+                "requirements": { "game": "chess" }
+            }),
+        ],
+    )?;
+    Ok(())
+}
 ```
 
 Generation validates every generator before inserting users. Invalid ranges, probabilities, empty pools, unknown types, or output above 64 MiB return `Err` without partial mutation.
@@ -172,13 +195,20 @@ Generation validates every generator before inserting users. Invalid ranges, pro
 ## Errors
 
 ```rust
-match engine.dispatch("join", vec![json!("alice"), json!("room")]) {
-    Ok(result) => {
-        if result["ok"] == false {
-            eprintln!("application result: {}", result["reason"]);
+use liveengine::Engine;
+use serde_json::json;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = Engine::new(42);
+    match engine.dispatch("join", vec![json!("alice"), json!("room")]) {
+        Ok(result) => {
+            if result["ok"] == false {
+                eprintln!("application result: {}", result["reason"]);
+            }
         }
+        Err(message) => eprintln!("invalid call: {message}"),
     }
-    Err(message) => eprintln!("invalid call: {message}"),
+    Ok(())
 }
 ```
 

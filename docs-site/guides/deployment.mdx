@@ -68,7 +68,7 @@ Use `into_make_service_with_connect_info::<SocketAddr>()` so the peer rate budge
 
 You can also register custom handlers:
 
-```rust
+```rust fragment
 hubs.register_internal(registration, MyHandler).await?;
 ```
 

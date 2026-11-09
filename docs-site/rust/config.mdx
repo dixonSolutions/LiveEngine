@@ -7,7 +7,7 @@ description: "Every HubConfig field and default, the from_env mapping, and start
 
 ## Fields and defaults
 
-```rust
+```rust fragment
 pub struct HubConfig {
     pub token: String,
     pub allowed_remote_hosts: Vec<String>,
@@ -24,6 +24,7 @@ pub struct HubConfig {
     pub max_queued_calls: usize,
     pub max_pair_wait: Duration,
     pub max_pending_pairs: usize,
+    pub max_room_capacity: usize,
     pub rate_limit_requests: usize,
     pub rate_limit_window: Duration,
     pub rate_limit_peers: usize,
@@ -32,6 +33,7 @@ pub struct HubConfig {
     // Nesting, live and durability settings
     pub max_depth: usize,
     pub live_tree_depth: usize,
+    pub live_registry_max_subscribers: usize,
     pub instance_id: Option<String>,
     pub state_file: Option<std::path::PathBuf>,
     pub ticket_ttl: Duration,
@@ -78,28 +80,32 @@ The last nine fields map to `LIVEENGINE_MAX_DEPTH`, `LIVEENGINE_LIVE_TREE_DEPTH`
 
 ## Build programmatically
 
-```rust fragment
+```rust
 use liveengine::hub::HubConfig;
 use std::time::Duration;
 
-let config = HubConfig {
-    token: std::env::var("LIVEENGINE_TOKEN")?,
-    allowed_remote_hosts: vec!["remote".into()],
-    max_hubs: 512,
-    max_entities: 50_000,
-    max_events: 50_000,
-    request_timeout: Duration::from_secs(10),
-    max_ttl: Duration::from_secs(60 * 60),
-    rate_limit_requests: 240,
-    ..HubConfig::default()
-};
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = HubConfig {
+        token: std::env::var("LIVEENGINE_TOKEN")?,
+        allowed_remote_hosts: vec!["remote".into()],
+        max_hubs: 512,
+        max_entities: 50_000,
+        max_events: 50_000,
+        request_timeout: Duration::from_secs(10),
+        max_ttl: Duration::from_secs(60 * 60),
+        rate_limit_requests: 240,
+        ..HubConfig::default()
+    };
+    Ok(())
+}
 ```
 
 `request_timeout` and `max_ttl` are Rust-only settings; the standalone binary does not expose environment variables for them. The remaining limits and the allowlist have environment equivalents.
 
 ## from_env
 
-```rust
+```rust fragment
 pub fn from_env() -> Result<Self, String>
 ```
 

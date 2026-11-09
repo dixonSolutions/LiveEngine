@@ -162,21 +162,26 @@ const descriptor = await hub.pair({
 
 The Rust `HubClient` has no `discover` or `pair` method. Use `request` for the endpoints, or `route` for a namespace:
 
-```rust fragment
+```rust
 use liveengine::hub::HubClient;
 use reqwest::Method;
 use serde_json::json;
 
-let hub = HubClient::new("http://127.0.0.1:8787", token)?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let token = std::env::var("LIVEENGINE_TOKEN")?;
+    let hub = HubClient::new("http://127.0.0.1:8787", token)?;
 
-let found = hub.request(Method::POST, "/v1/discover", Some(json!({
-    "kind": "hub", "depth": 2, "requirements": { "zone": "a" }
-}))).await?;
+    let found = hub.request(Method::POST, "/v1/discover", Some(json!({
+        "kind": "hub", "depth": 2, "requirements": { "zone": "a" }
+    }))).await?;
 
-let descriptor = hub.route(&["eu".to_string()], "pair", json!({
-    "subject": { "kind": "peer", "id": "user-a", "scopes": { "zone": "a" } },
-    "target": { "kind": "hub", "id": "hub-a" }
-})).await?;
+    let descriptor = hub.route(&["eu".to_string()], "pair", json!({
+        "subject": { "kind": "peer", "id": "user-a", "scopes": { "zone": "a" } },
+        "target": { "kind": "hub", "id": "hub-a" }
+    })).await?;
+    Ok(())
+}
 ```
 
 The Rust client times out after five seconds, so it cannot wait for a partner for longer than that; see [peer-to-peer](/guides/peer-to-peer).

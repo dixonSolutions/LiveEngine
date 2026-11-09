@@ -167,7 +167,7 @@ app.post('/api/room-ticket', async (req, res) => {
 
 ### Rust
 
-```rust
+```rust fragment
 let issued = hub.ticket(&[], "hub-a", "user-a", "room-1", "peer", None).await?;
 println!("{}", issued["url"]);
 ```

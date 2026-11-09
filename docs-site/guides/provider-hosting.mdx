@@ -48,19 +48,24 @@ The response is the public hub record plus two members: `"hosting": "provider"` 
 
 ### Rust
 
-```rust fragment
+```rust
 use liveengine::hub::{HubConfig, HubService, HubSpec};
 use serde_json::json;
 
-let service = HubService::new(HubConfig { token: token.into(), ..HubConfig::default() })?;
-let hosted = service.register_hosted(HubSpec {
-    id: "tenant-a".into(),
-    hosting: Some("provider".into()),
-    max_hubs: Some(16),
-    scopes: json!({}),
-    ..HubSpec::default()
-}).await?;
-println!("{}", hosted.credential); // returned once
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let token = std::env::var("LIVEENGINE_TOKEN")?;
+    let service = HubService::new(HubConfig { token: token.into(), ..HubConfig::default() })?;
+    let hosted = service.register_hosted(HubSpec {
+        id: "tenant-a".into(),
+        hosting: Some("provider".into()),
+        max_hubs: Some(16),
+        scopes: json!({}),
+        ..HubSpec::default()
+    }).await?;
+    println!("{}", hosted.credential); // returned once
+    Ok(())
+}
 ```
 
 `register_hosted` sets the mode to `central` if you leave it out and requires `hosting` to be `"provider"`. It fails if the hub already exists: with `if_absent` set the error is `hub already exists, so no credential was issued`; without it, `hub id already registered`. `HubService::register` refuses a spec that has `hosting`, so a credential cannot be dropped by accident. Over HTTP, a hosted hub must be a local central: `address`, `remoteToken` and `remoteHubId` are refused (`400 provider hosting requires a central hub without address or remote credentials`).
@@ -90,15 +95,20 @@ A holder's `pair` and `discover` run inside the hosted hub. For example `tenant.
 
 ### Rust
 
-```rust fragment
+```rust
 use liveengine::hub::HubClient;
 use serde_json::json;
 
-let tenant = HubClient::new("https://hub.example.net", credential)?;
-tenant.route(&["tenant-a".to_string()], "register",
-    json!({ "id": "hub-1", "mode": "internal" })).await?;
-let issued = tenant.route(&["tenant-a".to_string()], "ticket",
-    json!({ "id": "hub-1", "userId": "user-a", "serverId": "room-1" })).await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let credential = std::env::var("LIVEENGINE_CREDENTIAL")?;
+    let tenant = HubClient::new("https://hub.example.net", credential)?;
+    tenant.route(&["tenant-a".to_string()], "register",
+        json!({ "id": "hub-1", "mode": "internal" })).await?;
+    let issued = tenant.route(&["tenant-a".to_string()], "ticket",
+        json!({ "id": "hub-1", "userId": "user-a", "serverId": "room-1" })).await?;
+    Ok(())
+}
 ```
 
 `HubClient::ticket` works with a non-empty path, because it then uses the `ticket` route operation. `watch_ticket` always uses `/v1/tickets/watch`, which a scoped credential cannot reach: use `route(path, "watchTicket", ...)` instead.
