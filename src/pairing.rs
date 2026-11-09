@@ -961,6 +961,7 @@ async fn pair_once(
     let mut taken = None;
     let mut target_credential = body["target"]["credential"].clone();
     let mut candidate_scopes = Value::Null;
+    let mut candidate_seated = false;
     if let Some(candidates) = found["candidates"].as_array() {
         for candidate in candidates {
             if candidate["kind"] == kind && candidate["id"] == id {
@@ -1025,6 +1026,7 @@ async fn pair_once(
                     continue;
                 };
                 candidate_scopes = user["result"]["scopes"].clone();
+                candidate_seated = user["result"]["serverId"].is_string();
                 if user["result"]["status"] == "idle"
                     || !rules::evaluate(&user["result"]["requirements"], &subject["scopes"])
                 {
@@ -1060,6 +1062,10 @@ async fn pair_once(
                 ) {
                     Claim::Lost => break,
                     Claim::Skip => continue,
+                    // A registered peer that is neither queued nor seated has no request of its
+                    // own to answer: pairing it would seat it without a ticket. A waiting caller
+                    // only joins a peer that is already seated, or one that queued itself.
+                    Claim::Direct if seat.is_some() && !candidate_seated => continue,
                     Claim::Direct => {}
                     Claim::Taken((wake, credential)) => {
                         taken = Some(wake);
@@ -1234,26 +1240,6 @@ async fn pair_once(
         }
         // Peers waiting on a candidate they could not use may find this room worth joining.
         state.pending.changed();
-        // The waiter is told as soon as the engine holds the pairing; if it already left, the
-        // pairing is undone for it.
-        if let Some(wake) = taken.take() {
-            let matched = Matched {
-                path: path.clone(),
-                hub_id: hub_id.clone(),
-                room: room.clone(),
-            };
-            if wake.send(matched).is_err() {
-                let _ = routed(
-                    state.clone(),
-                    headers.clone(),
-                    path.clone(),
-                    "call",
-                    call("leave", vec![json!(target_id)]),
-                    inherited.clone(),
-                )
-                .await;
-            }
-        }
     } else {
         if existing.is_none() {
             let server = json!({"id":room,"scopes":target_scopes,"capacity":capacity});
@@ -1321,20 +1307,56 @@ async fn pair_once(
         ("hub", false) => "hub-hub",
         _ => "peer-hub",
     };
-    ticket_descriptor(
-        state,
-        headers,
-        path,
+    let response = ticket_descriptor(
+        state.clone(),
+        headers.clone(),
+        path.clone(),
         &hub_id,
         id,
         &room,
         role,
         &proof,
         link,
-        inherited,
+        inherited.clone(),
         inherited_channels,
     )
-    .await
+    .await;
+    if !peer {
+        return response;
+    }
+    // A pairing reported as failed leaves nobody seated: the caller leaves the room, and so does a
+    // partner that was seated by this request alone. A claimed waiter is dropped unwoken, so it
+    // queues again.
+    let mut leaving = Vec::new();
+    if !response.status().is_success() {
+        leaving.push(id);
+        if existing.is_none() {
+            leaving.push(target_id);
+        }
+    } else if let Some(wake) = taken.take() {
+        // The waiter is told once the pairing holds for both; if it already left, the pairing is
+        // undone for it.
+        let matched = Matched {
+            path: path.clone(),
+            hub_id: hub_id.clone(),
+            room: room.clone(),
+        };
+        if wake.send(matched).is_err() {
+            leaving.push(target_id);
+        }
+    }
+    for leaver in leaving {
+        let _ = routed(
+            state.clone(),
+            headers.clone(),
+            path.clone(),
+            "call",
+            call("leave", vec![json!(leaver)]),
+            inherited.clone(),
+        )
+        .await;
+    }
+    response
 }
 
 /// The credential is checked once. A hub that verified it returns a receipt, which the

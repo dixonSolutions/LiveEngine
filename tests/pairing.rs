@@ -652,6 +652,48 @@ async fn a_waiting_peer_is_woken_by_the_later_arrival() {
     task.abort();
 }
 
+/// Both peers are registered before either asks to pair. The waiter must not seat the registered
+/// arrival on its own: it queues, the arrival claims it, and both get tickets for one room.
+async fn a_registered_arrival_pairs_with_a_waiter(config: HubConfig) {
+    let (base, task) = server_with(config).await;
+    let c = reqwest::Client::new();
+    arena(&c, &base, TOKEN).await;
+    register(&c, &base, TOKEN, "early").await;
+    register(&c, &base, TOKEN, "late").await;
+    let early = spawn_pair(&c, &base, TOKEN, wait_request("early", 3000));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !early.is_finished(),
+        "the waiter must not pair with an idle registration"
+    );
+    for user in users(&c, &base, TOKEN).await {
+        assert_eq!(user["status"], "waiting", "{user}");
+    }
+    let (status, late) = post(&c, &base, TOKEN, "/v1/pair", wait_request("late", 0)).await;
+    assert_eq!(status, 200, "{late}");
+    let (status, early) = early.await.unwrap();
+    assert_eq!(status, 200, "{early}");
+    assert_eq!(early["room"], late["room"]);
+    assert_ne!(early["ticket"], late["ticket"]);
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_registered_arrival_pairs_with_a_waiter_under_the_waiting_config() {
+    a_registered_arrival_pairs_with_a_waiter(waiting_config(TOKEN)).await;
+}
+
+#[tokio::test]
+async fn a_registered_arrival_pairs_with_a_waiter_under_the_default_config() {
+    a_registered_arrival_pairs_with_a_waiter(HubConfig {
+        token: TOKEN.into(),
+        allowed_remote_hosts: vec!["127.0.0.1".into()],
+        public_url: Some("ws://live.example.test/v1/live".into()),
+        ..HubConfig::default()
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_wait_that_times_out_leaves_no_state_behind() {
     let (base, task) = server_with(waiting_config(TOKEN)).await;

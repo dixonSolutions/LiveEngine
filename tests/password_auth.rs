@@ -704,3 +704,76 @@ async fn generation_changes_invalidate_tickets_and_close_only_owner_sockets() {
         assert_ne!(event["type"], "error", "{change}");
     }
 }
+
+/// Password auth is opt-in per hub: accounts on a service never lock down its open hubs.
+#[tokio::test]
+async fn open_hubs_stay_open_when_the_service_has_accounts() {
+    let s = std::sync::Arc::new(server().await);
+    account(&s, "alice", "admin").await;
+    for (id, body) in [
+        (
+            "open",
+            json!({"id":"open","mode":"internal","scopes":{"game":"open"}}),
+        ),
+        (
+            "locked",
+            json!({"id":"locked","mode":"internal","scopes":{"game":"locked"},"auth":{"kind":"password"}}),
+        ),
+    ] {
+        assert_eq!(post(&s, "/v1/hubs", body).await.0, 201, "{id}");
+        for u in [format!("{id}-a"), format!("{id}-b")] {
+            call(&s, id, "upsertUser", json!([{"id":u,"scopes":{"game":id}}])).await;
+        }
+    }
+    let pair = |hub: &str, id: &str, wait| json!({"subject":{"kind":"peer","id":id,"scopes":{"game":hub}},"target":{"kind":"peer","requirements":{"game":hub}},"waitMs":wait});
+    assert_eq!(
+        post(&s, "/v1/pair", pair("locked", "locked-a", 0)).await.0,
+        403
+    );
+    let waiting = {
+        let s = s.clone();
+        let body = pair("open", "open-a", 3000);
+        tokio::spawn(async move { post(&s, "/v1/pair", body).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (status, b) = post(&s, "/v1/pair", pair("open", "open-b", 0)).await;
+    assert_eq!(status, 200, "{b}");
+    let (status, a) = waiting.await.unwrap();
+    assert_eq!(status, 200, "{a}");
+    assert_eq!(a["room"], b["room"]);
+    assert!(a.get("identity").is_none_or(Value::is_null), "{a}");
+    assert!(a["ticket"].is_string() && b["ticket"].is_string());
+}
+
+/// The waiter and the arrival must agree: both paired into one room, or neither.
+#[tokio::test]
+async fn an_open_hub_pairs_a_waiter_and_an_arrival_consistently() {
+    let s = std::sync::Arc::new(server().await);
+    assert_eq!(
+        post(&s, "/v1/hubs", json!({"id":"game","mode":"internal"}))
+            .await
+            .0,
+        201
+    );
+    for u in ["alice", "bob"] {
+        call(
+            &s,
+            "game",
+            "upsertUser",
+            json!([{"id":u,"scopes":{"game":"g"}}]),
+        )
+        .await;
+    }
+    let pair = |id: &str, wait| json!({"subject":{"kind":"peer","id":id,"scopes":{"game":"g"}},"target":{"kind":"peer","requirements":{"game":"g"}},"waitMs":wait});
+    let waiting = {
+        let s = s.clone();
+        let body = pair("alice", 3000);
+        tokio::spawn(async move { post(&s, "/v1/pair", body).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (status, b) = post(&s, "/v1/pair", pair("bob", 0)).await;
+    assert_eq!(status, 200, "the arrival must pair with the waiter: {b}");
+    let (status, a) = waiting.await.unwrap();
+    assert_eq!(status, 200, "{a}");
+    assert_eq!(a["room"], b["room"]);
+}
