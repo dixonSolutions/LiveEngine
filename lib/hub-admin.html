@@ -1,16 +1,281 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Hub administration</title><style>body{font:1rem/1.5 system-ui,sans-serif;max-width:70rem;margin:2rem auto;padding:0 1rem;color:#222}label{display:block;margin:.6rem 0}input,select,button{font:inherit;padding:.35rem}button{cursor:pointer}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{text-align:left;border-bottom:1px solid #999;padding:.5rem}#message{min-height:1.5em}section{margin:2rem 0} .scroll{overflow:auto}</style></head><body>
-<h1>Hub administration</h1><p id="message" role="status" aria-live="polite"></p>
-<section><h2>Create account</h2><form id="create"><label>Username <input name="username" required minlength="3" maxlength="64" autocomplete="username"></label><label>Password <input name="password" type="password" required minlength="10" autocomplete="new-password"></label><label>Role <select name="role"><option value="user">User</option><option value="admin">Admin</option></select></label><button>Create account</button></form></section>
-<section><h2>Accounts</h2><button id="refresh-accounts">Refresh accounts</button><div class="scroll"><table><thead><tr><th scope="col">Username</th><th scope="col">Enabled</th><th scope="col">Role</th><th scope="col">Actions</th></tr></thead><tbody id="accounts"></tbody></table></div></section>
-<section><h2>Connections</h2><button id="refresh-connections">Refresh connections</button><div class="scroll"><table><thead><tr><th scope="col">User</th><th scope="col">Hub</th><th scope="col">Room</th><th scope="col">Action</th></tr></thead><tbody id="connections"></tbody></table></div></section>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>Hub administration</title>
+<style>
+:root{--bg:#f4f5f7;--surface:#fff;--surface-2:#eef0f3;--text:#1b1f27;--muted:#505866;--border:#cfd4dc;--accent:#2457c5;--accent-text:#fff;--accent-soft:#e3ebfb;--danger:#b3261e;--danger-soft:#fbe7e5;--ok:#17653a;--ok-soft:#e1f3e8;--warn:#7a4b00;--warn-soft:#fdf0d5;--focus:#1a56db;--shadow:0 1px 2px rgba(20,25,35,.08);
+--font:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--s1:.25rem;--s2:.5rem;--s3:.75rem;--s4:1rem;--s5:1.5rem;--s6:2rem;--radius:.5rem}
+@media (prefers-color-scheme:dark){:root{--bg:#12151b;--surface:#1b2029;--surface-2:#242a35;--text:#e8ebf1;--muted:#a9b2c1;--border:#3a4352;--accent:#7aa2f7;--accent-text:#0d1220;--accent-soft:#222e4a;--danger:#ff8a80;--danger-soft:#3b1f1f;--ok:#7fd69c;--ok-soft:#1c3326;--warn:#f2c46d;--warn-soft:#3a2d12;--focus:#9db9ff;--shadow:none}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:1rem/1.5 var(--font)}
+.wrap{max-width:72rem;margin:0 auto;padding:var(--s4)}
+header.top{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:var(--s3);margin-bottom:var(--s4)}
+h1{font-size:1.5rem;line-height:1.25;margin:0}
+h2{font-size:1.125rem;line-height:1.3;margin:0}
+.who{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap;color:var(--muted);font-size:.9375rem}
+.who strong{color:var(--text)}
+#message{min-height:2.75rem;margin:0 0 var(--s4);padding:var(--s2) var(--s3);border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--muted)}
+#message.ok{background:var(--ok-soft);color:var(--ok);border-color:var(--ok)}
+#message.error{background:var(--danger-soft);color:var(--danger);border-color:var(--danger)}
+.summary{display:flex;flex-wrap:wrap;gap:var(--s3);margin:0 0 var(--s4);padding:0;list-style:none}
+.summary li{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:var(--s2) var(--s4);box-shadow:var(--shadow);min-width:7rem}
+.summary b{display:block;font-size:1.5rem;line-height:1.2}
+.summary span{color:var(--muted);font-size:.875rem}
+section.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:var(--s4);margin:0 0 var(--s4);box-shadow:var(--shadow)}
+.card-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:var(--s2) var(--s3);margin-bottom:var(--s3)}
+.hint{color:var(--muted);font-size:.875rem;margin:0}
+form.row{display:flex;flex-wrap:wrap;gap:var(--s3);align-items:flex-end}
+.field{display:flex;flex-direction:column;gap:var(--s1);min-width:11rem;flex:1 1 11rem}
+.field label,.field .lbl{font-size:.875rem;font-weight:600}
+input,select,button{font:inherit;color:inherit}
+input,select{background:var(--surface);border:1px solid var(--border);border-radius:.375rem;padding:.45rem .6rem;min-height:2.5rem;width:100%}
+input::placeholder{color:var(--muted);opacity:1}
+button{cursor:pointer;min-height:2.5rem;padding:.4rem .9rem;border-radius:.375rem;border:1px solid var(--border);background:var(--surface-2);font-weight:600}
+button:hover{border-color:var(--muted)}
+button.primary{background:var(--accent);color:var(--accent-text);border-color:var(--accent)}
+button.danger{color:var(--danger);border-color:var(--danger);background:transparent}
+button.danger:hover{background:var(--danger-soft)}
+button.small{min-height:2.25rem;padding:.25rem .65rem;font-size:.875rem}
+button:disabled{opacity:.6;cursor:not-allowed}
+:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+.scroll{overflow-x:auto;border:1px solid var(--border);border-radius:var(--radius);max-width:100%}
+table{border-collapse:collapse;width:100%;min-width:40rem}
+th,td{text-align:left;padding:.6rem .75rem;border-bottom:1px solid var(--border);vertical-align:middle}
+th{background:var(--surface-2);font-size:.8125rem;font-weight:700;color:var(--muted);white-space:nowrap}
+tbody tr:last-child td{border-bottom:0}
+td.name{font-weight:600;overflow-wrap:anywhere}
+.actions{display:flex;flex-wrap:wrap;gap:var(--s2);align-items:center}
+.actions .inline{display:flex;gap:var(--s2);align-items:center}
+.actions select,.actions input{width:auto;min-height:2.25rem;padding:.25rem .5rem}
+.actions input{width:11rem}
+.badge{display:inline-block;padding:.1rem .6rem;border-radius:999px;font-size:.8125rem;font-weight:700;border:1px solid transparent}
+.badge.admin{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
+.badge.user{background:var(--surface-2);color:var(--muted);border-color:var(--border)}
+.badge.on{background:var(--ok-soft);color:var(--ok);border-color:var(--ok)}
+.badge.off{background:var(--warn-soft);color:var(--warn);border-color:var(--warn)}
+.empty{color:var(--muted);text-align:center;padding:var(--s5) var(--s3)}
+#signin{max-width:26rem;margin:var(--s5) auto}
+#signin form{display:flex;flex-direction:column;gap:var(--s3)}
+[hidden]{display:none!important}
+@media (max-width:40rem){.wrap{padding:var(--s3)}h1{font-size:1.25rem}.summary li{flex:1 1 40%;min-width:0}.actions input{width:100%}.actions .inline{width:100%}button{min-height:2.75rem}}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+#message:empty{display:none}#signin form>*{flex:0 0 auto}#signin-hint{margin:0 0 var(--s3)}</style></head><body><div class="wrap">
+<header class="top"><h1>Hub administration</h1>
+<div class="who" id="who" hidden><span>Signed in as <strong id="who-name"></strong></span><span class="badge" id="who-role"></span><button type="button" id="signout" class="small">Sign out</button></div></header>
+<p id="message" role="status" aria-live="polite"></p>
+
+<section class="card" id="signin" hidden aria-labelledby="signin-title">
+<div class="card-head"><h2 id="signin-title">Sign in</h2></div>
+<p class="hint" id="signin-hint">Sign in with an administrator account to manage accounts and connections.</p>
+<form id="signin-form" autocomplete="on">
+<div class="field"><label for="si-user">Username</label><input id="si-user" required autocomplete="username" autocapitalize="none" spellcheck="false"></div>
+<div class="field"><label for="si-pass">Password</label><input id="si-pass" type="password" required autocomplete="current-password"></div>
+<button class="primary" type="submit">Sign in</button>
+</form></section>
+
+<main id="console" hidden>
+<ul class="summary" aria-label="Summary">
+<li><b id="n-accounts">0</b><span>Accounts</span></li>
+<li><b id="n-admins">0</b><span>Admins</span></li>
+<li><b id="n-disabled">0</b><span>Disabled</span></li>
+<li><b id="n-connections">0</b><span>Live connections</span></li>
+</ul>
+
+<section class="card" aria-labelledby="create-title">
+<div class="card-head"><h2 id="create-title">Create account</h2><p class="hint">Passwords need at least 10 characters.</p></div>
+<form id="create" class="row">
+<div class="field"><label for="c-user">Username</label><input id="c-user" name="username" required minlength="3" maxlength="64" autocomplete="username" autocapitalize="none" spellcheck="false"></div>
+<div class="field"><label for="c-pass">Password</label><input id="c-pass" name="password" type="password" required minlength="10" autocomplete="new-password"></div>
+<div class="field"><label for="c-role">Role</label><select id="c-role" name="role"><option value="user">User</option><option value="admin">Admin</option></select></div>
+<button class="primary" type="submit">Create account</button>
+</form></section>
+
+<section class="card" aria-labelledby="accounts-title">
+<div class="card-head"><h2 id="accounts-title">Accounts</h2><button type="button" id="refresh-accounts" class="small">Refresh accounts</button></div>
+<div class="scroll" tabindex="0" role="region" aria-label="Accounts table"><table><thead><tr><th scope="col">Username</th><th scope="col">Enabled</th><th scope="col">Role</th><th scope="col">Actions</th></tr></thead><tbody id="accounts"></tbody></table></div>
+<p class="empty" id="accounts-empty" hidden>No accounts yet. Create one above.</p>
+</section>
+
+<section class="card" aria-labelledby="conn-title">
+<div class="card-head"><h2 id="conn-title">Connections</h2><div class="actions"><span class="hint" id="updated" aria-live="off">Not updated yet</span><button type="button" id="refresh-connections" class="small">Refresh connections</button></div></div>
+<div class="scroll" tabindex="0" role="region" aria-label="Connections table"><table><thead><tr><th scope="col">User</th><th scope="col">Hub</th><th scope="col">Room</th><th scope="col">Action</th></tr></thead><tbody id="connections"></tbody></table></div>
+<p class="empty" id="connections-empty" hidden>No live connections right now. This list refreshes by itself.</p>
+</section>
+</main>
+</div>
 <script>
-const message=document.querySelector('#message'), base=location.pathname.replace(/\/$/,'');
-async function api(path,method='GET',body){const r=await fetch(base+'/'+path,{method,headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});const data=await r.json();if(!r.ok)throw Error(data.error||'Request failed');return data}
-function notice(error){message.textContent=error instanceof Error?error.message:error}
-function cell(row,text){const td=row.insertCell();td.textContent=text;return td}
-function button(text,action){const b=document.createElement('button');b.type='button';b.textContent=text;b.addEventListener('click',()=>Promise.resolve().then(action).catch(notice));return b}
-async function accounts(){const rows=await api('accounts'), body=document.querySelector('#accounts');body.replaceChildren();for(const a of rows){const row=body.insertRow();cell(row,a.username);cell(row,a.enabled?'Yes':'No');cell(row,a.role);const actions=cell(row,'');actions.append(button(a.enabled?'Disable':'Enable',async()=>{await api('accounts/'+encodeURIComponent(a.username),'PATCH',{enabled:!a.enabled});await accounts();notice('Account updated')}));const role=document.createElement('select');role.setAttribute('aria-label','Role for '+a.username);for(const r of ['user','admin']){const option=document.createElement('option');option.value=r;option.textContent=r;role.append(option)}role.value=a.role;actions.append(' ',role,' ',button('Change role',async()=>{await api('accounts/'+encodeURIComponent(a.username),'PATCH',{role:role.value});await accounts();notice('Role updated')}));const password=document.createElement('input');password.type='password';password.autocomplete='new-password';password.setAttribute('aria-label','New password for '+a.username);actions.append(' ',password,' ',button('Reset password',async()=>{await api('accounts/'+encodeURIComponent(a.username),'PATCH',{password:password.value});password.value='';notice('Password reset')}))}}
-async function connections(){const rows=await api('connections'), body=document.querySelector('#connections');body.replaceChildren();for(const c of rows){const row=body.insertRow();cell(row,c.user);cell(row,Array.isArray(c.hub)?c.hub.join('/'):c.hub);cell(row,c.room);cell(row,'').append(button('Kick '+c.user,async()=>{await api('connections/'+encodeURIComponent(c.id),'DELETE');await connections();notice('Connection kicked')}))}}
-document.querySelector('#create').addEventListener('submit',async e=>{e.preventDefault();const form=e.currentTarget;try{await api('accounts','POST',Object.fromEntries(new FormData(form)));form.reset();await accounts();notice('Account created')}catch(error){notice(error)}});document.querySelector('#refresh-accounts').onclick=()=>accounts().catch(notice);document.querySelector('#refresh-connections').onclick=()=>connections().catch(notice);accounts().catch(notice);connections().catch(notice);
+const $ = s => document.querySelector(s);
+const message = $('#message');
+const base = location.pathname.replace(/\/$/, '');
+const apiBase = base.replace(/\/admin$/, '');
+let me = null, lastAccounts = [], lastConnections = null, timer = null;
+
+class HttpError extends Error { constructor(text, status) { super(text); this.status = status; } }
+async function call(url, method = 'GET', body) {
+  const r = await fetch(url, { method, credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new HttpError(data.error || 'The request failed (' + r.status + ')', r.status);
+  return data;
+}
+const api = (path, method, body) => call(base + '/' + path, method, body);
+
+function notice(value, kind) {
+  const error = value instanceof Error;
+  message.textContent = error ? value.message : value;
+  message.className = kind || (error ? 'error' : 'ok');
+}
+function fail(error) {
+  if (error instanceof HttpError && (error.status === 401 || error.status === 403)) return showSignIn(error.status);
+  notice(error);
+}
+function el(tag, props, ...kids) { const e = Object.assign(document.createElement(tag), props); e.append(...kids); return e; }
+function badge(text, cls) { return el('span', { className: 'badge ' + cls, textContent: text }); }
+function cell(row, content, cls) { const td = row.insertCell(); if (cls) td.className = cls; if (content instanceof Node) td.append(content); else td.textContent = content; return td; }
+function button(text, action, cls = '') {
+  const b = el('button', { type: 'button', textContent: text, className: ('small ' + cls).trim() });
+  b.addEventListener('click', () => Promise.resolve().then(action).catch(fail));
+  return b;
+}
+
+function showSignIn(status) {
+  stopLive();
+  me = null;
+  $('#console').hidden = true; $('#who').hidden = true; $('#signin').hidden = false;
+  $('#signin-hint').textContent = status === 403 ? 'This account is not an admin. Sign in with an administrator account.' : 'Sign in with an administrator account to manage accounts and connections.';
+  notice(status === 403 ? 'This account is not an admin.' : 'Please sign in to continue.', status === 403 ? 'error' : 'info');
+  $('#si-user').focus();
+}
+
+function summarize() {
+  $('#n-accounts').textContent = lastAccounts.length;
+  $('#n-admins').textContent = lastAccounts.filter(a => a.role === 'admin').length;
+  $('#n-disabled').textContent = lastAccounts.filter(a => !a.enabled).length;
+  $('#n-connections').textContent = lastConnections ? lastConnections.length : 0;
+}
+
+async function accounts() {
+  lastAccounts = await api('accounts');
+  const body = $('#accounts');
+  body.replaceChildren();
+  $('#accounts-empty').hidden = lastAccounts.length > 0;
+  for (const a of lastAccounts) {
+    const name = a.username, path = 'accounts/' + encodeURIComponent(name);
+    const row = body.insertRow();
+    cell(row, name, 'name');
+    cell(row, a.enabled ? 'Yes' : 'No').replaceChildren(badge(a.enabled ? 'Yes' : 'No', a.enabled ? 'on' : 'off'));
+    cell(row, '').replaceChildren(badge(a.role, a.role === 'admin' ? 'admin' : 'user'));
+    const actions = el('div', { className: 'actions' });
+    cell(row, actions);
+    const toggle = button(a.enabled ? 'Disable' : 'Enable', async () => {
+      if (a.enabled && !confirm('Disable the account "' + name + '"? They will be signed out and cannot sign in until you enable it again.')) return;
+      await api(path, 'PATCH', { enabled: !a.enabled });
+      await accounts(); notice('Account updated');
+    });
+    toggle.setAttribute('aria-label', (a.enabled ? 'Disable ' : 'Enable ') + name);
+    const role = el('select', {});
+    role.setAttribute('aria-label', 'Role for ' + name);
+    for (const r of ['user', 'admin']) role.append(el('option', { value: r, textContent: r }));
+    role.value = a.role;
+    const changeRole = button('Change role', async () => {
+      if (role.value === a.role) return notice('That is already the role of ' + name + '.', '');
+      if (!confirm('Change the role of "' + name + '" to ' + role.value + '?')) return;
+      await api(path, 'PATCH', { role: role.value });
+      await accounts(); notice('Role updated');
+    });
+    changeRole.setAttribute('aria-label', 'Change role of ' + name);
+    const password = el('input', { type: 'password', autocomplete: 'new-password', placeholder: 'New password', minLength: 10 });
+    password.setAttribute('aria-label', 'New password for ' + name);
+    const reset = button('Reset password', async () => {
+      if (!password.value) { password.focus(); return notice('Type a new password for ' + name + ' first.', 'error'); }
+      if (!confirm('Reset the password of "' + name + '"? They will be signed out everywhere.')) return;
+      const value = password.value;
+      password.value = '';
+      await api(path, 'PATCH', { password: value });
+      notice('Password reset');
+    });
+    reset.setAttribute('aria-label', 'Reset password for ' + name);
+    const del = button('Delete', async () => {
+      if (!confirm('Delete the account "' + name + '"? This cannot be undone.')) return;
+      await api(path, 'DELETE');
+      await accounts(); notice('Account deleted');
+    }, 'danger');
+    del.setAttribute('aria-label', 'Delete ' + name);
+    actions.append(toggle, el('span', { className: 'inline' }, role, changeRole), el('span', { className: 'inline' }, password, reset), del);
+  }
+  summarize();
+}
+
+async function connections() {
+  const rows = await api('connections');
+  const key = JSON.stringify(rows);
+  stamp();
+  if (key === lastConnections?.key) return;
+  lastConnections = Object.assign(rows, { key });
+  const body = $('#connections');
+  body.replaceChildren();
+  $('#connections-empty').hidden = rows.length > 0;
+  for (const c of rows) {
+    const row = body.insertRow();
+    cell(row, c.user, 'name');
+    cell(row, Array.isArray(c.hub) ? c.hub.join('/') : c.hub);
+    cell(row, c.room);
+    cell(row, button('Kick ' + c.user, async () => {
+      if (!confirm('Kick "' + c.user + '"? Their live connection will be closed.')) return;
+      await api('connections/' + encodeURIComponent(c.id), 'DELETE');
+      await connections(); notice('Connection kicked');
+    }, 'danger'));
+  }
+  summarize();
+}
+function stamp() { $('#updated').textContent = 'Updated ' + new Date().toLocaleTimeString(); }
+
+function startLive() {
+  stopLive();
+  timer = setInterval(() => { if (!document.hidden && me) connections().catch(fail); }, 5000);
+}
+function stopLive() { clearInterval(timer); timer = null; }
+document.addEventListener('visibilitychange', () => { if (!document.hidden && me) connections().catch(fail); });
+
+async function load() {
+  const who = await call(apiBase + '/me');
+  const account = who.account || who;
+  if (account.role !== 'admin') { const e = new HttpError('This account is not an admin', 403); throw e; }
+  me = account;
+  $('#signin').hidden = true; $('#console').hidden = false; $('#who').hidden = false;
+  $('#who-name').textContent = account.username;
+  const roleBadge = $('#who-role'); roleBadge.textContent = account.role; roleBadge.className = 'badge admin';
+  await Promise.all([accounts(), connections()]);
+  startLive();
+}
+
+$('#create').addEventListener('submit', async e => {
+  e.preventDefault();
+  const form = e.currentTarget;
+  try {
+    await api('accounts', 'POST', Object.fromEntries(new FormData(form)));
+    form.reset();
+    await accounts(); notice('Account created');
+  } catch (error) { fail(error); }
+});
+$('#signin-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const data = { username: $('#si-user').value, password: $('#si-pass').value };
+  try {
+    await call(apiBase + '/login', 'POST', data);
+    $('#si-pass').value = '';
+    notice('Signed in.');
+    await load();
+  } catch (error) {
+    $('#si-pass').value = '';
+    if (error instanceof HttpError && error.status === 403) showSignIn(403);
+    else notice(error);
+  }
+});
+$('#signout').addEventListener('click', async () => {
+  try { await call(apiBase + '/logout', 'POST', {}); } catch (error) { return notice(error); }
+  showSignIn(401);
+  notice('You are signed out.', '');
+});
+$('#refresh-accounts').addEventListener('click', () => accounts().then(() => notice('Accounts refreshed.', '')).catch(fail));
+$('#refresh-connections').addEventListener('click', () => connections().catch(fail));
+load().catch(fail);
 </script></body></html>

@@ -366,6 +366,7 @@ const waitError = (player, pattern, ms = 30_000) => player.page.waitForFunction(
 async function openConsole(player) {
   const [popup] = await Promise.all([player.context.waitForEvent('page'), player.page.locator('#admin-link').click()]);
   popup.setDefaultTimeout(30_000);
+  popup.on('dialog', dialog => dialog.accept()); // the console asks before disabling, deleting, kicking or resetting a password
   popup.on('pageerror', error => { player.errors.push(`console: ${error.message}`); pageErrors.push(`${player.label} console: ${error.message}`); });
   await popup.waitForLoadState('domcontentloaded');
   await popup.getByRole('heading', {name: 'Hub administration'}).waitFor();
