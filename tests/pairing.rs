@@ -161,6 +161,13 @@ async fn pairing_returns_each_link_kind_through_a_remote_nest() {
     )
     .await;
     assert_eq!(status, 201, "{body}");
+    let waiter = spawn_pair(
+        &c,
+        &remote,
+        REMOTE,
+        json!({"subject":{"kind":"peer","id":"alice","scopes":{"rank":7}},"target":{"kind":"peer","requirements":{"skill":2}},"waitMs":3000}),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     for (subject, target, link) in [
         (
             json!({"kind":"peer","id":"bob","scopes":{"rank":7,"skill":2}}),
@@ -193,6 +200,8 @@ async fn pairing_returns_each_link_kind_through_a_remote_nest() {
         assert_eq!(body["transports"], json!(["webrtc", "websocket"]));
         assert!(!body.to_string().contains(REMOTE));
     }
+    let (status, body) = waiter.await.unwrap();
+    assert_eq!(status, 200, "{body}");
     let (status, body) = post(&c, &root, TOKEN, "/v1/route", json!({"path":["nest"],"op":"pair","body":{"subject":{"kind":"peer","id":"dave","scopes":{"rank":7,"skill":2}},"target":{"kind":"peer","requirements":{"rank":7}}}})).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["link"], "peer-peer");
@@ -247,9 +256,16 @@ async fn peer_pairing_uses_user_schema_and_rolls_back_failures() {
     )
     .await;
     assert_eq!(rooms["result"], json!([]));
+    let mut alice_request = pair("alice", json!({"rank":1}));
+    alice_request["target"]["requirements"] = json!({"rank":2});
+    alice_request["waitMs"] = json!(3000);
+    let alice = spawn_pair(&c, &base, TOKEN, alice_request);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let (status, body) = post(&c, &base, TOKEN, "/v1/pair", pair("bob", json!({"rank":2}))).await;
     assert_eq!(status, 200, "{body}");
     let room = body["room"].clone();
+    let (status, answer) = alice.await.unwrap();
+    assert_eq!(status, 200, "{answer}");
     let (status, body) = post(
         &c,
         &base,
@@ -448,6 +464,13 @@ async fn peer_pairing_skips_candidates_seated_in_other_kinds_of_room() {
         .await;
         assert_eq!(status, 200, "{body}");
     }
+    let mut request = pair(
+        "c-waiting",
+        json!({"kind":"peer","requirements":{"game":"g"}}),
+    );
+    request["waitMs"] = json!(3000);
+    let waiting = spawn_pair(&c, &base, TOKEN, request);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let (status, body) = post(
         &c,
         &base,
@@ -462,6 +485,8 @@ async fn peer_pairing_skips_candidates_seated_in_other_kinds_of_room() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["link"], "peer-peer");
     assert_eq!(body["room"], "pair:c-waiting");
+    let (status, answer) = waiting.await.unwrap();
+    assert_eq!(status, 200, "{answer}");
     // With the only eligible peer paired, a third joins that room, and a fourth finds only rooms it cannot join.
     let (status, body) = post(
         &c,
@@ -1212,5 +1237,70 @@ async fn capacity_invalid_returns_bad_request() {
             400
         );
     }
+    task.abort();
+}
+
+#[tokio::test]
+async fn never_seated_idle_peer_can_later_request_a_pair() {
+    let (base, task) = server_with(waiting_config(TOKEN)).await;
+    let c = reqwest::Client::new();
+    arena(&c, &base, TOKEN).await;
+    register(&c, &base, TOKEN, "idle").await;
+    register(&c, &base, TOKEN, "arrival").await;
+    for absent in [false, true] {
+        let mut request = wait_request("arrival", 0);
+        if absent {
+            request.as_object_mut().unwrap().remove("waitMs");
+        }
+        let (status, body) = post(&c, &base, TOKEN, "/v1/pair", request).await;
+        assert_eq!(status, 404, "{body}");
+    }
+    for user in users(&c, &base, TOKEN).await {
+        assert_ne!(user["status"], "paired", "{user}");
+        assert!(user["serverId"].is_null(), "{user}");
+    }
+    let waiting = spawn_pair(&c, &base, TOKEN, wait_request("arrival", 3000));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!waiting.is_finished());
+    let (status, idle) = post(&c, &base, TOKEN, "/v1/pair", wait_request("idle", 0)).await;
+    assert_eq!(status, 200, "{idle}");
+    let (status, arrival) = waiting.await.unwrap();
+    assert_eq!(status, 200, "{arrival}");
+    assert_eq!(idle["room"], arrival["room"]);
+    assert_ne!(idle["ticket"], arrival["ticket"]);
+    task.abort();
+}
+
+#[tokio::test]
+async fn ticket_failure_after_pair_peers_leaves_nobody_seated() {
+    let (base, task) = server_with(HubConfig {
+        public_url: None,
+        ..waiting_config(TOKEN)
+    })
+    .await;
+    let c = reqwest::Client::new();
+    arena(&c, &base, TOKEN).await;
+    register(&c, &base, TOKEN, "early").await;
+    register(&c, &base, TOKEN, "late").await;
+    let waiting = spawn_pair(&c, &base, TOKEN, wait_request("early", 3000));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!waiting.is_finished());
+    let (status, body) = post(&c, &base, TOKEN, "/v1/pair", wait_request("late", 0)).await;
+    assert_eq!(status, 503, "{body}");
+    for user in users(&c, &base, TOKEN).await {
+        assert_ne!(user["status"], "paired", "{user}");
+        assert!(user["serverId"].is_null(), "{user}");
+    }
+    let (status, rooms) = post(
+        &c,
+        &base,
+        TOKEN,
+        "/v1/hubs/arena/call",
+        json!({"method":"listServers","args":[]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{rooms}");
+    assert_eq!(rooms["result"], json!([]));
+    waiting.abort();
     task.abort();
 }

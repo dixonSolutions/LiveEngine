@@ -35,7 +35,7 @@ const clients = [];
 const track = client => { clients.push(client); return client; };
 
 before(async () => {
-  hub = await startHub();
+  hub = await startHub({ LIVEENGINE_RATE_LIMIT_REQUESTS: "1000" });
   admin = new HubClient(hub.address, { token: ADMIN_TOKEN });
   await admin.register({ id: 'game', mode: 'internal', scopes: { tier: 'open' } });
   await admin.register({
@@ -59,8 +59,9 @@ async function pairPeers(extra = {}, capacity = 2) {
   const a = `${group}-a`;
   const b = `${group}-b`;
   await admin.call('game', 'upsertUser', [{ id: a, scopes: { group } }]);
-  const second = await admin.pair({ subject: { id: b, scopes: {} }, target: { kind: 'peer', requirements: { group }, capacity } });
-  const first = { ...second, userId: a, ...(await admin.ticket('game', { userId: a, serverId: second.room })) };
+  await admin.call('game', 'upsertUser', [{ id: b, scopes: { group } }]);
+  const request = id => ({ subject: { id, scopes: { group } }, target: { kind: 'peer', requirements: { group }, capacity }, waitMs: 3000 });
+  const [first, second] = await Promise.all([admin.pair(request(a)), admin.pair(request(b))]);
   return { a: { ...first, ...extra }, b: { ...second, ...extra }, room: second.room };
 }
 

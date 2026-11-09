@@ -120,7 +120,10 @@ once. A peer is queued once (`409` for a second request), at most `LIVEENGINE_MA
 time (`503` beyond that), and a match removes both peers from the queue in one step. The waiting peer must
 already be a user of a hub, so that other peers can find it. A waiting `pair` gets the request timeout plus
 its own wait, also when forwarded through a nest; every other route keeps the plain request timeout. A
-waiting peer is known by its id and scopes, so one id can wait in two hubs of a service.
+waiting peer is known by its id and scopes, so one id can wait in two hubs of a service. To meet another
+peer, at least one request should set `waitMs`: an immediate request (absent or zero `waitMs`) finds a
+pending peer request or a peer already seated in an open system room, and otherwise returns `404`.
+Registration alone does not make a peer eligible to be seated; two immediate requests do not match each other.
 
 Calls to a hub queue in arrival order, for at most `LIVEENGINE_CALL_QUEUE_MS`, for the hub's turn and for one
 of `LIVEENGINE_MAX_INFLIGHT_CALLS` workers; at most `LIVEENGINE_MAX_QUEUED_CALLS` calls queue at once. Past
@@ -146,7 +149,7 @@ not user credentials and skip this check. `auth` is not available on central hub
 | `webhook` | `url`, `secret?` (sent as a bearer token), `timeoutMs?` (100 to 10000, default 3000) | opaque; forwarded to the webhook |
 | `custom` | `name` of a verifier registered with `HubService::register_verifier` | opaque; given to the verifier |
 
-For password hubs, `userId` must exactly match the account username. Claims include the verified account role; this role replaces any user-defined `role` claim. A peer pairing needs each peer’s session: each waiting peer supplies `subject.credential`, or a direct request supplies the other peer’s session as `target.credential`. Sessions are checked by the service that owns the hub, including through external hubs and remote centrals. Accounts and sessions are never exported.
+For password hubs, `userId` must exactly match the account username. Claims include the verified account role; this role replaces any user-defined `role` claim. A peer pairing needs each peer’s session: each waiting peer supplies `subject.credential`, and an arrival supplies its own credential. Sessions are checked by the service that owns the hub, including through external hubs and remote centrals. Accounts and sessions are never exported.
 
 The JWT algorithm comes only from the hub definition. A token whose `alg` header
 differs, including `none`, is refused, and no other algorithm can be configured.

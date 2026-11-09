@@ -558,6 +558,8 @@ async fn routed_with_channels(
 /// Pair, and with `waitMs` stay queued until a partner arrives. Waiting never polls: the peer
 /// that pairs with a queued one wakes it. The wait ends at `waitMs` (at most the configured
 /// maximum) with `408`, and a request dropped by its caller leaves the queue at once.
+/// Peers should wait to meet another peer: an immediate request finds only a pending peer
+/// request or an already seated peer in an open system room, never an idle registration.
 pub(crate) async fn pair(
     state: Arc<Inner>,
     headers: HeaderMap,
@@ -1063,9 +1065,9 @@ async fn pair_once(
                     Claim::Lost => break,
                     Claim::Skip => continue,
                     // A registered peer that is neither queued nor seated has no request of its
-                    // own to answer: pairing it would seat it without a ticket. A waiting caller
+                    // own to answer: pairing it would seat it without a ticket. Any caller
                     // only joins a peer that is already seated, or one that queued itself.
-                    Claim::Direct if seat.is_some() && !candidate_seated => continue,
+                    Claim::Direct if !candidate_seated => continue,
                     Claim::Direct => {}
                     Claim::Taken((wake, credential)) => {
                         taken = Some(wake);

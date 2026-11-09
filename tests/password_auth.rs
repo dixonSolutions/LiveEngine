@@ -273,19 +273,19 @@ async fn peer_pair_requires_both_sessions_and_reports_verified_identities() {
         .await;
     }
     let pair = |id: &str, credential: &str, wait| json!({"subject":{"kind":"peer","id":id,"scopes":{"game":"g"},"credential":credential},"target":{"kind":"peer","requirements":{"game":"g"}},"waitMs":wait});
-    assert_eq!(post(&s, "/v1/pair", pair("alice", &a, 0)).await.0, 403);
-    let (status, _) = post(&s, "/v1/pair", pair("alice", &b, 0)).await;
-    assert_eq!(status, 403);
+    assert_eq!(post(&s, "/v1/pair", pair("alice", &a, 0)).await.0, 404);
     let waiting = {
         let s = s.clone();
-        let body = pair("alice", &a, 3000);
+        let body = pair("bob", &b, 3000);
         tokio::spawn(async move { post(&s, "/v1/pair", body).await })
     };
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let (status, bob) = post(&s, "/v1/pair", pair("bob", &b, 0)).await;
-    assert_eq!(status, 200, "{bob}");
-    let (status, alice) = waiting.await.unwrap();
+    let (status, _) = post(&s, "/v1/pair", pair("alice", &b, 0)).await;
+    assert_eq!(status, 403);
+    let (status, alice) = post(&s, "/v1/pair", pair("alice", &a, 0)).await;
     assert_eq!(status, 200, "{alice}");
+    let (status, bob) = waiting.await.unwrap();
+    assert_eq!(status, 200, "{bob}");
     assert_eq!(alice["identity"]["identity"], "alice");
     assert_eq!(alice["identity"]["claims"]["role"], "user");
     assert_eq!(bob["identity"]["identity"], "bob");
@@ -726,10 +726,17 @@ async fn open_hubs_stay_open_when_the_service_has_accounts() {
         }
     }
     let pair = |hub: &str, id: &str, wait| json!({"subject":{"kind":"peer","id":id,"scopes":{"game":hub}},"target":{"kind":"peer","requirements":{"game":hub}},"waitMs":wait});
+    let locked_waiter = {
+        let s = s.clone();
+        let body = pair("locked", "locked-b", 3000);
+        tokio::spawn(async move { post(&s, "/v1/pair", body).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(
         post(&s, "/v1/pair", pair("locked", "locked-a", 0)).await.0,
         403
     );
+    locked_waiter.abort();
     let waiting = {
         let s = s.clone();
         let body = pair("open", "open-a", 3000);
