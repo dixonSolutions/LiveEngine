@@ -94,7 +94,7 @@ index c711141..5694b6f 100644
    "description": "A painterly six-versus-six browser shooter with twelve historical artists.",
 diff --git a/server-live.mjs b/server-live.mjs
 new file mode 100644
-index 0000000..da7818d
+index 0000000..03a37f3
 --- /dev/null
 +++ b/server-live.mjs
 @@ -0,0 +1,212 @@
@@ -242,9 +242,9 @@ index 0000000..da7818d
 +  // A verifier for the hub's `auth` as JSON. Unset leaves the hub open.
 +  auth: passwordAuth ? {kind: 'password'} : process.env.GOGH_HUB_AUTH ? JSON.parse(process.env.GOGH_HUB_AUTH) : undefined,
 +  adminConsole: passwordAuth, statusExtra: passwordAuth ? {auth: 'password', adminConsole: true} : undefined,
-+  // "hub" pairs every player with the hub's shared room. "peer" pairs players with each other
-+  // (the hub is still the signalling and fallback path); the first player waits for the next.
-+  peerLink: {kind: process.env.GOGH_LIVE_LINK === 'peer' ? 'peer' : 'hub', waitMs: positive(process.env.GOGH_PEER_WAIT_MS, 30_000)},
++  // "peer" (the default) pairs players with each other, with the hub as the signalling and
++  // fallback path; the first player waits for the next. GOGH_LIVE_LINK=hub uses the hub's shared room.
++  peerLink: {kind: process.env.GOGH_LIVE_LINK === 'hub' ? 'hub' : 'peer', waitMs: positive(process.env.GOGH_PEER_WAIT_MS, 30_000)},
 +  roomCapacity: positive(process.env.GOGH_MATCH_CAPACITY, 12),
 +  allowedOrigins, basePath: '/api/liveengine',
 +  limits: {requestsPerMinute: positive(process.env.GOGH_REQUEST_LIMIT, 10), readsPerMinute: positive(process.env.GOGH_REQUEST_LIMIT, 300), idleMs: positive(process.env.GOGH_IDLE_MS, 3 * 60_000)},

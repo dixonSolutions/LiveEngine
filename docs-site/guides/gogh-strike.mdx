@@ -173,7 +173,7 @@ The bridge:
 
 ## Peer-to-peer play
 
-By default every player joins the hub's shared room and traffic uses the relay. Set `GOGH_LIVE_LINK=peer` to pair players with each other: the first player's request is held (up to `GOGH_PEER_WAIT_MS`, default 30000, then `408`) until another player pairs with them. Both get a `peer-peer` descriptor, so `LiveClient` opens a WebRTC data channel with the hub as signalling and fallback. The game sets `directBroadcast` so its player state uses the data channels. `LIVEENGINE_WATCH_URL` overrides the registry address the `watch` route returns.
+With `bridge.mjs`, every player joins the hub's shared room by default and traffic uses the relay; set `GOGH_LIVE_LINK=peer` to pair players with each other. Gogh Strike's `npm run live` pairs players with each other by default; set `GOGH_LIVE_LINK=hub` there for the shared room. When players are paired with each other, the first player's request is held (up to `GOGH_PEER_WAIT_MS`, default 30000, then `408`) until another player pairs with them. Both get a `peer-peer` descriptor, so `LiveClient` opens a WebRTC data channel with the hub as signalling and fallback. The game sets `directBroadcast` so its player state uses the data channels. `LIVEENGINE_WATCH_URL` overrides the registry address the `watch` route returns.
 
 ## Adapter test
 

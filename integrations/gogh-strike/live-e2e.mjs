@@ -137,7 +137,9 @@ async function startBridge(port, hubUrl, token, env = {}, bindHost = '127.0.0.1'
   const child = spawn(process.execPath, [bridgeScript], {
     cwd: gameRoot, stdio: ['ignore', 'pipe', 'pipe'],
     env: {...process.env, PORT: String(port), HOST: bindHost, GOGH_STRIKE_ROOT: gameRoot,
-      LIVEENGINE_URL: hubUrl, LIVEENGINE_TOKEN: token, GOGH_REQUEST_LIMIT: '100000', ...env},
+      LIVEENGINE_URL: hubUrl, LIVEENGINE_TOKEN: token, GOGH_REQUEST_LIMIT: '100000',
+      // The bridge and the game's own server default to different links; scenarios say which they need.
+      GOGH_LIVE_LINK: 'hub', ...env},
   });
   // A failed spawn must fail its scenario, not take the whole run and its cleanup with it.
   child.once('error', error => output.push(`bridge failed to start: ${error.message}`));
