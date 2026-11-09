@@ -44,7 +44,7 @@ Set them programmatically when embedding. See [Rust configuration](/rust/config)
 - Integer limit variables are parsed as `usize`. A non-integer value fails startup with `<NAME> must be a positive integer`.
 - `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` must parse as an integer; otherwise `<NAME> must be an integer`.
 - `LIVEENGINE_SEED` must be an unsigned integer.
-- For most limit and window variables, a parseable zero is accepted by parsing but rejected by validation (`LIVEENGINE_MAX_PAIR_WAIT_MS=0` disables waiting): `hub limits and timeouts must be greater than zero`. `LIVEENGINE_SEED=0` is valid.
+- For most limit and window variables, a parseable zero is accepted by parsing but rejected by validation (`LIVEENGINE_MAX_PAIR_WAIT_MS=0` and `LIVEENGINE_CALL_QUEUE_MS=0` disable waiting): `hub limits and timeouts must be greater than zero`. `LIVEENGINE_SEED=0` is valid.
 - The token length check uses bytes. A token shorter than 24 bytes fails startup.
 - `LIVEENGINE_ALLOWED_REMOTE_HOSTS` entries are trimmed, lowercased, and empty entries are discarded.
 - `LIVEENGINE_BIND` parse or bind failures are fatal.

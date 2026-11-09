@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Cover environment configuration, deterministic reseeding, and CLI watch tickets with integration tests; clarify zero timeout settings.
+
 - Make standalone Rust documentation samples compile against the current API and mark contextual excerpts.
 
 - Prevent immediate peer pairing requests from seating registered peers that have not requested a pair.

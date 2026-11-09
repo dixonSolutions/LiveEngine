@@ -378,3 +378,28 @@ fn pair_peers_capacity_is_atomic_and_uses_existing_room_limit() {
     );
     assert_eq!(call(&mut e, "getUser", vec![json!("c")]), Value::Null);
 }
+
+#[test]
+fn reseed_reproduces_random_match_order() {
+    let mut engine = Engine::new(0);
+    call(&mut engine, "upsertUser", vec![json!({"id":"user"})]);
+    for i in 0..20 {
+        call(
+            &mut engine,
+            "upsertServer",
+            vec![json!({"id":format!("room-{i}"),"capacity":2})],
+        );
+    }
+    let order = |engine: &mut Engine, seed| {
+        call(engine, "reseed", vec![json!(seed)]);
+        call(
+            engine,
+            "findServersForUser",
+            vec![json!("user"), json!({"strategy":"random","limit":20})],
+        )
+    };
+    let first = order(&mut engine, 123);
+    assert_eq!(first.as_array().unwrap().len(), 20);
+    assert_ne!(first, order(&mut engine, 456));
+    assert_eq!(first, order(&mut engine, 123));
+}
