@@ -3,7 +3,7 @@ title: "Security model and limits"
 description: "Administrative authentication, peer rate budgets, remote-host allowlists, request budgets, and the boundaries of 0.2.4."
 ---
 
-LiveEngine 0.3.0 secures the **service** with an administrative token, and gives browsers narrow, short-lived tickets for live sockets. A hub can also verify a credential that your application relays before it issues a ticket ([custom auth](/guides/custom-auth)). It does not provide player accounts or sign-in, per-player authorization policy, tenant isolation, or durable rooms. Treat the hub token as a server-side secret and put application authentication in front of player-facing routes. The model for the live features is in [live architecture](/concepts/live-architecture).
+LiveEngine 0.4.0 secures the **service** with an administrative token, and gives browsers narrow, short-lived tickets for live sockets. A hub can also verify a credential that your application relays before it issues a ticket ([custom auth](/guides/custom-auth)). It does not provide player accounts or sign-in, per-player authorization policy, tenant isolation, or durable rooms. Treat the hub token as a server-side secret and put application authentication in front of player-facing routes. The model for the live features is in [live architecture](/concepts/live-architecture).
 
 ## Token authentication
 
@@ -89,7 +89,7 @@ Calls to a hub queue in arrival order for up to `LIVEENGINE_CALL_QUEUE_MS` (1000
 
 `scopeSchema` uses JSON Schema 2020-12 with bounded size and complexity. Only local JSON pointer references are allowed; remote references are refused. Validate application-specific payloads inside your handler.
 
-## Explicit non-goals in 0.3.0
+## Explicit non-goals in 0.4.0
 
 - No player accounts, sign-in or authorization policy. Hub `auth` verifies a credential for a user id, and your application decides everything else.
 - No tenant isolation policy.

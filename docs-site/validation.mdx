@@ -3,6 +3,16 @@ title: "Validation record"
 description: "What was actually observed for each release, and what remains unverified."
 ---
 
+## 0.4.0
+
+Observed on 2026-11-09, with Chromium 1194 (1248 aborts on text inputs on the test machine):
+
+- `npm run test:e2e` passed 24 of 24 scenarios, three runs in a row, from an upstream clone. The eight new ones sign in through the real front screen and admin console: wrong passwords, roles, peer-to-peer between signed-in users, kick, disable, a password change across tabs, an admin reset mid-match, an external password hub through a central, and ten signed-in users at once.
+- Open hubs stay open when their service has accounts, and pass the same suite.
+- `cargo test --locked` 184 tests, `npm test` 97, integration 22, eight repeated Rust runs, the container test, type and docs checks.
+
+Not verified for 0.4.0: two physical devices, NAT and TURN, machines without a GPU, and password hubs at more than ten simultaneous users.
+
 ## 0.3.0
 
 Observed on 2026-11-07:
