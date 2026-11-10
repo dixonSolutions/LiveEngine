@@ -1,5 +1,7 @@
 # Publishing
 
+> Canonical, maintained version: [Publishing and releases](https://liveengine.mintlify.site/publishing) (`docs-site/publishing.mdx`). This file may lag behind it.
+
 npm package: `@dixonsolutions/liveengine`. Cargo crate/binary: `liveengine` / `liveengine-hub`. Both manifests use the same version. The release workflow verifies that a `v<version>` tag matches both manifests.
 
 ## Current registry state

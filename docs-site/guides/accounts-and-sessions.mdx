@@ -1,0 +1,264 @@
+---
+title: "Accounts and sessions"
+description: "Create local accounts on a hub service, sign in for a bearer session, change passwords, and use sessions as the credential for password hubs. Every route, body, answer, error and limit."
+---
+
+A hub service can hold its own **accounts**: a username, a password, a role (`admin` or `user`), an enabled flag and optional claims. Signing in returns a **session token**. A session is useful in two ways:
+
+- An `admin` session can do everything the administrator token can, so an operator can sign in instead of handling `LIVEENGINE_TOKEN`.
+- A `user` session is the credential for a hub registered with `auth: { kind: "password" }`. The hub checks the session before it issues a ticket, and closes the player's live socket when an administrator disables, deletes or resets the account. See [custom auth](/guides/custom-auth) for the verifier.
+
+Accounts are optional. A service with no accounts behaves as before, and hubs without `auth` stay open when accounts exist.
+
+## When to use this
+
+Use accounts when you want the hub service itself to know who is signing in: a small game, a LAN deployment, an internal tool, or an operator console. If your application already has users, keep them there and relay a credential to the hub with a `token`, `hmac`, `jwt`, `webhook` or `custom` verifier instead ([custom auth](/guides/custom-auth)).
+
+## The smallest working flow
+
+Create an account with the administrator token, sign in, and read the session's account:
+
+```sh
+curl -sX POST http://127.0.0.1:8787/v1/accounts \
+  -H "Authorization: Bearer $LIVEENGINE_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"correct-horse-battery","role":"user"}'
+
+curl -sX POST http://127.0.0.1:8787/v1/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"correct-horse-battery"}'
+# {"token":"...","account":{"username":"alice","role":"user","enabled":true,"createdAt":1762700000},"expiresAt":1762743200}
+
+curl -s http://127.0.0.1:8787/v1/sessions/me -H "Authorization: Bearer $SESSION"
+```
+
+The same with the Node [`HubClient`](/node/hub-client#accounts-and-sessions):
+
+```js
+import { HubClient } from '@dixonsolutions/liveengine/hubs';
+
+const url = 'http://127.0.0.1:8787';
+const admin = new HubClient(url, { token: process.env.LIVEENGINE_TOKEN });
+await admin.createAccount({ username: 'alice', password: 'correct-horse-battery', role: 'user' });
+
+// POST /v1/sessions ignores the bearer token, so any non-empty value works here.
+const { token, account, expiresAt } = await new HubClient(url, { token: 'login' }).login('alice', 'correct-horse-battery');
+
+const alice = new HubClient(url, { token });
+console.log(await alice.me(), account.role, new Date(expiresAt * 1000));
+```
+
+The `liveengine-hub` command does the same from a shell. It sends `LIVEENGINE_TOKEN` as the bearer token, and `-` stands for "no username":
+
+```sh
+LIVEENGINE_TOKEN=... liveengine-hub accounts http://127.0.0.1:8787 POST - '{"username":"alice","password":"correct-horse-battery","role":"user"}'
+LIVEENGINE_TOKEN=... liveengine-hub accounts http://127.0.0.1:8787 GET
+LIVEENGINE_PASSWORD=correct-horse-battery liveengine-hub login http://127.0.0.1:8787 alice
+```
+
+## Who may call what
+
+| Caller | Allowed |
+| --- | --- |
+| No token | `POST /v1/sessions` (sign in) only, plus the public `/health` and `/v1/ping` |
+| Administrator token (`LIVEENGINE_TOKEN`) | Every account and connection route except the two that need a session: `GET /v1/sessions/me` and `POST /v1/accounts/me/password` |
+| `admin` session | Everything the administrator token can do, on every route of the service, including hubs, links and schemas |
+| `user` session | `GET /v1/sessions/me`, `DELETE /v1/sessions`, `POST /v1/accounts/me/password` and `GET /v1/accounts/{own username}` |
+
+Any other route called with a `user` session answers `401 unauthorized`, not `403`.
+
+<Warning>
+  An `admin` account is as powerful as the administrator token. Give the role only to operators, and keep `admin` session tokens on the server or in an HttpOnly cookie, never in page script.
+</Warning>
+
+## The account object
+
+Every route that returns an account returns this shape. The password hash is never returned.
+
+```json
+{ "username": "alice", "role": "user", "enabled": true, "claims": { "team": "blue" }, "createdAt": 1762700000 }
+```
+
+| Field | Meaning |
+| --- | --- |
+| `username` | As it was created. Names are unique without regard to case, so `Alice` and `alice` are the same account, and every route accepts either spelling |
+| `role` | `admin` or `user` |
+| `enabled` | A disabled account cannot sign in and its sessions are gone |
+| `claims` | Optional JSON object. Omitted when unset. For password hubs the claims become the peer's verified claims, with `role` set to the account role |
+| `createdAt` | Unix seconds |
+
+Validation, for every route that takes these fields:
+
+- `username`: 3 to 64 ASCII letters, digits, `.`, `_` or `-`.
+- `password`: 10 to 1024 bytes.
+- `role`: exactly `admin` or `user`.
+- `claims`: a JSON object (or `null` in a patch, to remove them).
+- Unknown fields are refused.
+
+## Account routes
+
+### Create an account
+
+`POST /v1/accounts`, administrator token or `admin` session.
+
+```json
+{ "username": "alice", "password": "correct-horse-battery", "role": "user", "enabled": true, "claims": { "team": "blue" } }
+```
+
+`enabled` defaults to `true`; `claims` is optional. Answers `201` with the account.
+
+| Status | `error` | Cause |
+| --- | --- | --- |
+| `400` | `invalid account` | A field failed the rules above |
+| `409` | `account already exists` | The name is taken, in any case |
+| `503` | `account limit reached` | The service already holds 10,000 accounts |
+
+### List accounts
+
+`GET /v1/accounts`, administrator token or `admin` session. Answers `200` with a JSON **array** of accounts sorted by lower-case username.
+
+### Read one account
+
+`GET /v1/accounts/{username}`. Administrators may read any account; a `user` session may read its own. `404 account not found` when there is no such account.
+
+### Update an account
+
+`PATCH /v1/accounts/{username}`, administrator token or `admin` session. Every field is optional:
+
+```json
+{ "role": "admin", "enabled": false, "claims": null, "password": "a-new-password-for-alice" }
+```
+
+| Field | Effect |
+| --- | --- |
+| `role` | Changes the role |
+| `enabled` | `false` disables the account (a ban); `true` lets it sign in again |
+| `claims` | Replaces the claims; `null` removes them |
+| `password` | Resets the password without knowing the old one |
+
+Answers `200` with the updated account; `400 invalid account` or `404 account not found` otherwise.
+
+A reset password, a changed role, or disabling an enabled account **ends every session of that account** and closes its sockets in rooms of password hubs: with the code `banned` when the patch set `enabled: false`, otherwise `credentials-changed`. Changing only `claims`, or enabling an account, ends nothing.
+
+### Delete an account
+
+`DELETE /v1/accounts/{username}`, administrator token or `admin` session. Answers `204`, or `404 account not found`. Its sessions end, and its sockets in password hubs close with `account-deleted`.
+
+## Session routes
+
+### Sign in
+
+`POST /v1/sessions`, no token needed.
+
+```json
+{ "username": "alice", "password": "correct-horse-battery" }
+```
+
+```json
+{ "token": "pE3...", "account": { "username": "alice", "role": "user", "enabled": true, "createdAt": 1762700000 }, "expiresAt": 1762743200 }
+```
+
+`token` is a random 32-byte value (unpadded base64url). Send it as `Authorization: Bearer <token>`. `expiresAt` is in Unix seconds, `LIVEENGINE_SESSION_TTL_SECONDS` (default 12 hours) after sign-in. The service stores only a SHA-256 hash of the token.
+
+Every failure answers the same `401 invalid username or password`: a wrong password, an unknown name, a disabled account and a locked-out name or address all look alike, and an unknown name costs the same hashing time as a known one.
+
+An account keeps at most 16 sessions; signing in a 17th time ends its oldest one. The service keeps at most 10,000 sessions in total, ending the oldest first.
+
+### Who am I
+
+`GET /v1/sessions/me` with a session token. Answers `200` with the account, or `401 unauthorized` for a missing, expired or ended session (and for the administrator token, which is not a session).
+
+### Sign out
+
+`DELETE /v1/sessions` with a session token. Ends that session only and answers `204`.
+
+### Change your own password
+
+`POST /v1/accounts/me/password` with a session token.
+
+```json
+{ "current": "correct-horse-battery", "next": "a-longer-better-password" }
+```
+
+Answers `204`. Every session of the account ends, **including the one that made the call**, so the caller signs in again with the new password. Sockets in password hubs close with `credentials-changed`.
+
+| Status | `error` | Cause |
+| --- | --- | --- |
+| `400` | `invalid account` | `next` is not 10 to 1024 bytes |
+| `401` | `unauthorized` | No valid session |
+| `401` | `invalid username or password` | `current` is wrong |
+
+## Sign-in throttling
+
+Each sign-in attempt is counted against two budgets before the password is checked: one for the username and one for the client's address (the socket peer; `X-Forwarded-For` is ignored).
+
+- A username may hold `LIVEENGINE_LOGIN_MAX_FAILURES` (default 5) unsuccessful or in-flight attempts. An address may hold ten times that, because many people sign in through one hub API or NAT.
+- A successful sign-in gives one attempt back.
+- The attempt that fills a budget starts a lock on that name or address: 2 seconds, then 3, 5, 9, 17 and so on (1 + 2<sup>n</sup> seconds) for each further attempt, up to 1025 seconds. That attempt is still checked, and a correct password lifts the lock. While a lock runs, every attempt answers `401`, even with the right password, and no hashing is done.
+- Counts are forgotten 15 minutes after the first attempt, once no lock is running.
+
+`POST /v1/sessions` also uses an ordinary request slot from the service-wide rate limit (`LIVEENGINE_RATE_LIMIT_REQUESTS` per `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS`), which answers `429 rate limit exceeded`.
+
+## Settings
+
+| Variable | Default | Range |
+| --- | --- | --- |
+| `LIVEENGINE_PASSWORD_ITERATIONS` | 310000 | 100000 to 10000000 PBKDF2-HMAC-SHA256 iterations for new hashes |
+| `LIVEENGINE_SESSION_TTL_SECONDS` | 43200 | 1 second to 365 days |
+| `LIVEENGINE_LOGIN_MAX_FAILURES` | 5 | 1 to 1000 |
+
+A value outside its range stops the service at startup. A hash made with a different iteration count is replaced with one at the current count the next time that user signs in. Embedded Rust services set the same values through `HubConfig` ([Rust configuration](/rust/config)). All variables are listed in [environment](/reference/environment).
+
+## Persistence
+
+With `LIVEENGINE_STATE_FILE` set, accounts (with their password hashes) and the hashes of live session tokens are saved in the private state file, so they survive a restart. Without it they live in memory. Accounts and sessions are never part of `GET /v1/registry/export` or a registry import.
+
+## Password hubs
+
+A hub registered with `auth: { kind: "password" }` accepts a session token as the player's credential. The user id the player pairs or connects with must be the account's username, and `roles` (`["user"]`, `["admin"]` or both) narrows which accounts may join.
+
+```js
+import { HubClient } from '@dixonsolutions/liveengine/hubs';
+
+const admin = new HubClient('http://127.0.0.1:8787', { token: process.env.LIVEENGINE_TOKEN });
+await admin.register({ id: 'members', mode: 'internal', auth: { kind: 'password', roles: ['user'] } });
+
+const session = await admin.login('alice', 'correct-horse-battery');
+const descriptor = await admin.pair({
+  subject: { id: session.account.username },
+  target: { kind: 'hub', id: 'members' },
+  credential: session.token,
+});
+```
+
+The session is checked again when the socket connects, and the socket is closed when the account changes, as described above. Sessions are always checked by the service that owns the hub, also through external hubs and remote centrals. Full rules: [custom auth](/guides/custom-auth).
+
+From a browser, use [`createHubApi`](/node/hub-api) with [`hubSession`](/node/live-client#hubsession): the page signs in through the API, the session stays in the API's HttpOnly cookie, and `pair` and `renew` pass it to the hub for you.
+
+## Errors at a glance
+
+| Status | `error` | Where |
+| --- | --- | --- |
+| `400` | `invalid account` | Create, patch, change password |
+| `401` | `invalid username or password` | Sign in; wrong `current` password |
+| `401` | `unauthorized` | Missing or ended session, or a `user` session on an administrator route |
+| `404` | `account not found` | Read, patch, delete |
+| `409` | `account already exists` | Create |
+| `429` | `rate limit exceeded` | Service-wide request budget |
+| `500` | `hashing failed` | The hashing worker failed |
+| `503` | `account limit reached` | Create |
+
+A body that is not JSON, or that has a missing or unknown field, is refused by the HTTP layer before these checks, with a `4xx` status and a plain-text body rather than `{ "error": ... }`.
+
+## Security notes
+
+- Serve the service over HTTPS. Passwords and session tokens travel in request bodies and headers.
+- Session tokens are bearer secrets. Keep them out of URLs, logs and page script; `createHubApi` keeps them on the server.
+- Disabling an account is the ban. It ends sessions at once and closes password-hub sockets with `banned`; a socket on a hub without password auth is not tied to the account, so [kick](/guides/connections-admin) it too.
+
+## What is not supported
+
+- No self-service sign-up, e-mail, password recovery or multi-factor sign-in. An administrator creates accounts and resets passwords.
+- No roles other than `admin` and `user`, and no per-route permissions for `user` beyond the four listed.
+- No account sharing between services: each service has its own accounts.
+
+Next: [manage live connections](/guides/connections-admin).

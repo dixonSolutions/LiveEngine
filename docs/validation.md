@@ -1,5 +1,7 @@
 # Validation record
 
+> Canonical, maintained version: [Validation record](https://liveengine.mintlify.site/validation) (`docs-site/validation.mdx`), which also holds the 0.4.0 record. This file may lag behind it.
+
 Validation performed on 2026-11-04. This records observed checks; registry publication and trust configuration are separate account operations.
 
 - Rust core replacement: existing Node engine and math-game regression suite passes. Core tests also cover FIFO ordering, rule coercion/missing scopes, invalid generators and membership invariants.

@@ -1,24 +1,49 @@
 ---
 title: "Introduction"
-description: "LiveEngine is a Rust matchmaking engine plus an authenticated HTTP hub registry for Node.js and Rust services."
+description: "LiveEngine is live infrastructure in one package: hub hosting and registry, nested central hubs, pairing, hub-relayed live rooms, direct WebRTC with relay fallback, live hub lists, accounts and pluggable hub auth, for Rust and Node.js."
 ---
 
-LiveEngine solves two related problems:
+LiveEngine is the plumbing for live, multi-user applications, in one package for Rust and Node.js. It hosts **hubs**, keeps a **registry** of them, pairs users with a hub or with each other, and connects them in **live rooms**. Core never knows your game or app: scopes, schemas, channels and payloads are all yours, defined at runtime.
 
-1. **Pairing users with capacity-limited servers.** A deterministic, in-process engine holds users and servers, evaluates requirements in both directions, and pairs users into rooms.
-2. **Routing matchmaking calls across processes.** A hosted registry lets one service own internal engines and attach independently hosted hubs through a uniform, authenticated HTTP contract.
+What it does:
 
-The same runtime can be embedded in a Node.js service, embedded in a Rust/Axum API, or run standalone as the `liveengine-hub` executable. Current release: **0.4.0**.
+- **Hub hosting and registry.** One service hosts many hubs behind one authenticated HTTP contract (`liveengine.hub/v1`): matchmaking engines, your own Rust handlers, or routes to hubs on other services. Run it standalone (`liveengine-hub`, the container image) or embed it in an Axum API. See [hosting](/guides/hosting) and [remote hubs](/guides/remote-hubs).
+- **Nested central hubs.** Central hubs are namespaces that hold other hubs, locally or on another service, so hubs form a tree you route into by path. See [nesting](/guides/nesting).
+- **Matchmaking and pairing.** Discover hubs and peers that match requirements, and pair a user with a hub or with another user, optionally waiting for a partner. Pairing returns a descriptor with a single-use ticket. See [find and pair](/guides/find-and-pair).
+- **Live rooms relayed by the hub.** A client opens the room socket with its ticket; the hub relays frames, checks channels and schemas, and reports presence. See [live rooms](/guides/live-rooms).
+- **Direct peer-to-peer.** For peer pairings the JavaScript `LiveClient` opens a WebRTC data channel to each peer, signalled through the hub, and falls back to the hub relay when it cannot. See [peer-to-peer](/guides/peer-to-peer).
+- **Hub-to-hub links.** Two services can bridge a room over a persistent WebSocket link, with merged presence. See [hub links](/guides/hub-links).
+- **Live hub lists.** Subscribe to the registry and receive a snapshot and then diffs, from a server or, with a read-only ticket, a page. See [live registry](/guides/live-registry).
+- **Pluggable hub auth and accounts.** A hub can verify the player's credential before any ticket: a session of a local account, static tokens, HMAC, JWT, a webhook or your own Rust verifier. Administrators can list and kick connections and ban accounts. See [custom auth](/guides/custom-auth), [accounts and sessions](/guides/accounts-and-sessions) and [manage live connections](/guides/connections-admin).
+- **Provider-hosted hubs.** Run a central hub for a customer on your service and give them one credential for that subtree only. See [provider hosting](/guides/provider-hosting).
+- **A browser-facing API.** `createHubApi` gives a page pairing, renewal, seats, a hub list and sign-in, while the administrator token stays on your server. See [hub API for browsers](/guides/hub-api).
+
+Current release: **0.4.0**.
+
+## What works where
+
+| Capability | Rust (`liveengine` crate) | Node.js (`@dixonsolutions/liveengine`) | Browser |
+| --- | --- | --- | --- |
+| In-process matchmaking engine | `Engine` | `LiveEngine` (native addon) | No |
+| Host hubs, registry, nesting, links | `HubService` router, `liveengine-hub` binary | Runs the `liveengine-hub` command; no in-process host | No |
+| HTTP client: register, route, discover, pair, tickets, accounts, connections | `hub::HubClient` | `HubClient` | No: keep the token on a server |
+| Live registry watch | `HubClient::watch` | `HubClient.watchRegistry` | `watchHubs`, with a ticket from your server |
+| Join a live room through the hub relay | No client yet | `LiveClient` (Node 22+) | `LiveClient`, `connectLive` |
+| Direct WebRTC data channels | No | `LiveClient` with an `RTCPeerConnection` you supply | `LiveClient`, built in |
+| Hub-to-hub room links | Run by the service | Defined over HTTP (`/v1/links`) | No |
+| Browser-facing pairing and sign-in routes | Write your own | `createHubApi` | `connectLive`, `watchHubs`, `hubSession` |
+
+Hub-to-hub links are WebSocket connections between services. WebRTC is only used between JavaScript clients, and only for `peer-peer` pairings.
 
 ## What is in the box
 
 | Artifact | Name | What it provides |
 | --- | --- | --- |
-| npm package | `@dixonsolutions/liveengine` | Rust N-API engine, TypeScript definitions, `HubClient`, and the `liveengine-hub` command |
-| Cargo crate | `liveengine` | `Engine`, `rules`, and the optional Axum `HubService` |
-| Cargo binary | `liveengine-hub` | Standalone HTTP host and central registry |
+| npm package | `@dixonsolutions/liveengine` | Rust N-API engine, TypeScript definitions, `HubClient`, the `live-client` and `hub-api` modules, and the `liveengine-hub` command |
+| Cargo crate | `liveengine` | `Engine`, `rules`, and the optional Axum `HubService` and `HubClient` |
+| Cargo binary | `liveengine-hub` | Standalone host, central registry and command-line client |
 | Container | same image | Central registry, ordinary internal hub host, or remote service |
-| Integration | Gogh Strike bridge | Optional server-side bridge from a browser game to the hub contract |
+| Integration | Gogh Strike bridge | A browser game paired and connected through a hub, with direct and relay transports |
 | Interface | User hub | Dependency-free browser UI with room listing, matchmaking and native ping |
 
 The former C++/node-gyp implementation has been replaced by Rust. The existing `LiveEngine` and `NativeEngine` Node interfaces remain. Seeded sequences are deterministic within the Rust implementation, but random sequences are **not** byte-for-byte compatible with the previous C++ generator.
@@ -26,26 +51,24 @@ The former C++/node-gyp implementation has been replaced by Rust. The existing `
 ## Architecture
 
 ```text
-                       authenticated HTTP (liveengine.hub/v1)
-  application / game  ──────────────────────────────────────────┐
-  server code                                                    │
-        │                                                        ▼
-        │  in-process                                   ┌──────────────────┐
-        ├──────────────► Engine (Rust)                   │ Central registry │
-        │                users + servers                 │  LIVEENGINE_TOKEN│
-        │                requirements + strategies       └────────┬─────────┘
-        │                                                        │
-        │  HubClient                                             │ register internal
-        └──────────────► ┌──────────────────┐                    │ register external
-                         │ Hub host         │◄───────────────────┘
-                         │ internal engines │
-                         │ external routes  │──────► external hub (its own
-                         └──────────────────┘        engine or custom handler)
+  your server (holds the administrator token)
+        │  HTTP liveengine.hub/v1: register, route, discover, pair, tickets
+        ▼
+  ┌──────────────────────────────┐   remote central / external hub   ┌──────────────────┐
+  │ LiveEngine service           │ ────────── HTTP forwarding ──────► │ another service  │
+  │  registry + central hubs     │                                    │                  │
+  │  internal hubs (engines,     │ ═══════ hub link (WebSocket) ═════ │  linked room     │
+  │  your Rust handlers)         │                                    └──────────────────┘
+  │  live rooms + live registry  │
+  └──────────────────────────────┘
+        ▲  room socket: single-use ticket, relayed frames, presence, signalling
+        │
+  LiveClient (browser or Node) ◄═══ WebRTC data channel (peer-peer pairings) ═══► LiveClient
 ```
 
-- An **internal** hub is backed by an `Engine` created by the host. HTTP registrations of mode `internal` get a fresh matchmaking engine.
-- An **external** hub is a route to another HTTP service. The host performs a health/contract handshake at registration time, then forwards calls.
-- A **central registry** is simply a host that also holds registrations for other hubs. The same process can do both jobs.
+- An **internal** hub is backed by an `Engine` created by the host, or by a Rust handler you register. An **external** hub is a route to another service. A **central** hub holds other hubs.
+- Your server pairs a user and passes the descriptor to the client. The client never sees the administrator token.
+- The [live architecture](/concepts/live-architecture) page follows one connection through every stage and shows which credential lives where.
 
 ## Delivery and platform support
 
@@ -68,12 +91,12 @@ See [Installation](/node/installation) for the platform matrix and source fallba
 
 LiveEngine is deliberately small and explicit about what it does not do:
 
-- **Live matchmaking state is in memory.** A state file can persist registry definitions, but users, rooms, memberships and events are lost on restart.
-- **Authentication is administrative.** The host verifies one bearer token, and issues single-use tickets for live sockets. A hub can verify a credential your application relays ([custom auth](/guides/custom-auth)), but there are no player accounts, authorization policy or tenant isolation. Keep tokens in server code and expose application-specific routes to clients.
+- **Live state is in memory.** A state file can persist registry definitions, accounts and sessions, but users, rooms, memberships, presence and events are lost on restart.
+- **Authentication is narrow.** The service verifies one administrator token, issues single-use tickets for live sockets, and can verify a player credential per hub ([custom auth](/guides/custom-auth)). Local [accounts](/guides/accounts-and-sessions) have two roles, `admin` and `user`, and no sign-up, recovery or multi-factor sign-in. There is no tenant isolation beyond [provider hosting](/guides/provider-hosting). Keep tokens in server code and expose application-specific routes to clients.
+- **No Rust live-room client.** Rust services host rooms and links, but joining a room as a client, and WebRTC, are JavaScript only.
 - **Request timeouts do not roll back work.** An internal handler that already started continues on a blocking worker. Capacity stays occupied until it finishes. Reconcile state before retrying a mutation.
 - **Schemas use JSON Schema 2020-12.** References must be local JSON pointers and are bounded.
 - **Remote imports can refresh.** Set `refreshSeconds` to discover changes and mark missing entries stale.
-- **Gogh Strike integration exchanges player state and events** using LiveClient with direct and relay transports.
 - **Ping is a latency probe, not a matchmaking input.** Use `HubClient.ping()` or `liveengine-hub ping` to measure a hub; add your own scope/requirement rules if you want ping to influence matching.
 
 ## Where to go next
@@ -82,13 +105,19 @@ LiveEngine is deliberately small and explicit about what it does not do:
   <Card title="Quickstart" icon="rocket" href="/quickstart">
     Install, run one local match, start a hub, and bring up Compose.
   </Card>
-  <Card title="First matchmaking session" icon="users" href="/guides/first-match">
-    Build a small matchmaking session with requirements, capacity, and events.
+  <Card title="Live rooms" icon="tower-broadcast" href="/guides/live-rooms">
+    Register a hub with channels, issue a ticket, and connect a client.
+  </Card>
+  <Card title="Hub API for browsers" icon="browser" href="/guides/hub-api">
+    Pair, renew and sign in from a page without exposing the token.
+  </Card>
+  <Card title="Live architecture" icon="diagram-project" href="/concepts/live-architecture">
+    How hosting, nesting, pairing and connections fit together.
+  </Card>
+  <Card title="Accounts and sessions" icon="user-lock" href="/guides/accounts-and-sessions">
+    Local accounts, sign-in, password hubs and bans.
   </Card>
   <Card title="Hub protocol" icon="network-wired" href="/protocol/overview">
     Read the versioned contract, endpoints, DTOs, and status codes.
-  </Card>
-  <Card title="Deployment" icon="server" href="/guides/deployment">
-    Run standalone, in Docker, behind TLS, or embedded in an API.
   </Card>
 </CardGroup>

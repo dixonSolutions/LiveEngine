@@ -1,0 +1,328 @@
+---
+title: "Live client reference"
+description: "LiveClient, connectLive, connectPeer, watchHubs, hubSession and explainHubError: options, defaults, events, return values and errors for the browser and Node live client."
+---
+
+The live client is what a page (or a Node process) uses to **be in a room**: it opens the room socket with a single-use ticket, sends and receives frames, reconnects with a fresh ticket, and, for peer-to-peer pairings, opens a WebRTC data channel to each peer with the hub relay as fallback. It also has helpers for a live hub list and for password sign-in through a [hub API](/node/hub-api).
+
+It is one dependency-free ES module for browsers and Node 22 or newer:
+
+```js
+import { LiveClient, connectLive, connectPeer, watchHubs, hubSession, explainHubError } from '@dixonsolutions/liveengine/live-client';
+```
+
+Without a bundler, serve the file yourself (it is `lib/live-client.mjs` in the package), or load it from a `createHubApi` handler, which serves it at its `live-client.mjs` route with CORS.
+
+The client never holds the administrator token. Your server pairs the player and hands the page a **descriptor**; see [find and pair](/guides/find-and-pair) and [hub API for browsers](/guides/hub-api).
+
+| Export | Use it to |
+| --- | --- |
+| [`connectLive(options)`](#connectlive) | Pair through your own route, connect, and get an open `LiveClient`. The usual entry point |
+| [`LiveClient`](#liveclient) | Connect with a descriptor you already have. Also the default export |
+| [`connectPeer(client, peerId, options)`](#connectpeer-and-peerlink) and `PeerLink` | Start or inspect one direct WebRTC link by hand |
+| [`watchHubs(options)`](#watchhubs) | Show a live list of hubs from a page |
+| [`hubSession(options)`](#hubsession) | Sign a person in and out through a hub API |
+| [`explainHubError(error)`](#explainhuberror) | Plain words for a refusal, for showing to a person |
+
+On the server, the live registry is watched with [`HubClient.watchRegistry`](/node/hub-client#live-discovery-and-pairing-methods) instead of `watchHubs`.
+
+## The smallest working page
+
+```js
+import { connectLive } from '/api/live/live-client.mjs';
+
+const client = await connectLive({
+  pairUrl: '/api/live/pair',
+  body: { userId: 'alice', waitMs: 30_000 },
+});
+
+client.on('message', frame => console.log(frame.from, frame.channel, frame.payload, frame.via));
+client.on('presence', event => console.log(event.event, event.peer));
+client.send({ text: 'hello' }, { channel: 'chat' });
+```
+
+## connectLive
+
+```ts fragment
+connectLive(options: ConnectLiveOptions): Promise<LiveClient & { leave(): Promise<unknown>; heartbeat(): Promise<unknown> }>
+```
+
+Posts `body` to `pairUrl`, builds a `LiveClient` from the answer, connects, and resolves once the hub has welcomed the client.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `pairUrl` | required | Your route that answers with a descriptor |
+| `renewUrl` | `pairUrl` | Posted for a fresh descriptor whenever a reconnect needs a new ticket |
+| `leaveUrl`, `heartbeatUrl` | `pairUrl` with its final `/pair` replaced by `/leave` or `/heartbeat` | Seat routes used by `client.leave()` and `client.heartbeat()` |
+| `body` | `{}` | The JSON body sent to `pairUrl` and `renewUrl` |
+| `seatStore` | `sessionStorage`, else memory | Where the seat token is kept: `{ get(key), set(key, value), delete(key) }`, all synchronous |
+| `fetch` | `globalThis.fetch` | |
+| `credential` | none | A string, or a function returning one. Added to the pair and renew bodies as `credential` |
+| any [`LiveClient` option](#options) | | Passed to the client. A `renew` you give replaces the `renewUrl` request |
+
+What it sends and keeps:
+
+- The pair request is `{ ...body, seatToken?, credential? }`. `seatToken` is the one saved for this `pairUrl` and `body.userId`, so a reload can reclaim its seat.
+- A `seatToken` in the answer is removed from the descriptor and saved. `createHubApi` issues one; any other route may leave it out.
+- A renew request is `{ ...body, seatToken, credential? }`.
+- `client.heartbeat()` and `client.leave()` post `{ userId: body.userId, seatToken }`. `leave()` uses `keepalive: true`, so it can run during `pagehide`, and always forgets the saved seat.
+
+<Warning>
+  If `pairUrl` does not end in `/pair`, the default `leaveUrl` and `heartbeatUrl` are `pairUrl` itself, so `leave()` would post to your pair route. Pass `leaveUrl` and `heartbeatUrl`, or do not call those methods.
+</Warning>
+
+Errors from your routes are `Error`s with `.status`. The message is the answer's `error` (or `reason`) field when there is one, otherwise `Pairing failed (HTTP n)`, `Renewal failed (HTTP n)`, and so on. A `4xx` answer other than `408` or `429` sets `.fatal`, which stops the retries and forgets the saved seat. If connecting fails after pairing, the client is closed and the promise rejects.
+
+## LiveClient
+
+```ts fragment
+new LiveClient(descriptor: LiveDescriptor, options?: LiveClientOptions)
+```
+
+```js
+import { LiveClient } from '@dixonsolutions/liveengine/live-client';
+
+const descriptor = await (await fetch('/api/pair', { method: 'POST' })).json();
+const client = new LiveClient(descriptor, {
+  renew: async () => (await fetch('/api/pair', { method: 'POST' })).json(),
+});
+await client.connect();
+```
+
+### Descriptor
+
+The object `pair` returns ([`HubClient.pair`](/node/hub-client#live-discovery-and-pairing-methods), `POST /v1/pair`, or your own route):
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `ticket` | yes | Single-use ticket, sent in the first frame, never in the URL |
+| `url` | yes | Room socket URL. `http:` and `https:` are turned into `ws:` and `wss:` |
+| `userId` | for direct links | This client's id in the room |
+| `room` | no | Room id, shown as `client.room` |
+| `link` | no | `peer-peer` turns on direct links in the default `direct: "auto"` mode |
+| `transports`, `identity` | no | Informational |
+
+The constructor throws `TypeError` for a missing descriptor, `ticket` or `url`, a URL that is not `ws`, `wss`, `http` or `https`, an `iceTransportPolicy` other than `"all"` or `"relay"`, or a `renew` that is not a function.
+
+### Options
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `renew` | none | `({ credential, previous }) => Promise<descriptor>`. Called for a new ticket on every reconnect after the first. Without it a reconnect fails with `The ticket was already used and no renew function was given to get a new one` |
+| `credential` | none | A string or a function returning one; resolved and passed to `renew` |
+| `reconnect` | `true` | Reconnect when an open connection drops |
+| `retries` | `5` | Attempts after the first, per connect or reconnect |
+| `retryBaseMs`, `retryMaxMs` | `250`, `8000` | Backoff: `min(retryMaxMs, retryBaseMs × 2^attempt)`, scaled by a random 50–100% |
+| `connectTimeoutMs` | `10000` | Wait for `welcome` per attempt |
+| `maxFrameBytes` | `65536` | Largest frame `send` accepts and a data channel delivers |
+| `queueLimit` | `64` | Frames held while reconnecting |
+| `direct` | `"auto"` | `"auto"`: direct links only for `peer-peer` descriptors. `true`: always try. `false`: never |
+| `directTimeoutMs` | `10000` | How long a data channel may take to open before the peer stays on the relay |
+| `directBroadcast` | `false` | Send broadcasts over open data channels and relay a copy only to peers without one |
+| `iceTransportPolicy` | browser default (`"all"`) | `"relay"` uses only TURN candidates, so no peer address is exposed |
+| `WebSocket` | `globalThis.WebSocket` | Supply one in a runtime without a global |
+| `RTCPeerConnection` | `globalThis.RTCPeerConnection` | Supply one in Node to get direct links; without it every peer stays on the relay |
+
+### Properties
+
+| Property | Meaning |
+| --- | --- |
+| `id` | `descriptor.userId` |
+| `room` | `descriptor.room` |
+| `state` | `idle`, `connecting`, `open`, `reconnecting` or `closed` |
+| `iceServers` | ICE servers from the hub's `welcome` |
+| `identity` | What the hub's `auth` verified for this client (`{ identity, claims }`), or `null` |
+| `links` | `Map` of peer id to open `PeerLink` |
+
+### Methods
+
+| Method | Returns | Notes |
+| --- | --- | --- |
+| `connect()` | `Promise<this>` | Resolves after `welcome`. Calling it again while connecting returns the same promise |
+| `reconnect()` | `Promise<this>` | Drops the socket and connects again now, with `renew` |
+| `send(payload, { to, channel = 'default', type = 'message' })` | `boolean` | See below |
+| `close()` | | Closes the socket and every direct link; no reconnect follows |
+| `peers()` | `string[]` | Other peers in the room |
+| `identityOf(peerId)` | object or `null` | A peer's verified identity, on hubs with `auth` |
+| `transportOf(peerId)` | `"direct"`, `"relay"` or `null` | `null` when the peer is not in the room |
+| `connectPeer(peerId, options)` | `PeerLink` | See [connectPeer](#connectpeer-and-peerlink) |
+| `on(event, listener)` | unsubscribe function | |
+| `once(event, listener)` | unsubscribe function | |
+| `off(event, listener)` | `this` | |
+
+`send` builds the frame `{ v: 1, type, channel, to?, seq, payload }` (an `undefined` payload becomes `null`):
+
+- With `to`, it goes over that peer's data channel when one is open, otherwise through the hub. Without `to` it is a broadcast through the hub (see `directBroadcast`).
+- Returns `true` when sent or queued during a reconnect, `false` when dropped (the queue is full or the socket write failed).
+- Throws `TypeError` for an empty `channel` or `type`, a reserved `type` (`welcome`, `presence`, `error`, `auth`, or anything starting `signal.` or `link.`), or a non-string `to`; `RangeError` for a frame over `maxFrameBytes`; and `Error('Not connected')` before `connect()` or after `close()`.
+
+When the hub declares channels, always pass `channel`: a frame on an undeclared channel closes the sender's socket ([live rooms](/guides/live-rooms)).
+
+### Events
+
+| Event | Payload |
+| --- | --- |
+| `open` | `{ reconnected }` |
+| `welcome` | `{ peers, iceServers, identity }` |
+| `message` | The frame `{ v, type, channel, from, to?, seq, payload }` plus `via`: `"relay"` or `"direct"` |
+| `presence` | `{ event: 'join', peer, identity }` or `{ event: 'leave', peer }` |
+| `transport` | `{ peer, transport: 'direct' \| 'relay', reason? }` when a peer's link opens or falls back |
+| `direct-failed` | `{ peer, reason }` when a data channel never opened |
+| `reconnecting` | `{ attempt, delayMs, error }` before each retry |
+| `disconnected` | `{ reconnecting: true }` when an open connection dropped and a reconnect starts |
+| `close` | `{ reason, reconnecting: false, error? }` when the client stops for good |
+| `error` | `Error` |
+| `kicked`, `banned` | `Error`, just before the client closes |
+
+An exception thrown by a listener is emitted as `error`.
+
+### Errors and refusals
+
+When the hub refuses or ends the connection it first sends `{ "type": "error", "code": "..." }`. The client turns this into `Error('Hub error: <code>')` with `.code` set, and emits it as `error`.
+
+- `kicked` and `banned` are final: the client emits `kicked` or `banned`, closes, and does not reconnect. See [manage live connections](/guides/connections-admin).
+- Any other code (for example `auth`, `credentials-changed`, `account-deleted`, `rate`, `channel`, `schema`) is followed by the socket closing. While connecting the attempt is retried; once open, the client reconnects with `renew` if `reconnect` is on.
+
+Messages a failed `connect()` can reject with:
+
+| Message | Cause |
+| --- | --- |
+| `Hub error: <code>` | The hub refused the ticket with a code |
+| `The hub refused the ticket or closed the connection` | The socket closed after the ticket was sent |
+| `Could not reach the hub` | The socket closed before it opened |
+| `Timed out waiting for the hub` | No `welcome` in `connectTimeoutMs` |
+| `The ticket was already used and no renew function was given to get a new one` | A retry needed a new ticket |
+| `No WebSocket implementation available` | No global `WebSocket` and none passed |
+| `Closed` | `close()` was called while connecting |
+
+Errors marked `.fatal` are not retried.
+
+## connectPeer and PeerLink
+
+```ts fragment
+connectPeer(client: LiveClient, peerId: string, options?: ConnectPeerOptions): PeerLink
+client.connectPeer(peerId: string, options?: ConnectPeerOptions): PeerLink
+```
+
+`LiveClient` starts direct links by itself for `peer-peer` descriptors (the peer with the larger id offers), so you rarely call this. Use it to retry a link after a fallback, or to force one with `direct: true`. It returns the existing link when one is open, and throws `TypeError` for an empty `peerId` or your own id.
+
+Options: `RTCPeerConnection`, `iceServers` (default: the hub's), `iceTransportPolicy`, `directTimeoutMs`.
+
+| `PeerLink` member | Meaning |
+| --- | --- |
+| `peer` | The peer id |
+| `transport` | `"direct"` while the data channel is open, else `"relay"` |
+| `ready` | Promise of the first transport that settles: `"direct"` or `"relay"` |
+| `polite` | `true` on the side with the smaller id, which yields on an offer collision |
+| `closed`, `failure` | Whether the link is closed, and why it fell back |
+| `close()` | Close the link; the peer stays reachable through the relay |
+
+Signalling, STUN and TURN: [peer-to-peer](/guides/peer-to-peer).
+
+## watchHubs
+
+```ts fragment
+watchHubs(options: WatchHubsOptions): Promise<HubWatch>
+```
+
+A live list of hubs for a page. Your server issues a read-only watch ticket (a `createHubApi` handler does this at its `watch` route); the page opens the registry socket with it.
+
+```js
+import { watchHubs } from '@dixonsolutions/liveengine/live-client';
+
+const watch = await watchHubs({ watchUrl: '/api/live/watch', body: { depth: 2 } });
+render(watch.hubs());
+const stop = watch.on('change', render);
+watch.on('close', ({ reason }) => console.log('hub list closed:', reason));
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `watchUrl` | required | Your route; it must answer `{ url, ticket, path?, depth? }` |
+| `body` | `{}` | Posted to `watchUrl` |
+| `fetch`, `WebSocket` | globals | |
+| `timeoutMs` | `10000` | Wait for the first snapshot |
+
+It resolves after the first snapshot with:
+
+| Member | Meaning |
+| --- | --- |
+| `hubs()` | The flat list. Each entry is the hub as the registry sends it (`id`, `mode`, `status`, `roomCount`, `memberCount`, ...) plus its `path`; never an address, credential or scope |
+| `on('change', listener)` | Called with the list after the snapshot and after every diff. Returns an unsubscribe function |
+| `on('close', listener)` | Called with `{ reason: 'closed' }` when the socket closes |
+| `close()`, `closed` | Close the socket, and whether it is closed |
+
+A gap in sequence numbers asks the hub for a fresh snapshot by itself. It rejects with `The hub list did not answer in time`, `The hub list connection failed`, `The hub closed the hub list (the ticket may have expired)`, or the watch route's own error. Wire format: [live registry](/guides/live-registry).
+
+## hubSession
+
+```ts fragment
+hubSession(options: { base: string; fetch?: typeof fetch; pollMs?: number }): HubSession
+```
+
+Password sign-in from a page, against a [`createHubApi`](/node/hub-api) handler. The API keeps the hub session in its own HttpOnly cookie; the page only learns the signed-in account. Accounts themselves are described in [accounts and sessions](/guides/accounts-and-sessions).
+
+```js
+import { connectLive, explainHubError, hubSession } from '/api/live/live-client.mjs';
+
+const session = hubSession({ base: '/api/live' });
+session.on('change', ({ account, reason }) => console.log(account?.username ?? 'signed out', reason));
+
+await session.refresh();                      // already signed in from an earlier visit?
+if (!session.account) await session.login('alice', 'correct-horse-battery');
+
+const client = await connectLive({ pairUrl: '/api/live/pair', body: { userId: session.account.username } });
+client.on('error', error => console.log(explainHubError(error) ?? error.message));
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `base` | required | The hub API address with its path, for example `/api/live`. Requests go to `${base}/me`, `/login`, `/logout` and `/password` with `credentials: 'include'` |
+| `fetch` | `globalThis.fetch` | |
+| `pollMs` | `5000` | How often a signed-in session is re-checked |
+
+| Member | Meaning |
+| --- | --- |
+| `account` | `{ username, role, enabled, claims?, ... }` or `null` |
+| `refresh()` | Ask the API who is signed in; resolves with `account` |
+| `login(username, password)` | Sign in; resolves with `account` |
+| `logout()` | Sign out. Never rejects |
+| `changePassword(current, next)` | Change the password. Every session of the account ends, this one too, so the person signs in again |
+| `on('change', listener)` | Called with `{ account, reason }` when the signed-in username or role changes. Returns an unsubscribe function. Any other event name throws `TypeError` |
+| `close()` | Stop polling and drop listeners |
+
+`reason` is `signed-in`, `signed-out`, or `ended` when a re-check finds the session gone (a password change in another tab, an administrator's reset, a ban or deletion).
+
+Rejections carry `.status` and friendlier messages: `Wrong username or password.` (401 on login), `Too many sign-in attempts. Wait a few minutes, then try again.` (429 on login), `The current password is wrong.` (401 on change), `Could not reach the hub API. Check that it is still running.` (network failure, `status` 0). The service's own sign-in lockout answers `401`, so it reads as a wrong password.
+
+## explainHubError
+
+```ts fragment
+explainHubError(error: { code?: string; status?: number } | string | null | undefined): string | undefined
+```
+
+Returns a sentence for a person, or `undefined` when there is nothing plain to say:
+
+| Input | Sentence |
+| --- | --- |
+| code `kicked` | You were removed from the match by an admin. |
+| code `banned` | Your account was disabled by an admin. |
+| code `account-deleted` | Your account was removed by an admin. |
+| code `credentials-changed` | Your password or role was changed, so you were signed out. Sign in again. |
+| code `auth` | You are not signed in. Sign in and try again. |
+| any error with `status` 401 | You are signed out. Sign in and try again. |
+
+It accepts a `LiveClient` error, an error from `connectLive` or `hubSession`, or the code string itself.
+
+## TypeScript
+
+The subpath ships `lib/live-client.d.mts`. Types such as `LiveDescriptor`, `LiveClientOptions`, `LiveFrame` and `LiveClientEvents` are re-exported from it, and `on` is typed per event.
+
+```ts
+import { LiveClient, type LiveDescriptor, type LiveFrame } from '@dixonsolutions/liveengine/live-client';
+
+declare const descriptor: LiveDescriptor;
+const client = new LiveClient(descriptor, { direct: 'auto', iceTransportPolicy: 'relay' });
+client.on('message', (frame: LiveFrame) => console.log(frame.via, frame.payload));
+await client.connect();
+```

@@ -7,7 +7,7 @@ description: "Use Engine::new and dispatch, call the same methods as the Node SD
 
 ```toml
 [dependencies]
-liveengine = "0.2"
+liveengine = "0.4"
 serde_json = "1"
 ```
 
@@ -32,7 +32,7 @@ Engine-only dependency:
 
 ```toml
 [dependencies]
-liveengine = { version = "0.2", default-features = false }
+liveengine = { version = "0.4", default-features = false }
 ```
 
 With `default-features = false`, only `Engine`, `rules`, and `VERSION` are available. There is no Node or hosting dependency.

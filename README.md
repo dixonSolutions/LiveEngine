@@ -1,11 +1,21 @@
 # LiveEngine
 
-Rust matchmaking and hub hosting for Node.js and Rust services. LiveEngine hosts internal hubs inside your API, runs standalone central registries, and connects independently hosted remote hubs through one authenticated HTTP contract.
+Live infrastructure in one package, for Rust and Node.js. LiveEngine hosts hubs and a registry of them, nests central hubs across services, pairs users with a hub or with each other, and connects them in live rooms that the hub relays, or directly over WebRTC with the hub as fallback. Core is plumbing: scopes, schemas, channels and payloads are all yours, defined at runtime.
 
-Define users, servers, custom scopes and requirements at runtime. Register internal or external hubs while the service is running; import a remote registry without rebuilding DTOs or redeploying. Each internal matchmaking hub owns an isolated engine. External hubs own their engine or custom implementation at their own address.
+- **Hub hosting and registry:** one authenticated HTTP contract (`liveengine.hub/v1`) for matchmaking engines, your own Rust handlers, and routes to hubs on other services. Run it standalone, in a container, or embedded in an Axum API.
+- **Nested central hubs:** namespaces of hubs, local or on another service, routed by path.
+- **Matchmaking and pairing:** discover hubs and peers that match requirements, pair a user with one, optionally wait for a partner, and get a descriptor with a single-use ticket.
+- **Live rooms:** a room socket per client; the hub relays frames, checks channels and schemas, and reports presence.
+- **Direct peer-to-peer:** the JavaScript `LiveClient` opens a WebRTC data channel to each paired peer, signalled through the hub, and falls back to the hub relay.
+- **Hub-to-hub links:** two services bridge a room over a persistent WebSocket link.
+- **Live hub lists:** subscribe to the registry for a snapshot and diffs, from a server or from a page with a read-only ticket.
+- **Pluggable hub auth and accounts:** a hub can verify a player's credential (a local account session, tokens, HMAC, JWT, a webhook or a Rust verifier); administrators can kick connections and ban accounts.
+- **Provider-hosted hubs:** run a central hub for a customer and give them a credential for that subtree only.
+
+What works where: Rust hosts hubs, rooms and links and has an HTTP client, but no live-room client yet. Node has the in-process engine, the HTTP client, `LiveClient` and `createHubApi` for browser-facing routes, and runs the host as the `liveengine-hub` command. Browsers use `LiveClient`, `watchHubs` and `hubSession`. WebRTC is only used between JavaScript clients; hub-to-hub links are WebSocket.
 
 - **Cargo:** `liveengine`, with an embeddable Rust library and `liveengine-hub` host.
-- **npm:** `@dixonsolutions/liveengine`, with a Rust N-API engine, TypeScript definitions, HTTP client and host command.
+- **npm:** `@dixonsolutions/liveengine`, with a Rust N-API engine, TypeScript definitions, HTTP client, live client, browser-facing hub API and host command.
 - **Containers:** one image runs a central registry, an internal hub host, or an independently hosted remote service.
 - **Custom hubs:** implement the versioned protocol externally or embed a Rust handler in your API.
 
@@ -216,7 +226,7 @@ docker run --rm -p 8787:8787 -e LIVEENGINE_TOKEN="$LIVEENGINE_TOKEN" liveengine-
 
 Pass real peer connection information so rate limits apply to the socket peer. Proxy headers do not establish client identity. When nesting the router below a prefix, advertise that prefix as part of the external base address.
 
-For an engine-only Rust dependency, disable hosting dependencies with `liveengine = { version = "0.2", default-features = false }`. The core is `Engine::new(seed)` with `dispatch(method, Vec<serde_json::Value>)` and has no Node dependency.
+For an engine-only Rust dependency, disable hosting dependencies with `liveengine = { version = "0.4", default-features = false }`. The core is `Engine::new(seed)` with `dispatch(method, Vec<serde_json::Value>)` and has no Node dependency.
 
 ## Docker and Podman
 
@@ -244,7 +254,7 @@ Hosts require a token of at least 24 bytes. Keep administrative tokens in server
 
 Defaults include a remote hostname allowlist, disabled HTTP redirects, outbound timeouts, bounded HTTP bodies/responses, bounded hub/entity/event counts and a peer request budget. Exact allowlist entries authorize the destination host, including private addresses when explicitly listed; only list hosts you control. Behind a shared reverse proxy, the socket peer budget is shared by its clients. TTL registrations expire in memory and can be re-registered after expiry.
 
-See [hosting configuration](docs/hosting.md) for environment settings and deployment details. Authentication is administrative: one bearer token for the HTTP API, single-use tickets for live sockets, and an optional per-hub `auth` that verifies a credential your application relays. There are no player accounts, per-player authorization policy or tenant isolation policy, and live rooms and members are not durable; `LIVEENGINE_STATE_FILE` persists registry definitions only.
+See [hosting configuration](docs/hosting.md) for environment settings and deployment details. Authentication is narrow: one administrator bearer token for the HTTP API, single-use tickets for live sockets, an optional per-hub `auth` that verifies a player credential, and optional local accounts (`admin` or `user`) whose sessions can sign in operators and players ([accounts and sessions](docs-site/guides/accounts-and-sessions.mdx)). There is no sign-up, password recovery, per-player authorization policy or tenant isolation beyond provider hosting, and live rooms and members are not durable; `LIVEENGINE_STATE_FILE` persists registry definitions, accounts and sessions only.
 
 ## Gogh Strike integration
 

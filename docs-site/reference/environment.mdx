@@ -24,11 +24,15 @@ These variables are read by `liveengine-hub` or `HubConfig::from_env()`.
 | `LIVEENGINE_MAX_QUEUED_CALLS` | positive integer | `1024` | Hub calls queued at once |
 | `LIVEENGINE_MAX_PAIR_WAIT_MS` | integer | `30000` | Longest a `pair` request may wait for a partner; `0` turns waiting off |
 | `LIVEENGINE_MAX_ROOM_CAPACITY` | integer at least 2 | `64` | Maximum requested pair room capacity; omitted capacity defaults to 2 |
-| `LIVEENGINE_MAX_PENDING_PAIRS` | positive integer | `1024` | Peers waiting in `pair` requests at once, per namespace (the service root, or the central a request addresses) |
+| `LIVEENGINE_MAX_PENDING_PAIRS` | positive integer | `1024` | Peers waiting in `pair` requests at once, across all namespaces of one hub service |
 | `LIVEENGINE_RATE_LIMIT_REQUESTS` | positive integer | `120` | Requests per peer per window |
 | `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS` | integer | `60` | Rate window in seconds |
 | `LIVEENGINE_RATE_LIMIT_PEERS` | positive integer | `4096` | Maximum tracked peers |
 | `LIVEENGINE_SEED` | unsigned integer | `0` | Seed for internally created engines |
+| `LIVEENGINE_PASSWORD` | string | none (required by `liveengine-hub login`) | Password sent by the `login` CLI command; the server does not read it |
+| `LIVEENGINE_PASSWORD_ITERATIONS` | integer from 100000 to 10000000 | `310000` | PBKDF2-SHA256 iterations for new password hashes; out-of-range values are rejected at startup |
+| `LIVEENGINE_SESSION_TTL_SECONDS` | integer from 1 to 31536000 | `43200` | Lifetime of a login session, in seconds (12 hours by default) |
+| `LIVEENGINE_LOGIN_MAX_FAILURES` | integer from 1 to 1000 | `5` | Failed logins one username may accumulate within 900 seconds before further attempts are delayed with exponential backoff; each address gets ten times this |
 
 `LIVEENGINE_BIND` must parse as a Rust `SocketAddr` (an IP literal plus port), not a DNS name. For example, `0.0.0.0:8787` or `[::1]:8787`.
 
@@ -163,6 +167,8 @@ See [Gogh Strike integration](/guides/gogh-strike) for commands and behavior.
 | `LIVEENGINE_LIVE_SEND_QUEUE` | 64 | Per-peer send queue |
 | `LIVEENGINE_LIVE_MAX_CONNECTIONS` | 4096 | Global connection cap |
 | `LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM` | 256 | Room connection cap |
+| `LIVEENGINE_LIVE_MAX_PREAUTH_PER_IP` | 16 | Unauthenticated `/v1/live` and `/v1/live/registry` sockets per client address; more are refused with `503`. Behind a shared reverse proxy every client has the proxy's address, so raise it there. Not applied when the server has no peer address |
+| `LIVEENGINE_LIVE_REGISTRY_MAX_SUBSCRIBERS` | 256 | Concurrent live registry subscribers; `0` is rejected, values above 16777216 are capped to it |
 | `LIVEENGINE_LIVE_IDLE_SECONDS` | 60 | Idle timeout |
 | `LIVEENGINE_LIVE_PING_SECONDS` | 20 | Ping interval |
 | `LIVEENGINE_LIVE_RESUME_MILLIS` | 500 | Presence resume window |

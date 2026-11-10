@@ -2,7 +2,7 @@
   "$schema": "https://mintlify.com/docs.json",
   "name": "LiveEngine",
   "theme": "mint",
-  "description": "Rust matchmaking engine and authenticated HTTP hub hosting/registry for Node.js and Rust services.",
+  "description": "Live infrastructure in one package: hub hosting and registry, nested central hubs, pairing, hub-relayed live rooms, direct WebRTC with relay fallback, live hub lists, accounts and pluggable hub auth, for Rust and Node.js.",
   "colors": {
     "primary": "#2563EB",
     "light": "#3B82F6",
@@ -64,6 +64,13 @@
             ]
           },
           {
+            "group": "Accounts and administration",
+            "pages": [
+              "guides/accounts-and-sessions",
+              "guides/connections-admin"
+            ]
+          },
+          {
             "group": "Concepts",
             "pages": [
               "concepts/lifecycle",
@@ -114,7 +121,9 @@
             "pages": [
               "node/installation",
               "node/engine",
-              "node/hub-client"
+              "node/hub-client",
+              "node/live-client",
+              "node/hub-api"
             ]
           },
           {

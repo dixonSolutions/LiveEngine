@@ -100,7 +100,7 @@ For a peer subject with a `peer` or `any` target, `waitMs` holds the request unt
 - A peer with no candidate yet stays queued. The next peer that pairs with it wakes it with its own ticket; nothing polls.
 - The wait ends with `408` after `waitMs`, capped by `LIVEENGINE_MAX_PAIR_WAIT_MS` (30000 by default). `0` there turns waiting off: with no candidate the request fails at once with `404`.
 - A request its caller drops leaves the queue at once, and a match removes both peers from the queue in one step.
-- A peer is queued once per id and scopes: a second request answers `409`. At most `LIVEENGINE_MAX_PENDING_PAIRS` (1024) peers wait at a time per namespace: `503` beyond that.
+- A peer is queued once per id and scopes: a second request answers `409`. At most `LIVEENGINE_MAX_PENDING_PAIRS` (1024) peers wait at a time across all namespaces of one hub service: `503` beyond that.
 - The waiting peer must already be a user of an internal hub, so other peers can discover it, and its registered scopes must equal the `subject.scopes` it passes to `pair`.
 - A waiting `pair` is allowed the request timeout plus its own wait, also when forwarded through a nest. Every other route keeps the plain request timeout.
 - With waiting enabled, a positive `waitMs` with a hub subject or a hub target is `400`. With `LIVEENGINE_MAX_PAIR_WAIT_MS=0` it is ignored.
@@ -193,7 +193,7 @@ The Rust client times out after five seconds, so it cannot wait for a partner fo
 | `LIVEENGINE_MAX_DEPTH` | 8 (at most 16) | Search and routing depth |
 | `LIVEENGINE_MAX_HUBS` | 256 | Bounds the discovery budget together with 1024 |
 | `LIVEENGINE_MAX_PAIR_WAIT_MS` | 30000 | Longest `waitMs`; `0` turns waiting off |
-| `LIVEENGINE_MAX_PENDING_PAIRS` | 1024 | Waiting peers at once, per namespace |
+| `LIVEENGINE_MAX_PENDING_PAIRS` | 1024 | Waiting peers at once, across all namespaces of one hub service |
 | `LIVEENGINE_CALL_QUEUE_MS` | 1000 | A call to a hub queues in arrival order for up to this long |
 | `LIVEENGINE_MAX_QUEUED_CALLS` | 1024 | Calls queued at once; beyond that a call is refused (`409` handler busy, `503` capacity busy) |
 | `LIVEENGINE_MAX_INFLIGHT_CALLS` | 16 | Concurrent hub calls |

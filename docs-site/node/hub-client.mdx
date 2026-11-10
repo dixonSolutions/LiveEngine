@@ -218,6 +218,66 @@ await client.importRegistry({
 });
 ```
 
+## Accounts and sessions
+
+These call the [account and session routes](/guides/accounts-and-sessions). The token the client was built with decides what is allowed: the administrator token or an `admin` session can manage accounts; a `user` session can only use `me`, `logout`, `changePassword` and `getAccount` for itself.
+
+```ts fragment
+interface Account { username: string; role: 'admin' | 'user'; enabled: boolean; claims?: Record<string, unknown>; createdAt: number; }
+
+login(username: string, password: string): Promise<{ token: string; account: Account; expiresAt: number }>
+logout(): Promise<null>
+me(): Promise<Account>
+changePassword(current: string, next: string): Promise<null>
+listAccounts(): Promise<Account[]>
+createAccount(account: { username: string; password: string; role: 'admin' | 'user'; enabled?: boolean; claims?: Record<string, unknown> }): Promise<Account>
+getAccount(username: string): Promise<Account>
+updateAccount(username: string, changes: { role?: 'admin' | 'user'; enabled?: boolean; claims?: Record<string, unknown> | null; password?: string }): Promise<Account>
+deleteAccount(username: string): Promise<null>
+```
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `login(username, password)` | `POST /v1/sessions` | The route ignores the bearer token, so any client can sign in. `token` is the new session; `expiresAt` is Unix seconds |
+| `logout()` | `DELETE /v1/sessions` | Ends the session this client was built with (`204`) |
+| `me()` | `GET /v1/sessions/me` | Needs a session token; the administrator token gets `401` |
+| `changePassword(current, next)` | `POST /v1/accounts/me/password` | Needs a session token. Ends every session of the account, including this client's |
+| `listAccounts()` | `GET /v1/accounts` | An array sorted by username |
+| `createAccount(account)` | `POST /v1/accounts` | `201`; `409` when the name exists in any case |
+| `getAccount(username)` | `GET /v1/accounts/{username}` | `404` when missing |
+| `updateAccount(username, changes)` | `PATCH /v1/accounts/{username}` | A password reset, a role change or `enabled: false` ends the account's sessions |
+| `deleteAccount(username)` | `DELETE /v1/accounts/{username}` | `204` |
+
+```js
+import { HubClient } from '@dixonsolutions/liveengine/hubs';
+
+const admin = new HubClient('http://127.0.0.1:8787', { token: process.env.LIVEENGINE_TOKEN });
+await admin.createAccount({ username: 'alice', password: 'correct-horse-battery', role: 'user' });
+
+const { token } = await admin.login('alice', 'correct-horse-battery');
+const alice = new HubClient('http://127.0.0.1:8787', { token });
+console.log((await alice.me()).role); // "user"
+await alice.logout();
+```
+
+Failures throw with `.status` like every other method, for example `401` with `invalid username or password`.
+
+## Live connections
+
+```ts fragment
+interface Connection { id: string; hub: string[]; room: string; user: string; role: string; transport: string; connectedAt: number; remote: boolean; }
+
+connections(filters?: { hub?: string; room?: string; user?: string }): Promise<Connection[]>
+kick(id: string): Promise<null>
+```
+
+`connections` calls `GET /v1/connections` with the filters as query parameters; `kick` calls `DELETE /v1/connections/{id}`, which closes the socket with the code `kicked` (`404` when the id is not connected). Every key in `filters` becomes a parameter, so leave unused keys out instead of setting them to `undefined`. Details: [manage live connections](/guides/connections-admin).
+
+```js
+const [first] = await admin.connections({ hub: 'ranked-au', user: 'alice' });
+if (first) await admin.kick(first.id);
+```
+
 ## Live, discovery and pairing methods
 
 | Method | Purpose | Guide |
@@ -228,9 +288,9 @@ await client.importRegistry({
 | `discover({ kind = 'any', path = [], depth, requirements })` | `{ candidates }` of hubs and peers | [Find and pair](/guides/find-and-pair) |
 | `pair({ subject, target = { kind: 'any' }, path = [], credential, waitMs })` | A descriptor `{ userId, link, room, ticket, url, transports }` for `LiveClient`; `waitMs` extends the request timeout | [Find and pair](/guides/find-and-pair) |
 | `renewal(request)` | A `renew` function for `LiveClient` that pairs again | [Find and pair](/guides/find-and-pair) |
-| `request(route, { method, body, signal, timeoutMs })` | Any authenticated route, for example `/v1/links` | [Hub links](/guides/hub-links) |
+| `request(route, { method, body, signal, token, timeoutMs })` | Any authenticated route, for example `/v1/links`. `token` replaces the client's token for this call | [Hub links](/guides/hub-links) |
 
-Hub-scoped provider credentials work with `route()` only; see [provider hosting](/guides/provider-hosting). `LiveClient` and `connectLive` are exported by `@dixonsolutions/liveengine/live-client`.
+Hub-scoped provider credentials work with `route()` only; see [provider hosting](/guides/provider-hosting). `LiveClient`, `connectLive` and the browser helpers are exported by `@dixonsolutions/liveengine/live-client`; see the [live client reference](/node/live-client).
 
 ## Properties
 

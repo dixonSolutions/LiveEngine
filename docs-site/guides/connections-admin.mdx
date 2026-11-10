@@ -1,0 +1,122 @@
+---
+title: "Manage live connections"
+description: "List the live sockets in a service's rooms, filter them by hub, room or user, kick one, and ban an account. Routes, answers, errors, and what the client sees."
+---
+
+An administrator can see who is connected to the service's live rooms right now and remove a connection. Kicking closes one socket. Banning is done on the account ([accounts and sessions](/guides/accounts-and-sessions)): it ends the account's sessions and closes its sockets in password hubs.
+
+Both routes need the administrator token or an `admin` session. Call them from your server or from the [hub API console](/node/hub-api#accounts-and-the-admin-console), never with the token in a page.
+
+## List connections
+
+`GET /v1/connections`, with optional query parameters:
+
+| Parameter | Matches |
+| --- | --- |
+| `hub` | The hub path joined with `/` (for example `eu/hub-a`), or the hub's own id (`hub-a`) |
+| `room` | The room id exactly |
+| `user` | The user id exactly |
+
+```sh
+curl -s 'http://127.0.0.1:8787/v1/connections?hub=hub-a&room=room-1' \
+  -H "Authorization: Bearer $LIVEENGINE_TOKEN"
+```
+
+Answers `200` with a JSON **array** sorted by `id`:
+
+```json
+[
+  {
+    "id": "9f2c...-3a41c0d2e8b7f615",
+    "hub": ["eu", "hub-a"],
+    "room": "room-1",
+    "user": "alice",
+    "role": "peer",
+    "transport": "websocket",
+    "connectedAt": 1762700000,
+    "remote": false
+  }
+]
+```
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Opaque connection id; pass it to the kick route. A new id is made for every connection, so a reconnect has a new one |
+| `hub` | Path of the hub that holds the room, ending with the hub id |
+| `room`, `user` | The room and the user id the ticket was issued for |
+| `role` | The ticket role: `peer` or `service` |
+| `transport` | `websocket` for sockets on this service |
+| `connectedAt` | Unix seconds |
+| `remote` | `true` for a peer in a [linked room](/guides/hub-links) whose socket belongs to another service |
+
+The list shows sockets in rooms only. Network addresses and credentials are never included, and direct WebRTC channels between peers are not connections of the service.
+
+With Node:
+
+```js
+import { HubClient } from '@dixonsolutions/liveengine/hubs';
+
+const admin = new HubClient('http://127.0.0.1:8787', { token: process.env.LIVEENGINE_TOKEN });
+const sockets = await admin.connections({ hub: 'hub-a', user: 'alice' });
+for (const c of sockets) console.log(c.id, c.hub.join('/'), c.room, c.user, c.remote);
+```
+
+Leave a filter out rather than passing `undefined`: the client turns every key it is given into a query parameter.
+
+From a shell, `liveengine-hub connections <url>` prints the unfiltered list, reading the token from `LIVEENGINE_TOKEN`.
+
+## Kick a connection
+
+`DELETE /v1/connections/{id}`
+
+```sh
+curl -sX DELETE "http://127.0.0.1:8787/v1/connections/$ID" -H "Authorization: Bearer $LIVEENGINE_TOKEN"
+```
+
+```js fragment
+await admin.kick(id); // resolves null (204)
+```
+
+| Status | Meaning |
+| --- | --- |
+| `204` | The socket was told to close. A local socket receives `{ "type": "error", "code": "kicked" }` and is closed. For a `remote` entry the kick is passed over the link to the service that owns the socket, which closes it the same way |
+| `404` | `connection not found`: no current connection has that id |
+
+A kick removes the connection, not the user's place in the hub. With a new ticket the user can connect again; to keep someone out, disable their account (for password hubs) or stop issuing them tickets in your own routes.
+
+## Ban an account
+
+```sh
+curl -sX PATCH http://127.0.0.1:8787/v1/accounts/alice \
+  -H "Authorization: Bearer $LIVEENGINE_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"enabled":false}'
+```
+
+```js fragment
+await admin.updateAccount('alice', { enabled: false });
+```
+
+This ends every session of the account at once and closes its sockets in rooms of hubs with `auth: { kind: "password" }` with the code `banned`. While the account is disabled, sign-in answers `401` and a socket that tries to connect with an older ticket is refused with `banned`. `{ "enabled": true }` lets the person sign in again. Sockets on hubs without password auth are not tied to an account; kick them.
+
+## What the client sees
+
+[`LiveClient`](/node/live-client#errors-and-refusals) turns the hub's `error` frame into an `Error` whose `code` is the hub's code:
+
+| Code | Sent when | `LiveClient` |
+| --- | --- | --- |
+| `kicked` | An administrator kicked the connection | Emits `kicked` and `error`, closes, and does **not** reconnect |
+| `banned` | The account was disabled | Emits `banned` and `error`, closes, and does **not** reconnect |
+| `credentials-changed` | The password was changed or reset, or the role changed | Emits `error`; the socket closes and the client tries to reconnect with `renew`, which fails until the person signs in again |
+| `account-deleted` | The account was deleted | As `credentials-changed` |
+
+`explainHubError(error)` from the same module gives plain words for each of these, for showing to the player.
+
+## Admin console
+
+`createHubApi({ adminConsole: true, ... })` serves a small page at the API's `/admin` path that lists, creates, disables, re-enables, re-roles and deletes accounts, resets passwords, and lists and kicks connections. The page is served only to a browser already signed in to the API with an `admin` account (through its `login` route, for example with `hubSession` on your own page); a signed-out request answers `401`. See [hub API reference](/node/hub-api#accounts-and-the-admin-console).
+
+## What is not supported
+
+- No live push of connection changes: poll `GET /v1/connections`, or watch the [live registry](/guides/live-registry) for room and member counts.
+- No temporary bans or ban lists by user id; a ban is a disabled account.
+- No kick by user id; list with `user=` and kick each `id`.

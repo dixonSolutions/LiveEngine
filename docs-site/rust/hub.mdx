@@ -234,4 +234,24 @@ liveengine-hub: could not bind 127.0.0.1:8787: ...
 
 ## HTTP client
 
-`liveengine::hub::HubClient::new(address, token)` provides `route`, `tree`, `ticket`, `watch_ticket`, `watch`, `export_registry`, and `request` for every protocol endpoint. There are no `discover` or `pair` methods: use `request` with `/v1/discover` and `/v1/pair`, or `route` with the `discover` and `pair` operations. Errors are `String`s such as `remote: remote returned HTTP 403`. Requests use a five-second timeout, no redirects, and a 4 MiB response limit.
+`liveengine::hub::HubClient::new(address, token)` creates a client for an `http` or `https` hub address with a bearer token. Its public methods:
+
+- `new(address, token)`: validate the address and token and build the client.
+- `request(method, route, body)`: send an authenticated request to any `/v1/` route; a 204 response returns null.
+- `login(username, password)`: authenticate an account and receive a session token.
+- `logout()`: revoke the session used by this client.
+- `me()`: retrieve the account that owns this session.
+- `change_password(current, next)`: change the session account's password.
+- `accounts(method, username, body)`: list or create accounts, or get, update, or delete a named account.
+- `connections(hub, room, user)`: list live connections, optionally filtered by hub, room, and user.
+- `kick(id)`: disconnect a live connection.
+- `route(path, op, body)`: route an operation to a central namespace; an empty path targets the root.
+- `discover(body)`: search the hub tree for matching candidates.
+- `pair(body)`: pair a subject with a matching target.
+- `tree(depth)`: discover hub branches recursively up to the given depth.
+- `ticket(path, hub_id, user_id, server_id, role, credential)`: issue a live ticket for a user paired in a room of a hub.
+- `watch_ticket(path, depth)`: issue a read-only watch ticket for the live registry.
+- `watch(path, depth, on_event)`: subscribe to the live registry over WebSocket and pass each message to `on_event` until it returns `false` or the stream closes.
+- `export_registry()`: export public registry definitions without credentials.
+
+Errors are `String`s such as `remote: remote returned HTTP 403`. Requests use a five-second timeout (plus any `waitMs` for pairing), no redirects, and a 4 MiB response limit.

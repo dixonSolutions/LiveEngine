@@ -1,5 +1,7 @@
 # Hub hosting
 
+> Canonical, maintained version: the docs site, starting at [Hosting](https://liveengine.mintlify.site/guides/hosting) (`docs-site/guides/hosting.mdx`), with [environment](https://liveengine.mintlify.site/reference/environment), [accounts and sessions](https://liveengine.mintlify.site/guides/accounts-and-sessions) and [live connections](https://liveengine.mintlify.site/guides/connections-admin). This file may lag behind it.
+
 The `liveengine-hub` process owns its registry and all registered internal engines. An external registration routes to a remote process; removing that registration does not remove its remote hub. Live room and player state is in memory; registry definitions can optionally be persisted.
 
 Set `LIVEENGINE_TOKEN` to an unpredictable secret of at least 24 bytes. Internal endpoints and remote endpoints share the `liveengine.hub/v1` protocol. Remote registrations require their own token; registry listing never returns credentials.

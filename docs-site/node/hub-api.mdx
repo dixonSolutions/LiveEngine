@@ -1,0 +1,177 @@
+---
+title: "createHubApi reference"
+description: "Every option, default and validation rule of createHubApi, each route it answers with its body, answer and status codes, the sign-in and admin console routes, and the handler's methods."
+---
+
+`createHubApi` returns a Node `(req, res, next?)` handler that gives a web page what it needs to use a hosted hub (pairing, renewal, seats, a live hub list, sign-in) while the administrator token stays inside the `HubClient` on your server. This page is the reference. For a walkthrough with Express and plain `http`, read [Hub API for browsers](/guides/hub-api) first.
+
+```js
+import { createHubApi } from '@dixonsolutions/liveengine/hub-api';
+```
+
+The module is dependency-free ESM. `HubClient` comes from `@dixonsolutions/liveengine/hubs`.
+
+## Smallest working handler
+
+```js
+import http from 'node:http';
+import { HubClient } from '@dixonsolutions/liveengine/hubs';
+import { createHubApi } from '@dixonsolutions/liveengine/hub-api';
+
+const api = createHubApi({
+  client: new HubClient(process.env.HUB_URL, { token: process.env.LIVEENGINE_TOKEN }),
+  hubId: 'lobby',
+  allowedOrigins: ['http://localhost:5173'],
+  basePath: '/api/live',
+});
+
+http.createServer((req, res) => api(req, res)).listen(8080);
+```
+
+The page then calls `POST /api/live/pair` with `{ "userId": "alice" }`, or uses [`connectLive`](/node/live-client#connectlive), which does that for you.
+
+## Options
+
+```ts fragment
+createHubApi(options: HubApiOptions): HubApi
+```
+
+| Option | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `client` | `HubClient` | none | Holds the administrator token. Without it every hub route answers `503` with `notConfigured` |
+| `hubId` | `string` | required | The hub this API fronts. Registered on first use if the service has no hub of that id |
+| `hubPath` | `string[]` | `[]` | Central namespace that holds the hub; calls go through `route()` when it is set |
+| `mode` | `'internal' \| 'external'` | `'internal'` | `external` registers the hub as a route to `remote` |
+| `remote` | `{ address, hubId?, token }` | none | Required for `external`; `hubId` defaults to `hubId`. Without `address` and `token` the API answers `503` |
+| `scopes` | object | `{}` | The hub's scopes, and the requirements a hub pairing uses |
+| `schemas` | `HubSchema[]` | `[]` | Published before an internal hub is registered; a version that exists is left alone |
+| `channels` | object | none | The hub's channel table, for an internal hub |
+| `auth` | `HubAuth` | none | The hub's verifier, for an internal hub. Unset leaves the hub open |
+| `peerLink.kind` | `'hub' \| 'peer'` | `'hub'` | `hub`: every player joins the hub's shared room. `peer`: players are paired with each other |
+| `peerLink.waitMs` | number | `30000` | How long a peer waits for a partner when the page does not say |
+| `peerLink.maxWaitMs` | number | `120000` | The most a page may ask for; never less than `waitMs` |
+| `roomCapacity` | integer ≥ 2 | `2` | Capacity of new pair rooms, bounded by the service's `LIVEENGINE_MAX_ROOM_CAPACITY` |
+| `subject` | `(body) => scopes` | the hub's `scopes` | Maps the page's request body to the scopes the player pairs with. Validate here: the body is the page's |
+| `allowedOrigins` | `Iterable<string>` or `(origin) => boolean` | `[]` | Pages allowed to call the API. Entries are trimmed, lower-cased and lose a trailing `/`. With the default, every `POST` is refused |
+| `allowedHosts` | `Iterable<string>` | none | When set, a request whose `Host` header is not listed answers `403` |
+| `basePath` | `string` | `''` | Prefix to answer under when no router strips it. Requests outside it go to `next()` |
+| `limits.bodyBytes` | number | `16384` | Largest request body |
+| `limits.requestsPerMinute` | number | `10` | `POST` requests per client address per minute |
+| `limits.readsPerMinute` | number | `300` | Other requests per client address per minute |
+| `limits.idleMs` | number | `180000` | A seat with no heartbeat for this long is released on the hub |
+| `limits.maxPlayers` | number | `4096` | Players the API tracks at once |
+| `join` | `{ server, extra? }` | none | Enables the older seat-based `join` route |
+| `statusExtra` | object | `{}` | Added to the `status` answer |
+| `watchUrl` | `string` | the client's address with `ws(s):` and `/v1/live/registry` | The registry socket URL handed to the page |
+| `adminConsole` | `boolean` | `false` | Enables the `/admin` console and its `admin/...` routes |
+| `notConfigured` | `string` | `The hub API has no hub client configured.` | The `503` message |
+
+A `limits` value that is not a positive number falls back to its default. The factory throws `TypeError` for a missing `hubId`, a non-array `hubPath`, an unknown `mode`, or a `roomCapacity` that is not an integer of at least 2.
+
+The hub is set up once, on `setup()` or the first request that needs it: the contract is checked, `schemas` are published and the hub is registered (with `scopes`, `channels` and `auth`) unless the service already has a hub with that id. An existing hub is not changed.
+
+## Handler
+
+| Member | Meaning |
+| --- | --- |
+| `api(req, res, next?)` | Answers its routes. A path it does not own goes to `next()`, or gets `404` without one |
+| `api.handle` | The same function, for frameworks that want a named handler |
+| `api.setup()` | Set the hub up now and start the idle reaper |
+| `api.close()` | Stop the idle reaper |
+| `api.stats()` | `{ seats, waiting, pairings }`: tracked seats, pair requests waiting for a partner, players with a known pairing |
+
+## Request checks
+
+Every request is checked in this order, before the route runs:
+
+| Check | Answer |
+| --- | --- |
+| `allowedHosts` set and `Host` not listed | `403 Invalid Host header` |
+| `Origin` present and not allowed, or a non-`GET` request without `Origin` | `403 Cross-origin request rejected` |
+| `OPTIONS` preflight from an allowed origin | `204`, with CORS headers (credentials allowed) and `Access-Control-Allow-Private-Network` when asked |
+| Wrong method for the route | `405 Method not allowed` |
+| Over the per-address budget | `429 Too many matchmaking requests` |
+| Body over `bodyBytes` | `413 Request body is too large` |
+| Body not a JSON object | `400 Expected a JSON object` |
+
+A `GET` without `Origin`, such as a health check, is allowed. Rate limits use the socket address: behind a proxy, every client shares the proxy's budget.
+
+## Routes
+
+Paths are relative to where the handler is mounted (or to `basePath`). Bodies are JSON.
+
+| Route | Method | Body | Answer |
+| --- | --- | --- | --- |
+| `status` | GET | | `{ configured, hubId, mode, externalConfigured, ...statusExtra }`; works without a hub |
+| `ping` | GET | | `{ ok, hubId, hubPingMs, serverTimeMs, waiting, seats }` |
+| `live-client.mjs` | GET | | The [live client](/node/live-client) module |
+| `discover` | POST | `{ kind?, depth?, requirements? }` | `{ candidates }` under `hubPath`. An unknown `kind` becomes `hub`; a `depth` outside 1–8 is ignored |
+| `watch` | POST | `{ depth? }` | `{ url, ticket, expiresAt, path, depth }` for [`watchHubs`](/node/live-client#watchhubs); a `depth` outside 1–8 becomes 1 |
+| `pair` | POST | `{ userId, waitMs?, credential?, seatToken?, ...yours }` | The descriptor plus a private `seatToken` |
+| `renew` | POST | `{ userId, seatToken, credential? }` | A fresh descriptor |
+| `heartbeat` | POST | `{ userId, seatToken }` | `{ ok: true }` |
+| `leave` | POST | `{ userId, seatToken }` | The hub's `leave` answer; the seat is released |
+| `join` | POST | `{ userId, seatToken?, ...yours }` | Only with the `join` option |
+| `login`, `logout`, `password`, `me` | | | See [accounts](#accounts-and-the-admin-console) |
+| `admin`, `admin/accounts...`, `admin/connections...` | | | Only with `adminConsole: true` |
+
+`userId` must match `^[a-zA-Z0-9._-]{1,64}$`, otherwise `400 Invalid userId`.
+
+### pair and renew
+
+- `pair` with `peerLink.kind: 'hub'` puts the player in the hub's shared room. With `'peer'` it registers the player as a candidate (scoped to this hub with an `arena` scope) and holds the request until another player arrives or `waitMs` passes. `waitMs` is clamped to `peerLink.maxWaitMs`.
+- The credential sent to the hub is the signed-in session (cookie or `Authorization: Bearer`) when there is one, otherwise `credential` from the body (up to 4096 characters). It is never stored.
+- The first `pair` for a user returns a new random `seatToken`; the API keeps only its SHA-256 hash. A repeat `pair`, and every `renew`, `heartbeat` and `leave`, must send it.
+- `renew` returns a descriptor without a `seatToken`.
+
+| Status | `error` | Cause |
+| --- | --- | --- |
+| `403` | `Seat authorization failed` | Missing or wrong `seatToken`; a second `pair` for a user whose first is still waiting; or a new `pair` for a user the hub already has paired |
+| `404` | `Pair before renewing` | `renew` for a user this API has not paired |
+| `408` | `No other player arrived in time` | A peer pairing waited `waitMs` with no partner |
+| `409` | `Pairing was cancelled` | The page dropped the request |
+| `429` | `Too many players` | `limits.maxPlayers` reached |
+| `401`, `503`, other `4xx` | the hub's message | Passed through, for example `403 credential refused` |
+| `502` | `LiveEngine request failed` | Anything else, including an administrator-token failure |
+
+A player is released (left, and removed from the hub if this API created them) on `leave`, when a waiting pair fails, and when the seat has had no heartbeat for `limits.idleMs`.
+
+## Accounts and the admin console
+
+These routes talk to the service that owns the accounts: the hub service, or for `mode: 'external'` the `remote` service. Accounts are described in [accounts and sessions](/guides/accounts-and-sessions).
+
+| Route | Method | Body | Answer |
+| --- | --- | --- | --- |
+| `login` | POST | `{ username, password }` | `{ account, expiresAt }` and a `liveengine_session` cookie |
+| `me` | GET | | The signed-in account, or `401 Sign in required` |
+| `logout` | POST | `{}` | `{ ok: true }`; ends the hub session and clears the cookie |
+| `password` | POST | `{ current, next }` | `{ ok: true }`; every session of the account ends, so the page signs in again |
+| `admin` | GET | | The console page (HTML) |
+| `admin/accounts`, `admin/accounts/{name}` | GET, POST, PATCH, DELETE | as `/v1/accounts` | Proxied to `/v1/accounts...` with the admin's session |
+| `admin/connections`, `admin/connections/{id}` | GET, DELETE | | Proxied to `/v1/connections...`; query strings are kept |
+
+- `login`, `me`, `logout` and `password` are always available; `adminConsole` only adds the `admin` routes. Without it those answer `404`.
+- The cookie holds a random id for a session kept in the API's memory (at most 4096; users sign in again after a restart). It is `HttpOnly; SameSite=Strict` with `Path` set to `basePath` (or `/`), and `Secure` when the API itself serves HTTPS. Behind a TLS-terminating proxy the API sees plain HTTP and leaves `Secure` off.
+- An explicit `Authorization: Bearer <hub session token>` header is accepted instead of the cookie.
+- The `admin` routes need a session whose account role is `admin`: no session answers `401 Sign in required`, another role `403 Administrator access required`. This includes the console page itself, so sign in first (for example with [`hubSession`](/node/live-client#hubsession)) and then open `admin`.
+- Errors from the service are passed through: `401 invalid username or password` on a bad sign-in, for example.
+
+## In the page
+
+```js
+import { connectLive, hubSession, watchHubs } from '/api/live/live-client.mjs';
+
+const session = hubSession({ base: '/api/live' });
+await session.login('alice', 'correct-horse-battery');
+
+const client = await connectLive({ pairUrl: '/api/live/pair', body: { userId: session.account.username } });
+const hubs = await watchHubs({ watchUrl: '/api/live/watch' });
+setInterval(() => client.heartbeat().catch(() => {}), 60_000);
+addEventListener('pagehide', () => { client.leave(); });
+```
+
+The page's origin must also be in the hub's `LIVEENGINE_LIVE_ALLOWED_ORIGINS` for the room and registry sockets.
+
+<Warning>
+  Without hub `auth`, the API does not know who a player is: anyone allowed by `allowedOrigins` can pair as any `userId`. Use a password hub with `hubSession`, pass another credential through `credential`, or put your own authentication in front of the handler.
+</Warning>

@@ -32,6 +32,7 @@ Use hub `auth` when the hub should not simply trust the user id your application
 
 | `kind` | Definition | Credential |
 | --- | --- | --- |
+| `password` | `roles?`: one or two distinct of `user` and `admin`; omitted accepts any account role | A session token from `POST /v1/sessions`; the identity is the account username, and claims include `role` |
 | `token` | `tokens`: 1 to 256 entries of `{ token, identity?, claims? }`; each `token` is 24 to 512 bytes | The token itself, compared in constant time |
 | `hmac` | `secret` (32 to 512 bytes), `leewaySeconds?` (0 to 300) | `base64url(payload JSON).base64url(HMAC-SHA256(secret, first segment))`. The payload holds `sub`, a required `exp` in Unix seconds, and any claims |
 | `jwt` | `alg`: `HS256` with `secret` (32 to 512 bytes) or `EdDSA` with `publicKey` (32 raw bytes as unpadded base64url); `issuer?`, `audience?`, `identityClaim?` (default `sub`), `leewaySeconds?` (0 to 300) | A compact JWT with a required `exp` |
