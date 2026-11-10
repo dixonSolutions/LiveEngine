@@ -106,6 +106,8 @@ async fn attempt(
         .unwrap()
 }
 
+// macOS routes only 127.0.0.1 on loopback, so a second source address cannot be bound there.
+#[cfg_attr(target_os = "macos", ignore = "needs more than one loopback address")]
 #[tokio::test]
 async fn one_address_cannot_lock_an_account_out_of_another() {
     let s = server_with(None, fast_hashing()).await;
