@@ -14,7 +14,7 @@ It is dependency-free ESM (`@dixonsolutions/liveengine/hub-api`), has no knowled
 | Publishing | `setup()` (or the first request) checks the contract, publishes `schemas` once, and registers the hub with its `channels`, `scopes` and `auth` if the service has no such hub. A schema version is immutable, so an existing one is left alone. |
 | Pairing | `pair` pairs a player with the hub's shared room (`peerLink.kind: "hub"`) or with another player (`"peer"`). With peers it holds the request for `waitMs` until a partner arrives and answers `408` if none does. |
 | Renewal | `renew` gives a paired player a fresh single-use ticket. Credentials are never stored, so a hub with `auth` needs the player to send one again. |
-| Seats | The API tracks each player it paired, serialises operations per player, and caps players at `limits.maxPlayers`. |
+| Seats | The API tracks each peer it paired, serialises operations per peer, and caps the peers holding a pairing at `limits.maxPeers` (`429 Too many peers`). |
 | Idle reaper | A seat with no `heartbeat` for `limits.idleMs` is released on the hub. |
 | Cancel | A page that drops its pairing request, leaves the engine's queue at once. A left player is also removed from the hub: `leave` alone returns a player to "waiting", which would make them a ghost candidate for the next pairing. |
 | Watch tickets | `watch` issues a read-only registry ticket and the registry URL, so a page can show a live hub list without the token. |
@@ -37,7 +37,7 @@ Paths are relative to where you mount the handler.
 | `watch` | POST | `{ depth? }`: `{ url, ticket, expiresAt, path, depth }`. |
 | `join` | POST | Only with the `join` option: the older seat-based matchmaking. |
 
-`userId` must match `^[a-zA-Z0-9_-]{1,64}$`. A `POST` needs an `Origin` in `allowedOrigins`; a `GET` without an `Origin` (a health check) is allowed, one with a disallowed `Origin` is refused with `403`. Hub `4xx` answers such as `403 credential refused` reach the page; an administrator-token failure or anything else becomes `502`.
+`userId` must match `^[a-zA-Z0-9._-]{1,64}$`. A `POST` needs an `Origin` in `allowedOrigins`; a `GET` without an `Origin` (a health check) is allowed, one with a disallowed `Origin` is refused with `403`. Hub `4xx` answers such as `403 credential refused` reach the page; an administrator-token failure or anything else becomes `502`.
 
 ## Plain `http`
 
@@ -90,13 +90,19 @@ Fastify (with `@fastify/middie`) and Next route handlers pass Node requests the 
 | `roomCapacity` | Capacity for newly created pair rooms, default 2; bounded by the hub service maximum. |
 | `scopes` | The hub's scopes, and what a hub pairing requires. |
 | `schemas`, `channels`, `auth` | What to publish and register. `auth` is the hub's verifier; unset leaves the hub open. |
-| `peerLink` | `{ kind: "hub" \| "peer", waitMs, maxWaitMs }`. Peers are kept to this hub by an `arena` scope. |
+| `peerLink` | `{ kind: "hub" \| "peer", waitMs, maxWaitMs }`. Peers are kept to this hub by the `peerScopeKey` scope. |
+| `peerScopeKey` | The scope key, default `arena`, added with the hub id as its value to every peer's scopes and to what a peer requires, so peers of other hubs on the service are never candidates. See the note below. |
 | `subject(input)` | Maps a request body to the scopes a player pairs with. Validate here: the body is the page's. |
 | `allowedOrigins` | A list of origins, or a predicate. |
 | `allowedHosts` | When set, another `Host` header is refused. |
 | `basePath` | Path to answer under when no router strips it. |
-| `limits` | `bodyBytes` (16384), `requestsPerMinute` (10 per address for POST), `readsPerMinute` (300 for GET), `idleMs` (180000), `maxPlayers` (4096). |
+| `limits` | `bodyBytes` (16384), `requestsPerMinute` (10 per address for POST), `readsPerMinute` (300 for GET), `idleMs` (180000), `maxPeers` (4096). `maxPlayers` is a deprecated alias of `maxPeers`, which wins when both are set. |
+| `secureCookies`, `trustProxy` | When the session cookie is `Secure`: `true`, `false`, or `'auto'` (default), which marks it when the request reached the handler over TLS, or, with `trustProxy: true`, when `X-Forwarded-Proto` is `https`. Set `trustProxy` only behind a proxy that overwrites that header. |
 | `join`, `statusExtra`, `watchUrl`, `notConfigured` | The legacy `join` route, extra status fields, the registry URL the page opens (default: the hub's own), the `503` message. |
+
+<Note>
+With `peerLink.kind: "peer"` the API adds `peerScopeKey` (default `arena`) to each peer's scopes. A hub `userSchema` or `scopeSchema` with `additionalProperties: false` refuses that key, and every peer pairing fails validation. Allow the key in the schema (`"arena": { "type": "string" }`), or set `peerScopeKey` to a name the schema already allows.
+</Note>
 
 `api.setup()` publishes now and starts the reaper, `api.close()` stops the reaper, and `api.stats()` returns `{ seats, waiting, pairings }`.
 
@@ -125,7 +131,9 @@ See [Gogh Strike integration](/guides/gogh-strike) for a game built on it, and [
 
 ## Accounts and administration
 
-Set `adminConsole: true` on `createHubApi` to enable the console at the API's `/admin` path. An administrator signs in through `POST /login` with `username` and `password`; `GET /me` returns the account and `POST /logout` ends the session. The browser receives an HttpOnly, SameSite=Strict cookie containing an opaque API session identifier. The hub session stays on the API server. HTTPS adds the Secure cookie attribute. An explicit hub session bearer token can also be supplied in the Authorization header. Configure allowed origins and HTTPS for the host serving the API.
+Every hub API has the account routes, with or without the console. Any account (`user` or `admin`) signs in through `POST /login` with `username` and `password`; `GET /me` returns the account and `POST /logout` ends the session. The browser receives an HttpOnly, SameSite=Strict cookie containing an opaque API session identifier. The hub session stays on the API server. The cookie is `Secure` as `secureCookies` decides: by default when the API itself serves HTTPS, or behind a TLS proxy with `trustProxy: true`. An explicit hub session bearer token can also be supplied in the Authorization header. Configure allowed origins and HTTPS for the host serving the API.
+
+Set `adminConsole: true` to also serve the administrator console at the API's `/admin` path. The page itself is a static shell with no data or secrets, served to anyone so that a signed-out visitor sees its sign-in form; the routes it reads (`/admin/accounts`, `/admin/connections`) need an `admin` session (`401` signed out, `403` for a `user`). Without `adminConsole` all of these answer `404`.
 
 `POST /password` takes `{ current, next }` for the signed-in account and ends every session of it, this one included, so the page signs in again. With an external hub the accounts live on the remote service that owns the hub, so `login`, `me`, `logout`, `password` and the console talk to that service (`remote.address`), and the central only forwards the session on a pair.
 

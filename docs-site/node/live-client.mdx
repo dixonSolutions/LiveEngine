@@ -53,7 +53,7 @@ Posts `body` to `pairUrl`, builds a `LiveClient` from the answer, connects, and 
 | --- | --- | --- |
 | `pairUrl` | required | Your route that answers with a descriptor |
 | `renewUrl` | `pairUrl` | Posted for a fresh descriptor whenever a reconnect needs a new ticket |
-| `leaveUrl`, `heartbeatUrl` | `pairUrl` with its final `/pair` replaced by `/leave` or `/heartbeat` | Seat routes used by `client.leave()` and `client.heartbeat()` |
+| `leaveUrl`, `heartbeatUrl` | `pairUrl` with its last path segment replaced by `leave` or `heartbeat`, query and fragment kept | Seat routes used by `client.leave()` and `client.heartbeat()` |
 | `body` | `{}` | The JSON body sent to `pairUrl` and `renewUrl` |
 | `seatStore` | `sessionStorage`, else memory | Where the seat token is kept: `{ get(key), set(key, value), delete(key) }`, all synchronous |
 | `fetch` | `globalThis.fetch` | |
@@ -67,9 +67,9 @@ What it sends and keeps:
 - A renew request is `{ ...body, seatToken, credential? }`.
 - `client.heartbeat()` and `client.leave()` post `{ userId: body.userId, seatToken }`. `leave()` uses `keepalive: true`, so it can run during `pagehide`, and always forgets the saved seat.
 
-<Warning>
-  If `pairUrl` does not end in `/pair`, the default `leaveUrl` and `heartbeatUrl` are `pairUrl` itself, so `leave()` would post to your pair route. Pass `leaveUrl` and `heartbeatUrl`, or do not call those methods.
-</Warning>
+<Note>
+  The seat routes default to siblings of `pairUrl`: `/api/live/pair/?region=au` gives `/api/live/leave?region=au`, and `/api/match` gives `/api/leave`. Pass `leaveUrl` and `heartbeatUrl` when yours live elsewhere. A `pairUrl` with no path segment (a bare origin) has no siblings, so `connectLive` throws `TypeError` unless both are given; it never posts a seat request to `pairUrl` itself.
+</Note>
 
 Errors from your routes are `Error`s with `.status`. The message is the answer's `error` (or `reason`) field when there is one, otherwise `Pairing failed (HTTP n)`, `Renewal failed (HTTP n)`, and so on. A `4xx` answer other than `408` or `429` sets `.fatal`, which stops the retries and forgets the saved seat. If connecting fails after pairing, the client is closed and the promise rejects.
 

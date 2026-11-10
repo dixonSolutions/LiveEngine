@@ -910,6 +910,31 @@ describe('connectLive', () => {
     await afterFallback.leave();
     afterFallback.close();
   });
+
+  test('seat routes beside a pairUrl not named /pair are its siblings, never pairUrl itself', async () => {
+    const calls = [];
+    const fetchSeat = async (url, init) => {
+      calls.push(url);
+      if (url.includes('/heartbeat') || url.includes('/leave') || url.includes('/beat') || url.includes('/bye')) return new Response('{}', { status: 200 });
+      const response = await fetch(`${base}/pair`, init);
+      return new Response(await response.text(), { status: response.status });
+    };
+    const options = { body: { userId: `cl-sibling-${++counter}`, tier: 'open' }, seatStore: new Map(), fetch: fetchSeat, direct: false };
+    const client = track(await connectLive({ ...options, pairUrl: `${base}/api/matchmake/?region=b#seat` }));
+    await client.heartbeat();
+    await client.leave();
+    client.close();
+    assert.deepEqual(calls.slice(1), [`${base}/api/heartbeat?region=b#seat`, `${base}/api/leave?region=b#seat`]);
+    // Explicit routes win; a pairUrl with no path segment needs them.
+    calls.length = 0;
+    const explicit = track(await connectLive({ ...options, body: { userId: `cl-sibling-${++counter}`, tier: 'open' }, pairUrl: base, leaveUrl: `${base}/bye`, heartbeatUrl: `${base}/beat` }));
+    await explicit.heartbeat();
+    await explicit.leave();
+    explicit.close();
+    assert.deepEqual(calls.slice(1), [`${base}/beat`, `${base}/bye`]);
+    await assert.rejects(connectLive({ ...options, pairUrl: `${base}/` }), /leaveUrl and heartbeatUrl are required/);
+    assert.equal(calls.length, 3, 'nothing was posted for a pairUrl without seat routes');
+  });
 });
 
 test('kicked and banned events stop automatic reconnect', async () => {

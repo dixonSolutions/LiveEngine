@@ -5,7 +5,7 @@ description: "Every LiveEngine and NativeEngine export, option, method, return s
 
 ## Exports
 
-```ts
+```ts fragment
 export declare class LiveEngine extends EventEmitter { /* ... */ }
 export declare class NativeEngine { /* ... */ }
 export declare const nativeVersion: string;
@@ -38,7 +38,7 @@ The seed controls generated users and the `random` strategy. The same seed and o
 
 ## Input and output shapes
 
-```ts
+```ts fragment
 type ScopeValue = number | boolean | string | string[] | null;
 type Scopes = Record<string, ScopeValue>;
 
@@ -118,7 +118,7 @@ Defaults: `capacity` 1 (minimum 1), `minMembers` 0, status `open`. A new server 
 
 ## Query and matching methods
 
-```ts
+```ts fragment
 interface MatchOptions {
   limit?: number;     // 0 = unlimited, default 10
   strategy?: Strategy;

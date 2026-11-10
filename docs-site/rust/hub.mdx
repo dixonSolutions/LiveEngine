@@ -254,4 +254,44 @@ liveengine-hub: could not bind 127.0.0.1:8787: ...
 - `watch(path, depth, on_event)`: subscribe to the live registry over WebSocket and pass each message to `on_event` until it returns `false` or the stream closes.
 - `export_registry()`: export public registry definitions without credentials.
 
+Typed wrappers over `request` for the rest of the protocol. Each takes and returns `serde_json::Value` where the shape is yours (scopes, schemas, hub definitions), and a route that answers `204` returns `Value::Null`. Path segments are percent-encoded.
+
+| Method | Route |
+| --- | --- |
+| `contract()` | `GET /v1/contract`; an error when the protocol is not `HUB_PROTOCOL` |
+| `contract_schema()` | `GET /v1/contract/schema` |
+| `list_schemas()`, `create_schema(schema)`, `get_schema(reference)`, `delete_schema(reference)` | `/v1/schemas`, `/v1/schemas/{id@version}` |
+| `list_templates()`, `create_template(template)`, `get_template(name)`, `delete_template(name)` | `/v1/templates`, `/v1/templates/{name}` |
+| `list_hubs()`, `register_hub(definition)`, `get_hub(id)`, `delete_hub(id)` | `/v1/hubs`, `/v1/hubs/{id}` |
+| `call_hub(id, method, args)` | `POST /v1/hubs/{id}/call`; returns the call's `result` |
+| `import_registry(request)` | `POST /v1/registries/import` with `{ address, token, prefix?, refreshSeconds? }` |
+| `list_links()`, `create_link(definition)`, `get_link(id)`, `delete_link(id)` | `/v1/links`, `/v1/links/{id}` ([hub links](/guides/hub-links)) |
+| `issue_link_credential(hub_id)`, `revoke_link_credentials(hub_id)` | `POST` and `DELETE /v1/hubs/{id}/link-credentials` |
+
+```rust
+use liveengine::hub::HubClient;
+use serde_json::json;
+
+async fn link(local: &HubClient, remote: &HubClient, remote_url: &str) -> Result<(), String> {
+    remote.register_hub(json!({"id": "far", "mode": "internal"})).await?;
+    let credential = remote.issue_link_credential("far").await?;
+    local
+        .create_link(json!({
+            "id": "to-far", "address": remote_url, "remoteToken": credential["token"],
+            "hubId": "far", "userId": "bridge", "serverId": "room"
+        }))
+        .await?;
+    println!("{}", local.get_link("to-far").await?["status"]);
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), String> {
+    let token = std::env::var("LIVEENGINE_TOKEN").map_err(|e| e.to_string())?;
+    let local = HubClient::new("http://127.0.0.1:8787", token.clone())?;
+    let remote = HubClient::new("http://127.0.0.1:8788", token)?;
+    link(&local, &remote, "http://127.0.0.1:8788").await
+}
+```
+
 Errors are `String`s such as `remote: remote returned HTTP 403`. Requests use a five-second timeout (plus any `waitMs` for pairing), no redirects, and a 4 MiB response limit.

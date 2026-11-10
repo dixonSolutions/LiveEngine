@@ -85,7 +85,7 @@ docker compose down
 ```
 
 <Warning>
-The Compose services keep all registry and matchmaking state in memory. `docker compose restart` or `down` loses registrations, users, memberships, and events. Re-create runtime registrations after a restart.
+Each Compose service sets `LIVEENGINE_STATE_FILE=/state/registry.json` on its own named volume (`central-state`, `remote-state`, `leaf-state`), so definitions survive `docker compose restart` and `down`: the instance id, schemas, templates, registry imports, hub registrations (with their credentials), links, accounts and session hashes. Matchmaking state is still in memory: users, rooms, memberships, events and live connections are lost on a restart, and pages must pair again. `docker compose down -v` removes the volumes and everything in them.
 </Warning>
 
 ## Custom hub container

@@ -27,3 +27,10 @@ impl NativeEngineCore {
             .map_err(napi::Error::from_reason)
     }
 }
+
+/// The crate version this addon was built from, so an install in a source checkout can tell an
+/// addon left over from another version.
+#[napi(js_name = "nativeVersion")]
+pub fn native_version() -> String {
+    env!("CARGO_PKG_VERSION").to_owned()
+}

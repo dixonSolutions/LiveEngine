@@ -37,6 +37,23 @@ struct Waiting {
     requirements: Value,
     credential: Value,
     wake: oneshot::Sender<Matched>,
+    /// Counts the queue changes this waiter may want to look again for (see `PendingPairs`).
+    changes: tokio::sync::watch::Sender<u64>,
+}
+
+impl Waiting {
+    /// Whether this waiter, as a claimer, could take a peer with this id and these scopes, by
+    /// the same test `claim` makes on the waiter's own wishes.
+    fn wants(&self, id: &str, scopes: &Value) -> bool {
+        matches!(self.kind.as_str(), Some("peer" | "any"))
+            && self.id.as_str().is_none_or(|wanted| wanted == id)
+            && rules::evaluate(&self.requirements, scopes)
+    }
+
+    fn look_again(&self) {
+        self.changes
+            .send_modify(|count| *count = count.wrapping_add(1));
+    }
 }
 
 /// A waiting peer is known by its id and its scopes, so the same id waiting in two hubs of one
@@ -49,18 +66,24 @@ fn seat_key(id: &str, scopes: &Value) -> SeatKey {
 
 /// Peers whose `pair` request is waiting for a partner. Guarded by one mutex that is
 /// never held across an await, so a claim removes the waiter and the claimer together.
+///
+/// A waiter that found no partner sleeps until a change it could use: a peer it would accept
+/// joined the queue, or a pairing seated a peer it would accept in a room that may have space.
+/// Each waiter has its own change counter, so a change wakes only the waiters it concerns
+/// instead of every waiter on the service, each of which would look again.
 pub(crate) struct PendingPairs {
     state: Mutex<(u64, HashMap<SeatKey, Waiting>)>,
-    /// Counts the changes a waiting peer may want to look again for: a peer joined the queue, or a
-    /// pairing completed. A waiter that could not use a candidate yet watches it.
-    changes: tokio::sync::watch::Sender<u64>,
+    /// `pair_once` runs made by each waiting peer (its first look and every look again).
+    #[cfg(test)]
+    looks: Mutex<HashMap<String, usize>>,
 }
 
 impl Default for PendingPairs {
     fn default() -> Self {
         Self {
             state: Mutex::new((0, HashMap::new())),
-            changes: tokio::sync::watch::channel(0).0,
+            #[cfg(test)]
+            looks: Default::default(),
         }
     }
 }
@@ -89,6 +112,8 @@ pub(crate) struct Seat {
     state: Arc<Inner>,
     key: SeatKey,
     token: u64,
+    /// Changes in the queue that concern this waiter.
+    changes: tokio::sync::watch::Receiver<u64>,
 }
 
 impl Seat {
@@ -113,13 +138,15 @@ impl PendingPairs {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.changes.subscribe()
-    }
-
-    fn changed(&self) {
-        self.changes
-            .send_modify(|count| *count = count.wrapping_add(1));
+    /// A pairing seated these members (id, scopes) in a room that may still have space: wake
+    /// the waiters that would accept one of them, since that room is now worth joining.
+    fn seated(&self, members: &[(&str, &Value)]) {
+        let guard = self.lock();
+        for waiting in guard.1.values() {
+            if members.iter().any(|(id, scopes)| waiting.wants(id, scopes)) {
+                waiting.look_again();
+            }
+        }
     }
 
     fn remove(&self, key: &SeatKey, token: u64) -> bool {
@@ -162,8 +189,15 @@ impl PendingPairs {
         }
         guard.0 += 1;
         let token = guard.0;
-        self.changed();
+        // Wake the waiters that could claim this newcomer. One that could not gains nothing
+        // from it: the newcomer looks for its own partners, and claims them itself.
+        for waiting in guard.1.values() {
+            if waiting.wants(id, scopes) {
+                waiting.look_again();
+            }
+        }
         let (wake, receiver) = oneshot::channel();
+        let (changes, watching) = tokio::sync::watch::channel(0);
         guard.1.insert(
             key.clone(),
             Waiting {
@@ -173,6 +207,7 @@ impl PendingPairs {
                 requirements,
                 credential,
                 wake,
+                changes,
             },
         );
         Ok((
@@ -180,6 +215,7 @@ impl PendingPairs {
                 state: state.clone(),
                 key,
                 token,
+                changes: watching,
             },
             receiver,
         ))
@@ -633,7 +669,7 @@ pub(crate) async fn pair(
                 return error(StatusCode::SERVICE_UNAVAILABLE, "pairing queue is full")
             }
         };
-        let mut changes = state.pending.subscribe();
+        let mut changes = seat.changes.clone();
         let (response, woken) = loop {
             changes.borrow_and_update();
             let mut races = 0;
@@ -883,6 +919,16 @@ async fn pair_once(
     inherited_channels: Option<crate::live::ChannelPolicy>,
     seat: Option<&Seat>,
 ) -> Response {
+    #[cfg(test)]
+    if let (Some(_), Some(id)) = (seat, body.pointer("/subject/id").and_then(Value::as_str)) {
+        *state
+            .pending
+            .looks
+            .lock()
+            .unwrap()
+            .entry(id.to_owned())
+            .or_default() += 1;
+    }
     let capacity = body
         .pointer("/target/capacity")
         .and_then(Value::as_u64)
@@ -1233,8 +1279,13 @@ async fn pair_once(
             }
             return *e;
         }
-        // Peers waiting on a candidate they could not use may find this room worth joining.
-        state.pending.changed();
+        // Peers waiting on a candidate they could not use may find this room worth joining. A
+        // new room of two is full, so nobody can.
+        if existing.is_some() || capacity > 2 {
+            state
+                .pending
+                .seated(&[(target_id, &target_scopes), (id, &subject["scopes"])]);
+        }
     } else {
         if existing.is_none() {
             let server = json!({"id":room,"scopes":target_scopes,"capacity":capacity});
@@ -1492,6 +1543,7 @@ mod tests {
             state: state.clone(),
             key: seat_key("a", &json!({})),
             token: seat.token + 100,
+            changes: seat.changes.clone(),
         };
         drop(stale);
         assert!(seat.holds());
@@ -1603,5 +1655,162 @@ mod tests {
             Claim::Taken(_)
         ));
         assert_eq!(state.pending.len(), 0);
+    }
+
+    async fn call(state: &Arc<Inner>, path: Vec<String>, op: &str, body: Value) -> (u16, Value) {
+        let response = crate::hub::route_hub(
+            State(state.clone()),
+            HeaderMap::new(),
+            Ok(Json(RouteRequest {
+                path,
+                op: op.into(),
+                body,
+                inherited_schemas: None,
+                inherited_channels: None,
+            })),
+        )
+        .await;
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// A crowd of waiting peers: pairs that accept only each other, and loners nobody accepts.
+    /// Every pair is made exactly once, nobody is seated twice, every loner times out, and a
+    /// queue change wakes only the waiters it could matter to, so the number of looks stays
+    /// close to one per peer instead of growing with the crowd.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_crowd_of_waiters_pairs_once_and_wakes_only_whom_a_change_concerns() {
+        const PAIRS: usize = 50;
+        const LONERS: usize = 900;
+        let state = HubService::new(HubConfig {
+            token: "pending-queue-unit-test-token-123".into(),
+            public_url: Some("ws://live.example.test/v1/live".into()),
+            max_pending_pairs: 4096,
+            // Discovery scans at most `max_hubs` (capped at 1024) hubs and users per look.
+            max_hubs: 4096,
+            max_queued_calls: 1 << 20,
+            max_inflight_calls: 64,
+            call_queue: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(60),
+            max_pair_wait: Duration::from_secs(60),
+            ..HubConfig::default()
+        })
+        .unwrap()
+        .inner;
+        let (status, body) = call(
+            &state,
+            vec![],
+            "register",
+            json!({"id":"arena","mode":"internal"}),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        // (id, group): a pair shares a group, a loner's group is its own.
+        let mut peers: Vec<(String, String)> = Vec::new();
+        for n in 0..PAIRS {
+            peers.push((format!("p{n}a"), format!("pair{n}")));
+            peers.push((format!("p{n}b"), format!("pair{n}")));
+        }
+        for n in 0..LONERS {
+            peers.push((format!("l{n}"), format!("alone{n}")));
+        }
+        // Only pair mates register, as a page's API does before it asks to pair: a loner is never a
+        // candidate for anyone, so a look costs the same however many loners wait.
+        let users: Vec<Value> = peers
+            .iter()
+            .filter(|(id, _)| id.starts_with('p'))
+            .map(|(id, group)| json!({"id":id,"scopes":{"group":group}}))
+            .collect();
+        let (status, body) = call(
+            &state,
+            vec![],
+            "call",
+            json!({"id":"arena","method":"upsertUsers","args":[users]}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        // Interleave so that pair mates and loners arrive mixed together.
+        let mut order: Vec<usize> = (0..peers.len()).collect();
+        order.sort_by_key(|i| (i * 7919) % peers.len());
+        let started = Instant::now();
+        let tasks: Vec<_> = order
+            .iter()
+            .map(|&i| {
+                let (state, (id, group)) = (state.clone(), peers[i].clone());
+                // Loners give up first; pairs have ample time even on a loaded machine.
+                let wait = if id.starts_with('l') { 2_000 } else { 30_000 };
+                tokio::spawn(async move {
+                    let request = json!({
+                        "subject":{"kind":"peer","id":id,"scopes":{"group":group}},
+                        "target":{"kind":"peer","requirements":{"group":group}},
+                        "waitMs":wait
+                    });
+                    let (status, body) = call(&state, vec![], "pair", request).await;
+                    (id, group, status, body)
+                })
+            })
+            .collect();
+        let mut results = Vec::new();
+        for task in tasks {
+            results.push(task.await.unwrap());
+        }
+        let looks = state.pending.looks.lock().unwrap().clone();
+        eprintln!(
+            "{} waiters, {} looks, {:?}",
+            peers.len(),
+            looks.values().sum::<usize>(),
+            started.elapsed()
+        );
+        let mut rooms: HashMap<String, Vec<String>> = HashMap::new();
+        let mut timed_out = 0;
+        for (id, group, status, body) in results {
+            if id.starts_with('l') {
+                assert_eq!(status, 408, "{id}: {body}");
+                timed_out += 1;
+                continue;
+            }
+            assert_eq!(status, 200, "{id}: {body}");
+            assert_eq!(body["userId"], json!(id));
+            let room = body["room"].as_str().unwrap().to_owned();
+            rooms.entry(room).or_default().push(group);
+        }
+        assert_eq!(timed_out, LONERS);
+        assert_eq!(rooms.len(), PAIRS, "every pair has one room of its own");
+        for (room, groups) in &rooms {
+            assert_eq!(groups.len(), 2, "{room}: {groups:?}");
+            assert_eq!(groups[0], groups[1], "{room}: {groups:?}");
+        }
+        let (_, listed) = call(
+            &state,
+            vec![],
+            "call",
+            json!({"id":"arena","method":"listUsers","args":[]}),
+        )
+        .await;
+        let mut seated = 0;
+        for user in listed["result"].as_array().unwrap() {
+            assert_eq!(user["status"], "paired", "{user}");
+            seated += 1;
+        }
+        assert_eq!(seated, PAIRS * 2);
+        assert_eq!(state.pending.len(), 0);
+        // Nobody would take a loner, so no change concerns it: it looks once, then sleeps until
+        // its wait runs out. (When every change woke every waiter, each loner looked again after
+        // arrivals and pairings: about 2100 looks for 100 pairs and 900 loners, not about 1200.)
+        for n in 0..LONERS {
+            assert_eq!(looks.get(&format!("l{n}")), Some(&1), "l{n}");
+        }
+        // A pair mate looks once, and again when its mate arrives if that mate is slow to claim
+        // it; a lost race for the same pair may cost one more.
+        for (id, _) in peers.iter().filter(|(id, _)| id.starts_with('p')) {
+            let n = looks.get(id).copied().unwrap_or(0);
+            assert!((1..=3).contains(&n), "{id}: {n} looks");
+        }
     }
 }

@@ -281,7 +281,7 @@ Never put the ticket in the URL.
 
 A sender does not receive its own broadcast. A targeted frame to a peer that is not in the room is dropped silently.
 
-Reserved types: `presence`, `welcome`, `error`, `auth`, anything starting with `link.`, and anything starting with `signal.` except the three signalling types `signal.offer`, `signal.answer` and `signal.ice`, which are allowed as targeted frames. See [peer-to-peer](/guides/peer-to-peer). The server does not currently send `error` frames; it closes the connection.
+Reserved types: `presence`, `welcome`, `error`, `auth`, anything starting with `link.`, and anything starting with `signal.` except the three signalling types `signal.offer`, `signal.answer` and `signal.ice`, which are allowed as targeted frames. See [peer-to-peer](/guides/peer-to-peer). The server sends one `error` frame, `{"type":"error","code":"..."}`, before it closes a connection it refuses or drops; see [on the socket](#on-the-socket).
 
 ### Channels and delivery
 
@@ -337,7 +337,22 @@ The `LIVEENGINE_LIVE_*` and `LIVEENGINE_SIGNAL_MAX_BYTES` values that are not po
 
 ### On the socket
 
-The server closes the connection without a message for: a missing, late, malformed or extra-field first frame; an invalid, expired, reused or wrong-role ticket; a user who is not paired; a second connection for the same user in the same room; a violation of the frame rules, channel rules, rate budget or schema; and a binary frame. Before the upgrade completes, a disallowed origin returns `403 origin not allowed` and a full service returns `503 live connection capacity reached`. `LiveClient` reports a closed socket as `The hub refused the ticket or closed the connection` while it is connecting, and as `disconnected` afterwards.
+When the server refuses or drops a connection it first sends one text frame, `{"type":"error","code":"<code>"}`, then closes the socket. The frame is best effort: a socket that is already gone, or a send queue that stays full for a second, gets the close alone.
+
+| `code` | When |
+| --- | --- |
+| `auth` | The first frame is missing, late (5 seconds), not JSON or has an extra field; the ticket is invalid, expired, reused, for another hub or room, or of the wrong role; the hub's `auth` refuses the credential; or the user is not paired in the room |
+| `banned` | A password hub's account is disabled, at connect time or while connected |
+| `credentials-changed` | The account's password or role changed, or an administrator reset it, while connected |
+| `account-deleted` | The account was deleted while connected |
+| `kicked` | An administrator closed the connection (`DELETE /v1/connections/{id}`) |
+| `duplicate` | The user already has a connection in this room |
+| `rate` | The service or room is at its connection limit, the address is over its pre-authentication cap (custom transports), the peer went over its frame or byte budget, or it reads too slowly and its send queue filled |
+| `frame` | A binary frame, a frame over `LIVEENGINE_LIVE_MAX_FRAME_BYTES`, a frame that is not a JSON object, a reserved or malformed type, a bad `to`, or a `link.` frame from a peer |
+| `channel` | A frame on a channel the hub does not declare |
+| `schema` | A payload the channel's schema refuses |
+
+Some closes carry no frame: a peer silent for `LIVEENGINE_LIVE_IDLE_SECONDS`, and a user who left the room or whose hub was removed or replaced. Before the upgrade completes, a disallowed origin returns `403 origin not allowed` and a full service returns `503 live connection capacity reached`. `LiveClient` emits the frame as an `error` event whose `code` is the frame's; for `kicked` and `banned` it also emits an event of that name and does not reconnect. `explainHubError` turns the account codes into plain words. A closed socket without a frame is reported as `The hub refused the ticket or closed the connection` while connecting, and as `disconnected` afterwards.
 
 ## Security notes
 
@@ -352,7 +367,7 @@ The server closes the connection without a message for: a missing, late, malform
 - No persistence of rooms, presence or messages; no message history or replay.
 - No delivery acknowledgements or ordering guarantees across reconnects.
 - No per-frame authorization beyond channel declarations. There are no per-peer channel permissions.
-- No `error` frames from the server; protocol violations close the socket.
+- No error frame for a socket closed for idleness or because the user left the room; no frame tells which rule a `frame` violation broke.
 - No multiple concurrent connections for one user in one room.
 - No binary frames.
 - The ticket cannot be sent in the URL or a header.

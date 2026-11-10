@@ -380,15 +380,24 @@ test('browser sessions hide hub tokens and restrict the admin console', async ()
   await admin.createAccount({ username: 'api-admin', role: 'admin', password: 'test-password-admin-123' });
   await admin.createAccount({ username: 'api-user', role: 'user', password: 'test-password-user-123' });
   const app = await serve({ hubId: 'api-accounts', adminConsole: true });
-  assert.equal((await app.request('admin', { method: 'GET' })).status, 401);
+  // A signed-out visitor gets the console's page, which shows its own sign-in form; it holds no
+  // data and no secret, and every route it reads still needs an administrator session.
+  const shell = await app.request('admin', { method: 'GET' });
+  assert.equal(shell.status, 200);
+  assert.match(shell.headers.get('content-type'), /text\/html/);
+  assert.match(shell.text, /id="signin-form"/);
+  for (const secret of [ADMIN_TOKEN, 'api-admin', 'api-user', 'test-password-']) assert.ok(!shell.text.includes(secret), secret);
+  assert.equal((await app.request('admin/accounts', { method: 'GET' })).status, 401);
+  assert.equal((await app.request('admin/connections', { method: 'GET' })).status, 401);
   const login = await app.request('login', { body: { username: 'api-user', password: 'test-password-user-123' } });
   assert.equal(login.status, 200);
   assert.match(login.headers.get('set-cookie'), /HttpOnly; SameSite=Strict/);
   assert.equal(login.body.token, undefined);
   const cookie = login.headers.get('set-cookie').split(';')[0];
   assert.equal((await app.request('me', { method: 'GET', headers: { cookie } })).body.username, 'api-user');
-  assert.equal((await app.request('admin', { method: 'GET', headers: { cookie } })).status, 403);
+  assert.equal((await app.request('admin', { method: 'GET', headers: { cookie } })).text, shell.text, 'the same shell for everyone');
   assert.equal((await app.request('admin/accounts', { method: 'GET', headers: { cookie } })).status, 403);
+  assert.equal((await app.request('admin/connections', { method: 'GET', headers: { cookie } })).status, 403);
   const adminLogin = await app.request('login', { body: { username: 'api-admin', password: 'test-password-admin-123' } });
   const adminCookie = adminLogin.headers.get('set-cookie').split(';')[0];
   assert.equal((await app.request('admin', { method: 'GET', headers: { cookie: adminCookie } })).status, 200);
@@ -454,4 +463,62 @@ test('an external hub keeps its sign-ins on the remote service that owns the acc
     assert.equal((await app.request('logout', { headers: { cookie }, body: {} })).status, 200);
     assert.equal((await app.request('me', { method: 'GET', headers: { cookie } })).status, 401);
   } finally { await remote.stop(); }
+});
+
+test('a locked-out sign-in is a 429 with Retry-After through the API, and a malformed account body is a JSON error', async () => {
+  const locking = await startHub({ LIVEENGINE_RATE_LIMIT_REQUESTS: '10000', LIVEENGINE_LOGIN_MAX_FAILURES: '1', LIVEENGINE_PASSWORD_ITERATIONS: '100000' });
+  try {
+    const owner = new HubClient(locking.address, { token: ADMIN_TOKEN });
+    await owner.createAccount({ username: 'api-locked', role: 'user', password: 'test-password-locked-123' });
+    // The service's JSON layer answers in the API's error shape, so the client error carries a status.
+    await assert.rejects(owner.request('/v1/sessions', { method: 'POST', body: { username: 'api-locked' } }),
+      error => error.status >= 400 && error.status < 500 && /invalid sign-in request/.test(error.message));
+    await assert.rejects(owner.login('api-locked', 'not-the-password-123'), error => error.status === 401);
+    await assert.rejects(owner.login('api-locked', 'test-password-locked-123'), error => error.status === 429 && error.retryAfter >= 1);
+    const app = await serve({ client: owner, hubId: 'api-locked' });
+    const refused = await app.request('login', { body: { username: 'api-locked', password: 'test-password-locked-123' } });
+    assert.equal(refused.status, 429, refused.text);
+    assert.ok(Number(refused.headers.get('retry-after')) >= 1);
+    assert.equal(refused.body.error, 'too many sign-in attempts');
+  } finally { await locking.stop(); }
+});
+
+test('the session cookie is Secure when asked, or behind a trusted TLS proxy, and never on a forwarded header alone', async () => {
+  await admin.createAccount({ username: 'api-cookie', role: 'user', password: 'test-password-cookie-123' });
+  const body = { username: 'api-cookie', password: 'test-password-cookie-123' };
+  const https = { 'X-Forwarded-Proto': 'https' };
+  const cookieOf = async (options, headers = {}) => (await (await serve({ hubId: 'api-cookie', ...options })).request('login', { body, headers })).headers.get('set-cookie');
+  assert.doesNotMatch(await cookieOf({}), /Secure/);
+  assert.doesNotMatch(await cookieOf({}, https), /Secure/, 'a client may not claim https by itself');
+  assert.match(await cookieOf({ trustProxy: true }, https), /; Secure/);
+  assert.match(await cookieOf({ trustProxy: true }, { 'X-Forwarded-Proto': 'https, http' }), /; Secure/);
+  assert.doesNotMatch(await cookieOf({ trustProxy: true }, { 'X-Forwarded-Proto': 'http' }), /Secure/);
+  assert.match(await cookieOf({ secureCookies: true }), /; Secure/);
+  assert.doesNotMatch(await cookieOf({ secureCookies: false, trustProxy: true }, https), /Secure/);
+  const app = await serve({ hubId: 'api-cookie', trustProxy: true });
+  const login = await app.request('login', { body, headers: https });
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  assert.match((await app.request('logout', { body: {}, headers: { cookie, ...https } })).headers.get('set-cookie'), /Max-Age=0; Secure|Secure; Max-Age=0|; Secure/);
+  assert.throws(() => createHubApi({ hubId: 'x', secureCookies: 'yes' }), /secureCookies/);
+});
+
+test('peerScopeKey names the scope that keeps peers to the hub, and maxPeers (or deprecated maxPlayers) caps them', async () => {
+  const app = await serve({ hubId: 'api-scope-key', peerLink: { kind: 'peer', waitMs: 4000 }, peerScopeKey: 'lobby', limits: { requestsPerMinute: 1000 } });
+  const first = app.request('pair', { body: { userId: 'key-a' } });
+  const user = await until(() => admin.call('api-scope-key', 'getUser', ['key-a']).catch(() => null), 'the first peer to be registered');
+  assert.equal(user.scopes.lobby, 'api-scope-key');
+  assert.equal(user.scopes.arena, undefined);
+  const second = await app.request('pair', { body: { userId: 'key-b' } });
+  const held = await first;
+  assert.deepEqual([held.status, second.status], [200, 200]);
+  assert.equal(held.body.room, second.body.room);
+  for (const limits of [{ maxPeers: 1 }, { maxPlayers: 1 }]) {
+    const capped = await serve({ hubId: `api-cap-${Object.keys(limits)[0]}`, peerLink: { kind: 'peer', waitMs: 600 }, limits: { requestsPerMinute: 1000, ...limits } });
+    const waiting = capped.request('pair', { body: { userId: 'cap-a' } });
+    await until(() => capped.api.stats().pairings === 1, 'the first peer to hold a pairing');
+    const refused = await capped.request('pair', { body: { userId: 'cap-b' } });
+    assert.equal(refused.status, 429);
+    assert.equal(refused.body.error, 'Too many peers');
+    assert.equal((await waiting).status, 408);
+  }
 });

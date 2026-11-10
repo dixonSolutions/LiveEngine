@@ -215,6 +215,29 @@ export interface HubPing {
 export declare const HUB_PROTOCOL: 'liveengine.hub/v1';
 export interface Account { username: string; role: 'admin' | 'user'; enabled: boolean; claims?: Record<string, unknown>; createdAt: number; }
 export interface Connection { id: string; hub: string[]; room: string; user: string; role: string; transport: string; connectedAt: number; remote: boolean; }
+/** What `createLink` takes: a link from this service to a room of a remote hub. */
+export interface LinkDefinition {
+  id: string;
+  /** The remote service's base URL. Its host must be allowed by the local service. */
+  address: string;
+  /** A link credential from the remote service's `issueLinkCredential`. Write-only. */
+  remoteToken: string;
+  hubId: string;
+  userId: string;
+  serverId: string;
+  /** With `localRoom`, bridges that room of a local hub to the remote room. */
+  localHubId?: string;
+  localRoom?: string;
+}
+/** A link as the service reports it; the credential is never included. */
+export interface LinkInfo { id: string; hubId: string; userId: string; serverId: string; status: 'connecting' | 'connected' | 'unreachable'; localHubId?: string; localRoom?: string; }
+export interface LinkList { links: LinkInfo[]; frames: { dropped: number; rejected: number }; }
+/** An error from `HubClient.request`: the service's `error` message and the HTTP status. */
+export interface HubRequestError extends Error {
+  status?: number;
+  /** Seconds from `Retry-After`, sent with a `429` sign-in lockout. */
+  retryAfter?: number;
+}
 export declare class HubClient {
   constructor(address: string, options: HubClientOptions);
   readonly address: string;
@@ -230,6 +253,7 @@ export declare class HubClient {
   getAccount(username: string): Promise<Account>;
   updateAccount(username: string, changes: { role?: 'admin' | 'user'; enabled?: boolean; claims?: Record<string, unknown>; password?: string }): Promise<Account>;
   deleteAccount(username: string): Promise<unknown>;
+  /** Filters left undefined are not sent. */
   connections(filters?: { hub?: string; room?: string; user?: string }): Promise<Connection[]>;
   kick(id: string): Promise<unknown>;
   contract(): Promise<{ protocol: typeof HUB_PROTOCOL; [key: string]: unknown }>;
@@ -251,6 +275,16 @@ export declare class HubClient {
   remove(id: string): Promise<unknown>;
   call<T = unknown>(id: string, method: string, args?: unknown[], options?: { signal?: AbortSignal }): Promise<T>;
   importRegistry(registry: { address: string; token: string; prefix?: string; refreshSeconds?: number }): Promise<unknown>;
+  /** The links this service keeps open, with their status and frame counters. */
+  listLinks(): Promise<LinkList>;
+  /** Open a link to a room of a remote hub. */
+  createLink(link: LinkDefinition): Promise<LinkInfo>;
+  getLink(id: string): Promise<LinkInfo>;
+  deleteLink(id: string): Promise<null>;
+  /** Issue a credential another service's link uses to reach hub `id`. Shown once. */
+  issueLinkCredential(id: string): Promise<{ token: string }>;
+  /** Revoke every link credential of hub `id`. */
+  revokeLinkCredentials(id: string): Promise<null>;
   /** Issue a short-lived, single-use live ticket for a user already paired in `serverId`. */
   ticket(id: string, options: TicketOptions): Promise<{ ticket: string; url: string; expiresAt: number }>;
   /** Issue a read-only registry watch ticket scoped to a path and depth. */

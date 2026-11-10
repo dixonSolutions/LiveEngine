@@ -279,8 +279,10 @@ pub struct AccountLimits {
     /// Lifetime of a login session, 1 second to 365 days
     /// (`LIVEENGINE_SESSION_TTL_SECONDS`, 43200).
     pub session_ttl: Duration,
-    /// Failed or in-flight logins one username may hold in the throttle window, 1 to 1000
-    /// (`LIVEENGINE_LOGIN_MAX_FAILURES`, 5). An address gets ten times this.
+    /// Failed or in-flight logins one username may hold from one client address in the throttle
+    /// window, 1 to 1000 (`LIVEENGINE_LOGIN_MAX_FAILURES`, 5). An address gets ten times this
+    /// across all usernames, and a username a hundred times this across all addresses. A locked
+    /// out sign-in answers `429` with `Retry-After`.
     pub login_max_failures: u32,
 }
 
@@ -4776,6 +4778,196 @@ impl HubClient {
     pub async fn export_registry(&self) -> Result<Value, String> {
         self.request(reqwest::Method::GET, "/v1/registry/export", None)
             .await
+    }
+
+    /// `GET /v1/contract`: the protocol contract the service speaks. Fails when the service
+    /// does not speak [`HUB_PROTOCOL`].
+    pub async fn contract(&self) -> Result<Value, String> {
+        let contract = self
+            .request(reqwest::Method::GET, "/v1/contract", None)
+            .await?;
+        if contract.get("protocol").and_then(Value::as_str) != Some(HUB_PROTOCOL) {
+            return Err("incompatible hub protocol".into());
+        }
+        Ok(contract)
+    }
+
+    /// `GET /v1/contract/schema`: the JSON Schema of the protocol's data transfer objects.
+    pub async fn contract_schema(&self) -> Result<Value, String> {
+        self.request(reqwest::Method::GET, "/v1/contract/schema", None)
+            .await
+    }
+
+    /// `GET /v1/schemas`: the published schemas, as `{ "schemas": [...] }`.
+    pub async fn list_schemas(&self) -> Result<Value, String> {
+        self.request(reqwest::Method::GET, "/v1/schemas", None)
+            .await
+    }
+
+    /// `POST /v1/schemas`: publish `{ "id", "version", "schema" }`. The schema itself is yours;
+    /// a published version is immutable, and publishing it again answers an error.
+    pub async fn create_schema(&self, schema: Value) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/v1/schemas", Some(schema))
+            .await
+    }
+
+    /// `GET /v1/schemas/{ref}`: one schema by its reference, `id@version`.
+    pub async fn get_schema(&self, reference: &str) -> Result<Value, String> {
+        let reference = encode_segment(reference);
+        self.request(
+            reqwest::Method::GET,
+            &format!("/v1/schemas/{reference}"),
+            None,
+        )
+        .await
+    }
+
+    /// `DELETE /v1/schemas/{ref}`: remove a schema no hub uses. Answers null.
+    pub async fn delete_schema(&self, reference: &str) -> Result<Value, String> {
+        let reference = encode_segment(reference);
+        self.request(
+            reqwest::Method::DELETE,
+            &format!("/v1/schemas/{reference}"),
+            None,
+        )
+        .await
+    }
+
+    /// `GET /v1/templates`: the hub templates.
+    pub async fn list_templates(&self) -> Result<Value, String> {
+        self.request(reqwest::Method::GET, "/v1/templates", None)
+            .await
+    }
+
+    /// `POST /v1/templates`: create a template, a hub definition with a `name` and no `id`.
+    pub async fn create_template(&self, template: Value) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/v1/templates", Some(template))
+            .await
+    }
+
+    /// `GET /v1/templates/{name}`: one template.
+    pub async fn get_template(&self, name: &str) -> Result<Value, String> {
+        let name = encode_segment(name);
+        self.request(reqwest::Method::GET, &format!("/v1/templates/{name}"), None)
+            .await
+    }
+
+    /// `DELETE /v1/templates/{name}`: remove a template. Answers null.
+    pub async fn delete_template(&self, name: &str) -> Result<Value, String> {
+        let name = encode_segment(name);
+        self.request(
+            reqwest::Method::DELETE,
+            &format!("/v1/templates/{name}"),
+            None,
+        )
+        .await
+    }
+
+    /// `GET /v1/hubs`: the hubs registered at the root, as `{ "hubs": [...] }`.
+    pub async fn list_hubs(&self) -> Result<Value, String> {
+        self.request(reqwest::Method::GET, "/v1/hubs", None).await
+    }
+
+    /// `POST /v1/hubs`: register a hub from its definition (`id`, `mode`, `scopes`, ...). Its
+    /// scopes, schemas and channels are yours to define.
+    pub async fn register_hub(&self, definition: Value) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/v1/hubs", Some(definition))
+            .await
+    }
+
+    /// `GET /v1/hubs/{id}`: one hub's public description.
+    pub async fn get_hub(&self, id: &str) -> Result<Value, String> {
+        let id = encode_segment(id);
+        self.request(reqwest::Method::GET, &format!("/v1/hubs/{id}"), None)
+            .await
+    }
+
+    /// `DELETE /v1/hubs/{id}`: remove a hub. Answers null.
+    pub async fn delete_hub(&self, id: &str) -> Result<Value, String> {
+        let id = encode_segment(id);
+        self.request(reqwest::Method::DELETE, &format!("/v1/hubs/{id}"), None)
+            .await
+    }
+
+    /// `POST /v1/hubs/{id}/call`: run one engine method on a hub and return its `result`.
+    pub async fn call_hub(
+        &self,
+        id: &str,
+        method: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, String> {
+        let id = encode_segment(id);
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/v1/hubs/{id}/call"),
+                Some(serde_json::json!({"method": method, "args": args})),
+            )
+            .await?;
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// `POST /v1/registries/import`: mirror another service's registry
+    /// (`{ "address", "token", "prefix"?, "refreshSeconds"? }`).
+    pub async fn import_registry(&self, request: Value) -> Result<Value, String> {
+        self.request(
+            reqwest::Method::POST,
+            "/v1/registries/import",
+            Some(request),
+        )
+        .await
+    }
+
+    /// `GET /v1/links`: the hub links this service keeps open, with their status and the frame
+    /// counters, as `{ "links": [...], "frames": {...} }`.
+    pub async fn list_links(&self) -> Result<Value, String> {
+        self.request(reqwest::Method::GET, "/v1/links", None).await
+    }
+
+    /// `POST /v1/links`: open a link to a room of a remote hub (`id`, `address`, `remoteToken`,
+    /// `hubId`, `userId`, `serverId`, optionally `localHubId` with `localRoom`). The remote
+    /// token is a link credential from [`HubClient::issue_link_credential`] on the remote side.
+    pub async fn create_link(&self, definition: Value) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, "/v1/links", Some(definition))
+            .await
+    }
+
+    /// `GET /v1/links/{id}`: one link and its status.
+    pub async fn get_link(&self, id: &str) -> Result<Value, String> {
+        let id = encode_segment(id);
+        self.request(reqwest::Method::GET, &format!("/v1/links/{id}"), None)
+            .await
+    }
+
+    /// `DELETE /v1/links/{id}`: close and forget a link. Answers null.
+    pub async fn delete_link(&self, id: &str) -> Result<Value, String> {
+        let id = encode_segment(id);
+        self.request(reqwest::Method::DELETE, &format!("/v1/links/{id}"), None)
+            .await
+    }
+
+    /// `POST /v1/hubs/{id}/link-credentials`: issue a credential another service's link uses
+    /// to reach this hub, as `{ "token": ... }`. Only a digest is kept; the token is shown once.
+    pub async fn issue_link_credential(&self, hub_id: &str) -> Result<Value, String> {
+        let id = encode_segment(hub_id);
+        self.request(
+            reqwest::Method::POST,
+            &format!("/v1/hubs/{id}/link-credentials"),
+            Some(serde_json::json!({})),
+        )
+        .await
+    }
+
+    /// `DELETE /v1/hubs/{id}/link-credentials`: revoke every link credential of a hub. Answers
+    /// null.
+    pub async fn revoke_link_credentials(&self, hub_id: &str) -> Result<Value, String> {
+        let id = encode_segment(hub_id);
+        self.request(
+            reqwest::Method::DELETE,
+            &format!("/v1/hubs/{id}/link-credentials"),
+            None,
+        )
+        .await
     }
 }
 

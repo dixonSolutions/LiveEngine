@@ -1,5 +1,5 @@
 #![cfg(feature = "host")]
-use liveengine::hub::{HubConfig, HubService};
+use liveengine::hub::{AccountLimits, HubConfig, HubService};
 use serde_json::{json, Value};
 use std::{net::SocketAddr, path::PathBuf};
 const ADMIN: &str = "a-long-throwaway-admin-credential-for-tests";
@@ -13,10 +13,22 @@ impl Drop for Server {
     }
 }
 async fn server(file: Option<PathBuf>) -> Server {
+    server_with(file, AccountLimits::default()).await
+}
+/// The cheapest password hashing the service accepts, so wrong passwords fail quickly even on a
+/// loaded machine.
+fn fast_hashing() -> AccountLimits {
+    AccountLimits {
+        password_iterations: 100_000,
+        ..AccountLimits::builtin()
+    }
+}
+async fn server_with(file: Option<PathBuf>, account_limits: AccountLimits) -> Server {
     let config = HubConfig {
         token: ADMIN.into(),
         state_file: file,
         rate_limit_requests: 10000,
+        account_limits,
         ..Default::default()
     };
     let service = HubService::new(config).unwrap();
@@ -76,6 +88,104 @@ async fn login(s: &Server, name: &str, password: &str) -> (u16, Value) {
     )
     .await
 }
+/// Sign in from `local` (any 127.0.0.0/8 address reaches the loopback listener).
+async fn attempt(
+    url: &str,
+    local: Option<std::net::IpAddr>,
+    name: &str,
+    password: &str,
+) -> reqwest::Response {
+    reqwest::Client::builder()
+        .local_address(local)
+        .build()
+        .unwrap()
+        .post(format!("{url}/v1/sessions"))
+        .json(&json!({"username":name,"password":password}))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn one_address_cannot_lock_an_account_out_of_another() {
+    let s = server_with(None, fast_hashing()).await;
+    create(&s, "Frank", "user").await;
+    let attacker = Some("127.0.0.2".parse().unwrap());
+    for _ in 0..5 {
+        let r = attempt(&s.url, attacker, "Frank", "incorrect-password").await;
+        assert_eq!(r.status().as_u16(), 401);
+    }
+    let r = attempt(&s.url, attacker, "Frank", "long-password-123").await;
+    assert_eq!(r.status().as_u16(), 429);
+    assert!(r.headers().contains_key("retry-after"));
+    let owner = Some("127.0.0.3".parse().unwrap());
+    let r = attempt(&s.url, owner, "Frank", "long-password-123").await;
+    assert_eq!(r.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn malformed_account_bodies_answer_json_errors() {
+    let s = server(None).await;
+    let c = reqwest::Client::new();
+    for (method, path, token, body, content_type) in [
+        (
+            "POST",
+            "/v1/sessions",
+            None,
+            "{not json",
+            "application/json",
+        ),
+        (
+            "POST",
+            "/v1/sessions",
+            None,
+            r#"{"username":"a"}"#,
+            "application/json",
+        ),
+        (
+            "POST",
+            "/v1/sessions",
+            None,
+            r#"{"username":"a","password":"b"}"#,
+            "text/plain",
+        ),
+        (
+            "POST",
+            "/v1/accounts",
+            Some(ADMIN),
+            r#"{"username":"abc","extra":1}"#,
+            "application/json",
+        ),
+        (
+            "PATCH",
+            "/v1/accounts/abc",
+            Some(ADMIN),
+            "[]",
+            "application/json",
+        ),
+        (
+            "POST",
+            "/v1/accounts/me/password",
+            None,
+            "nope",
+            "application/json",
+        ),
+    ] {
+        let mut r = c
+            .request(method.parse().unwrap(), format!("{}{path}", s.url))
+            .header("content-type", content_type)
+            .body(body);
+        if let Some(t) = token {
+            r = r.bearer_auth(t);
+        }
+        let r = r.send().await.unwrap();
+        let status = r.status().as_u16();
+        assert!((400..500).contains(&status), "{path}: {status}");
+        let value: Value = r.json().await.unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert!(value["error"].is_string(), "{path}: {value}");
+    }
+}
+
 #[tokio::test]
 async fn accounts_sessions_roles_and_revocation() {
     let s = server(None).await;
@@ -334,13 +444,24 @@ async fn login_lockout_backoff_recovers_and_expired_session_is_denied() {
         std::env::temp_dir().join(format!("liveengine-expiry-{:032x}", rand::random::<u128>()));
     std::fs::create_dir(&dir).unwrap();
     let path = dir.join("state.json");
-    let s = server(Some(path.clone())).await;
+    let s = server_with(Some(path.clone()), fast_hashing()).await;
     create(&s, "Dave", "user").await;
     for _ in 0..5 {
         assert_eq!(login(&s, "Dave", "incorrect-password").await.0, 401);
     }
-    assert_eq!(login(&s, "Dave", "long-password-123").await.0, 401);
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // The lock runs from the end of the fifth failure (not from when it was reserved, before its
+    // hashing), so the next attempt is inside it however slow that hashing was.
+    let locked = attempt(&s.url, None, "Dave", "long-password-123").await;
+    assert_eq!(locked.status().as_u16(), 429);
+    let retry: u64 = locked.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=3).contains(&retry), "{retry}");
+    let body: Value = locked.json().await.unwrap();
+    assert_eq!(body["error"], "too many sign-in attempts");
+    tokio::time::sleep(std::time::Duration::from_secs(retry + 1)).await;
     let (status, value) = login(&s, "Dave", "long-password-123").await;
     assert_eq!(status, 200);
     let token = value["token"].as_str().unwrap().to_owned();

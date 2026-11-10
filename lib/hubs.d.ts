@@ -1,1 +1,1 @@
-export { HubClient, HUB_PROTOCOL, RegistryWatch, HubDefinition, HubClientOptions, HubMode, HubSchema, HubTemplate, LiveDescriptor, PairRequest, TicketOptions, WatchRegistryOptions, RegistryMessage, DiscoveryCandidate, LiveRenew } from '../index';
+export { HubClient, HUB_PROTOCOL, RegistryWatch, HubDefinition, HubClientOptions, HubMode, HubSchema, HubTemplate, LiveDescriptor, PairRequest, TicketOptions, WatchRegistryOptions, RegistryMessage, DiscoveryCandidate, LiveRenew, LinkDefinition, LinkInfo, LinkList, HubRequestError, Account, Connection } from '../index';

@@ -5,7 +5,7 @@ description: "The event queue, every event type, payload fields, ordering, manua
 
 Every mutating engine operation appends to an internal event queue. Events are ordered, numbered, and drained either automatically (Node `LiveEngine` default) or manually.
 
-```ts
+```ts fragment
 interface EngineEvent {
   type: EventType;
   seq: number;

@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Key the sign-in lockout by username and client address, so wrong passwords from one address no longer lock the account out for everyone. Each address keeps its total budget (ten times `LIVEENGINE_LOGIN_MAX_FAILURES`), and a username has a backstop of a hundred times it across all addresses. A lock is now timed from the end of the failed attempt, not from before its hashing.
+
+- **Behaviour change:** a sign-in refused by the lockout answers `429 too many sign-in attempts` with a `Retry-After` header instead of `401`. `HubClient` errors carry `.retryAfter`, and `createHubApi` passes the status and header through to the page.
+
+- Account and sign-in routes answer a body that is not JSON, not `application/json`, too large, or with a missing or unknown field with the usual `{ "error": ... }` JSON (keeping its `4xx` status), so `HubClient` errors carry `.status` instead of failing with "invalid JSON".
+
+- A change to the pairing queue now wakes only the waiting peers it could concern (one that would accept a newcomer, or a peer just seated in a room that may have space) instead of every waiter on the service, so a crowd of waiting peers no longer looks again after every arrival and pairing. Pairing results and order are unchanged.
+
+- Add typed Rust `HubClient` methods: `contract`, `contract_schema`, `list_schemas`, `create_schema`, `get_schema`, `delete_schema`, `list_templates`, `create_template`, `get_template`, `delete_template`, `list_hubs`, `register_hub`, `get_hub`, `delete_hub`, `call_hub`, `import_registry`, `list_links`, `create_link`, `get_link`, `delete_link`, `issue_link_credential` and `revoke_link_credentials`.
+
+- Add Node `HubClient` link methods `listLinks`, `createLink`, `getLink`, `deleteLink`, `issueLinkCredential` and `revokeLinkCredentials`, with `LinkDefinition`, `LinkInfo`, `LinkList` and `HubRequestError` types. `connections()` no longer sends `undefined` or `null` filters as the strings `"undefined"` and `"null"`.
+
+- `connectLive` derives `leaveUrl` and `heartbeatUrl` from any `pairUrl` by replacing its last path segment (keeping the query), instead of posting seat requests to `pairUrl` itself when it does not end in `/pair`. A `pairUrl` with no path segment now needs explicit `leaveUrl` and `heartbeatUrl` (`TypeError` otherwise).
+
+- `createHubApi` gains `secureCookies` (`true`, `false` or `'auto'`, the default) and `trustProxy`, so the session cookie can be `Secure` behind a TLS-terminating proxy that sets `X-Forwarded-Proto`.
+
+- **Behaviour change:** the `createHubApi` admin console page (`/admin`, with `adminConsole: true`) is now served to signed-out visitors as a static shell that shows its own sign-in form, instead of a bare `401`. Its data routes (`admin/accounts`, `admin/connections`) still need an administrator session.
+
+- `createHubApi` gains `peerScopeKey` (default `arena`) to name the scope that keeps peer pairings to the hub, and `limits.maxPeers`; `limits.maxPlayers` still works as a deprecated alias. The refusal and timeout messages are now `Too many peers` and `No other peer arrived in time`.
+
+- A source checkout's `npm install` / `npm ci` rebuilds the native addon when it is older than the Rust sources or was built from another version (the addon now exports `nativeVersion()`); a published package never rebuilds a prebuilt addon.
+
+- `npm run check:docs` type-checks the TypeScript documentation samples against the package's own declarations (wrong method names, exports or argument types now fail) and runs Cargo with `-j 4`.
+
+- Docs: the live room `error` frames and their codes, the hub API `userId` pattern and account routes without `adminConsole`, Compose state files, and the changelog instructions for contributors.
+
 - Make standalone Rust documentation samples compile against the current API and mark contextual excerpts.
 
 - Prevent immediate peer pairing requests from seating registered peers that have not requested a pair.

@@ -59,14 +59,18 @@ createHubApi(options: HubApiOptions): HubApi
 | `limits.requestsPerMinute` | number | `10` | `POST` requests per client address per minute |
 | `limits.readsPerMinute` | number | `300` | Other requests per client address per minute |
 | `limits.idleMs` | number | `180000` | A seat with no heartbeat for this long is released on the hub |
-| `limits.maxPlayers` | number | `4096` | Players the API tracks at once |
+| `limits.maxPeers` | number | `4096` | Peers holding a pairing through the API at once; one more answers `429 Too many peers` |
+| `limits.maxPlayers` | number | | Deprecated alias of `limits.maxPeers`, used when `maxPeers` is not set |
 | `join` | `{ server, extra? }` | none | Enables the older seat-based `join` route |
 | `statusExtra` | object | `{}` | Added to the `status` answer |
 | `watchUrl` | `string` | the client's address with `ws(s):` and `/v1/live/registry` | The registry socket URL handed to the page |
 | `adminConsole` | `boolean` | `false` | Enables the `/admin` console and its `admin/...` routes |
+| `secureCookies` | `true \| false \| 'auto'` | `'auto'` | Whether the session cookie is `Secure`. `'auto'`: when the request reached the handler over TLS, or, with `trustProxy`, when `X-Forwarded-Proto` is `https` |
+| `trustProxy` | `boolean` | `false` | Believe the first `X-Forwarded-Proto` value. Set it only behind a proxy that overwrites the header |
+| `peerScopeKey` | `string` | `'arena'` | Scope key that keeps peer pairings to this hub (see [pair and renew](#pair-and-renew)) |
 | `notConfigured` | `string` | `The hub API has no hub client configured.` | The `503` message |
 
-A `limits` value that is not a positive number falls back to its default. The factory throws `TypeError` for a missing `hubId`, a non-array `hubPath`, an unknown `mode`, or a `roomCapacity` that is not an integer of at least 2.
+A `limits` value that is not a positive number falls back to its default. The factory throws `TypeError` for a missing `hubId`, a non-array `hubPath`, an unknown `mode`, a `roomCapacity` that is not an integer of at least 2, a `secureCookies` other than `true`, `false` or `'auto'`, or an empty `peerScopeKey`.
 
 The hub is set up once, on `setup()` or the first request that needs it: the contract is checked, `schemas` are published and the hub is registered (with `scopes`, `channels` and `auth`) unless the service already has a hub with that id. An existing hub is not changed.
 
@@ -78,7 +82,7 @@ The hub is set up once, on `setup()` or the first request that needs it: the con
 | `api.handle` | The same function, for frameworks that want a named handler |
 | `api.setup()` | Set the hub up now and start the idle reaper |
 | `api.close()` | Stop the idle reaper |
-| `api.stats()` | `{ seats, waiting, pairings }`: tracked seats, pair requests waiting for a partner, players with a known pairing |
+| `api.stats()` | `{ seats, waiting, pairings }`: tracked seats, pair requests waiting for a partner, peers with a known pairing |
 
 ## Request checks
 
@@ -119,7 +123,8 @@ Paths are relative to where the handler is mounted (or to `basePath`). Bodies ar
 
 ### pair and renew
 
-- `pair` with `peerLink.kind: 'hub'` puts the player in the hub's shared room. With `'peer'` it registers the player as a candidate (scoped to this hub with an `arena` scope) and holds the request until another player arrives or `waitMs` passes. `waitMs` is clamped to `peerLink.maxWaitMs`.
+- `pair` with `peerLink.kind: 'hub'` puts the player in the hub's shared room. With `'peer'` it registers the player as a candidate and holds the request until another player arrives or `waitMs` passes. `waitMs` is clamped to `peerLink.maxWaitMs`.
+- A peer is kept to this hub by the scope `peerScopeKey` (default `arena`) set to `hubId`, added to its scopes and to its requirements. That key lands in the hub's user records, so a hub `userSchema` or `scopeSchema` with `additionalProperties: false` must allow it (or set `peerScopeKey` to a key the schema allows); otherwise every peer pairing is refused by validation.
 - The credential sent to the hub is the signed-in session (cookie or `Authorization: Bearer`) when there is one, otherwise `credential` from the body (up to 4096 characters). It is never stored.
 - The first `pair` for a user returns a new random `seatToken`; the API keeps only its SHA-256 hash. A repeat `pair`, and every `renew`, `heartbeat` and `leave`, must send it.
 - `renew` returns a descriptor without a `seatToken`.
@@ -128,9 +133,9 @@ Paths are relative to where the handler is mounted (or to `basePath`). Bodies ar
 | --- | --- | --- |
 | `403` | `Seat authorization failed` | Missing or wrong `seatToken`; a second `pair` for a user whose first is still waiting; or a new `pair` for a user the hub already has paired |
 | `404` | `Pair before renewing` | `renew` for a user this API has not paired |
-| `408` | `No other player arrived in time` | A peer pairing waited `waitMs` with no partner |
+| `408` | `No other peer arrived in time` | A peer pairing waited `waitMs` with no partner |
 | `409` | `Pairing was cancelled` | The page dropped the request |
-| `429` | `Too many players` | `limits.maxPlayers` reached |
+| `429` | `Too many peers` | `limits.maxPeers` reached |
 | `401`, `503`, other `4xx` | the hub's message | Passed through, for example `403 credential refused` |
 | `502` | `LiveEngine request failed` | Anything else, including an administrator-token failure |
 
@@ -146,15 +151,15 @@ These routes talk to the service that owns the accounts: the hub service, or for
 | `me` | GET | | The signed-in account, or `401 Sign in required` |
 | `logout` | POST | `{}` | `{ ok: true }`; ends the hub session and clears the cookie |
 | `password` | POST | `{ current, next }` | `{ ok: true }`; every session of the account ends, so the page signs in again |
-| `admin` | GET | | The console page (HTML) |
+| `admin` | GET | | The console page (HTML): a static shell, served signed in or not |
 | `admin/accounts`, `admin/accounts/{name}` | GET, POST, PATCH, DELETE | as `/v1/accounts` | Proxied to `/v1/accounts...` with the admin's session |
 | `admin/connections`, `admin/connections/{id}` | GET, DELETE | | Proxied to `/v1/connections...`; query strings are kept |
 
 - `login`, `me`, `logout` and `password` are always available; `adminConsole` only adds the `admin` routes. Without it those answer `404`.
-- The cookie holds a random id for a session kept in the API's memory (at most 4096; users sign in again after a restart). It is `HttpOnly; SameSite=Strict` with `Path` set to `basePath` (or `/`), and `Secure` when the API itself serves HTTPS. Behind a TLS-terminating proxy the API sees plain HTTP and leaves `Secure` off.
+- The cookie holds a random id for a session kept in the API's memory (at most 4096; users sign in again after a restart). It is `HttpOnly; SameSite=Strict` with `Path` set to `basePath` (or `/`). It is `Secure` as `secureCookies` says: by default when the API itself serves HTTPS. Behind a TLS-terminating proxy the API sees plain HTTP, so set `trustProxy: true` (the proxy must overwrite `X-Forwarded-Proto`) or `secureCookies: true`.
 - An explicit `Authorization: Bearer <hub session token>` header is accepted instead of the cookie.
-- The `admin` routes need a session whose account role is `admin`: no session answers `401 Sign in required`, another role `403 Administrator access required`. This includes the console page itself, so sign in first (for example with [`hubSession`](/node/live-client#hubsession)) and then open `admin`.
-- Errors from the service are passed through: `401 invalid username or password` on a bad sign-in, for example.
+- The `admin/accounts` and `admin/connections` routes need a session whose account role is `admin`: no session answers `401 Sign in required`, another role `403 Administrator access required`. The `admin` page itself is a static shell with no data or secrets, served to anyone, so a signed-out visitor sees its sign-in form.
+- Errors from the service are passed through: `401 invalid username or password` on a bad sign-in, for example, and `429 too many sign-in attempts` with its `Retry-After` header while a sign-in lock runs.
 
 ## In the page
 

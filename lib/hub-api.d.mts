@@ -10,7 +10,9 @@ export interface HubApiLimits {
   readsPerMinute?: number;
   /** A seat with no heartbeat for this long is released. Default 180000. */
   idleMs?: number;
-  /** Most players the API tracks at once. Default 4096. */
+  /** Most peers holding a pairing through the API at once; one more is refused with 429 `Too many peers`. Default 4096. */
+  maxPeers?: number;
+  /** @deprecated Use `maxPeers`, which wins when both are set. */
   maxPlayers?: number;
 }
 
@@ -63,6 +65,19 @@ export interface HubApiOptions {
   adminConsole?: boolean;
   /** The 503 message when there is no client. */
   notConfigured?: string;
+  /**
+   * Mark the session cookie `Secure`. `'auto'` (default) does so when the request reached the
+   * handler over TLS, or, with `trustProxy`, when `X-Forwarded-Proto` is `https`.
+   */
+  secureCookies?: boolean | 'auto';
+  /** Believe `X-Forwarded-Proto` from a proxy in front that overwrites it. Default false. */
+  trustProxy?: boolean;
+  /**
+   * The scope key that keeps peer pairings to this hub, added to every peer's scopes and
+   * requirements with the hub id as its value. Default `"arena"`. A user schema with
+   * `additionalProperties: false` must allow it.
+   */
+  peerScopeKey?: string;
 }
 
 export interface HubApi {

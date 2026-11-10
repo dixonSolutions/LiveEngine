@@ -127,7 +127,7 @@ const info = await client.register({
 
 `HubDefinition`:
 
-```ts
+```ts fragment
 interface HubDefinition {
   id: string;
   mode: 'internal' | 'external' | 'central';
@@ -271,11 +271,46 @@ connections(filters?: { hub?: string; room?: string; user?: string }): Promise<C
 kick(id: string): Promise<null>
 ```
 
-`connections` calls `GET /v1/connections` with the filters as query parameters; `kick` calls `DELETE /v1/connections/{id}`, which closes the socket with the code `kicked` (`404` when the id is not connected). Every key in `filters` becomes a parameter, so leave unused keys out instead of setting them to `undefined`. Details: [manage live connections](/guides/connections-admin).
+`connections` calls `GET /v1/connections` with the filters as query parameters; `kick` calls `DELETE /v1/connections/{id}`, which closes the socket with the code `kicked` (`404` when the id is not connected). A filter that is `undefined` or `null` is left out. Details: [manage live connections](/guides/connections-admin).
 
 ```js
 const [first] = await admin.connections({ hub: 'ranked-au', user: 'alice' });
 if (first) await admin.kick(first.id);
+```
+
+## Links and link credentials
+
+These call the [hub link](/guides/hub-links) routes. A link connects this service to a room of a hub on another service; the remote side issues the credential the link presents.
+
+```ts fragment
+interface LinkDefinition { id: string; address: string; remoteToken: string; hubId: string; userId: string; serverId: string; localHubId?: string; localRoom?: string; }
+interface LinkInfo { id: string; hubId: string; userId: string; serverId: string; status: 'connecting' | 'connected' | 'unreachable'; localHubId?: string; localRoom?: string; }
+
+listLinks(): Promise<{ links: LinkInfo[]; frames: { dropped: number; rejected: number } }>
+createLink(link: LinkDefinition): Promise<LinkInfo>
+getLink(id: string): Promise<LinkInfo>
+deleteLink(id: string): Promise<null>
+issueLinkCredential(hubId: string): Promise<{ token: string }>
+revokeLinkCredentials(hubId: string): Promise<null>
+```
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `listLinks()` | `GET /v1/links` | Sorted by id, with the service's dropped and rejected frame counters |
+| `createLink(link)` | `POST /v1/links` | `201`; `400` for an invalid definition or a host not in `LIVEENGINE_ALLOWED_REMOTE_HOSTS`, `409` for a duplicate id. `remoteToken` is never echoed |
+| `getLink(id)` | `GET /v1/links/{id}` | `404` when missing |
+| `deleteLink(id)` | `DELETE /v1/links/{id}` | `204`; closes the link |
+| `issueLinkCredential(hubId)` | `POST /v1/hubs/{id}/link-credentials` | Run on the remote service. The token is shown once; only a digest is kept |
+| `revokeLinkCredentials(hubId)` | `DELETE /v1/hubs/{id}/link-credentials` | Revokes every credential of the hub |
+
+```js
+import { HubClient } from '@dixonsolutions/liveengine/hubs';
+
+const local = new HubClient('http://127.0.0.1:8787', { token: process.env.LIVEENGINE_TOKEN });
+const remote = new HubClient('https://far.example.net', { token: process.env.REMOTE_HUB_TOKEN });
+const { token } = await remote.issueLinkCredential('far');
+await local.createLink({ id: 'to-far', address: 'https://far.example.net', remoteToken: token, hubId: 'far', userId: 'bridge', serverId: 'room' });
+console.log((await local.getLink('to-far')).status);
 ```
 
 ## Live, discovery and pairing methods
@@ -288,7 +323,7 @@ if (first) await admin.kick(first.id);
 | `discover({ kind = 'any', path = [], depth, requirements })` | `{ candidates }` of hubs and peers | [Find and pair](/guides/find-and-pair) |
 | `pair({ subject, target = { kind: 'any' }, path = [], credential, waitMs })` | A descriptor `{ userId, link, room, ticket, url, transports }` for `LiveClient`; `waitMs` extends the request timeout | [Find and pair](/guides/find-and-pair) |
 | `renewal(request)` | A `renew` function for `LiveClient` that pairs again | [Find and pair](/guides/find-and-pair) |
-| `request(route, { method, body, signal, token, timeoutMs })` | Any authenticated route, for example `/v1/links`. `token` replaces the client's token for this call | [Hub links](/guides/hub-links) |
+| `request(route, { method, body, signal, token, timeoutMs })` | Any authenticated route. `token` replaces the client's token for this call | [Hub protocol](/protocol/endpoints) |
 
 Hub-scoped provider credentials work with `route()` only; see [provider hosting](/guides/provider-hosting). `LiveClient`, `connectLive` and the browser helpers are exported by `@dixonsolutions/liveengine/live-client`; see the [live client reference](/node/live-client).
 
@@ -310,7 +345,7 @@ The token is intentionally not a public property.
 | `Error: Incompatible hub protocol` | Contract protocol mismatch |
 | `Error: Hub response exceeds configured limit` | Response exceeded `maxResponseBytes` |
 | `Error: Hub returned invalid JSON (HTTP n)` | Non-JSON response |
-| `Error` with `.status` | Non-2xx HTTP response |
+| `Error` with `.status` | Non-2xx HTTP response. A `429` sign-in lockout also sets `.retryAfter` (seconds) |
 | `AbortError` / timeout error | Request timed out or caller aborted |
 
 ```js
@@ -361,8 +396,12 @@ await client.register(definition);
 `call<T>` is generic so you can type application results:
 
 ```ts
+import { HubClient } from '@dixonsolutions/liveengine/hubs';
+
+const client = new HubClient('http://127.0.0.1:8787', { token: process.env.LIVEENGINE_TOKEN! });
 interface Counter { count: number; }
 const counter = await client.call<Counter>('counter', 'increment', [1]);
+console.log(counter.count);
 ```
 
 ## Nested registries and schemas

@@ -32,7 +32,7 @@ These variables are read by `liveengine-hub` or `HubConfig::from_env()`.
 | `LIVEENGINE_PASSWORD` | string | none (required by `liveengine-hub login`) | Password sent by the `login` CLI command; the server does not read it |
 | `LIVEENGINE_PASSWORD_ITERATIONS` | integer from 100000 to 10000000 | `310000` | PBKDF2-SHA256 iterations for new password hashes; out-of-range values are rejected at startup |
 | `LIVEENGINE_SESSION_TTL_SECONDS` | integer from 1 to 31536000 | `43200` | Lifetime of a login session, in seconds (12 hours by default) |
-| `LIVEENGINE_LOGIN_MAX_FAILURES` | integer from 1 to 1000 | `5` | Failed logins one username may accumulate within 900 seconds before further attempts are delayed with exponential backoff; each address gets ten times this |
+| `LIVEENGINE_LOGIN_MAX_FAILURES` | integer from 1 to 1000 | `5` | Failed or in-flight sign-ins one username may hold from one address within 900 seconds before that address is locked out of it with exponential backoff (`429` with `Retry-After`); each address gets ten times this across all usernames, and each username a hundred times this across all addresses |
 
 `LIVEENGINE_BIND` must parse as a Rust `SocketAddr` (an IP literal plus port), not a DNS name. For example, `0.0.0.0:8787` or `[::1]:8787`.
 

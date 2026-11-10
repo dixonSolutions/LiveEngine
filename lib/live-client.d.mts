@@ -9,7 +9,11 @@ export interface ConnectLiveOptions extends LiveClientOptions {
   pairUrl: string;
   /** Posted for a fresh descriptor on reconnect. Defaults to `pairUrl`. */
   renewUrl?: string;
-  /** Seat routes; default to replacing the final /pair in pairUrl. */
+  /**
+   * Seat routes. Default: `pairUrl` with its last path segment replaced by `leave` and
+   * `heartbeat`, keeping the query (`/api/pair?x=1` gives `/api/leave?x=1`). Required when
+   * `pairUrl` has no path segment, such as a bare origin.
+   */
   leaveUrl?: string;
   heartbeatUrl?: string;
   /** Per-tab seat token storage. Defaults to sessionStorage, with an in-memory fallback. */

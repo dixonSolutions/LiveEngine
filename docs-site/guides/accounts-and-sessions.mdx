@@ -159,7 +159,7 @@ A reset password, a changed role, or disabling an enabled account **ends every s
 
 `token` is a random 32-byte value (unpadded base64url). Send it as `Authorization: Bearer <token>`. `expiresAt` is in Unix seconds, `LIVEENGINE_SESSION_TTL_SECONDS` (default 12 hours) after sign-in. The service stores only a SHA-256 hash of the token.
 
-Every failure answers the same `401 invalid username or password`: a wrong password, an unknown name, a disabled account and a locked-out name or address all look alike, and an unknown name costs the same hashing time as a known one.
+Every failed check answers the same `401 invalid username or password`: a wrong password, an unknown name and a disabled account all look alike, and an unknown name costs the same hashing time as a known one. An attempt refused by [sign-in throttling](#sign-in-throttling) answers `429 too many sign-in attempts` with a `Retry-After` header (seconds) instead, without checking the password. The lock is counted the same way for unknown names, so it does not reveal whether an account exists.
 
 An account keeps at most 16 sessions; signing in a 17th time ends its oldest one. The service keeps at most 10,000 sessions in total, ending the oldest first.
 
@@ -189,12 +189,18 @@ Answers `204`. Every session of the account ends, **including the one that made 
 
 ## Sign-in throttling
 
-Each sign-in attempt is counted against two budgets before the password is checked: one for the username and one for the client's address (the socket peer; `X-Forwarded-For` is ignored).
+Each sign-in attempt is counted against three budgets before the password is checked. The client's address is the socket peer; `X-Forwarded-For` is ignored.
 
-- A username may hold `LIVEENGINE_LOGIN_MAX_FAILURES` (default 5) unsuccessful or in-flight attempts. An address may hold ten times that, because many people sign in through one hub API or NAT.
-- A successful sign-in gives one attempt back.
-- The attempt that fills a budget starts a lock on that name or address: 2 seconds, then 3, 5, 9, 17 and so on (1 + 2<sup>n</sup> seconds) for each further attempt, up to 1025 seconds. That attempt is still checked, and a correct password lifts the lock. While a lock runs, every attempt answers `401`, even with the right password, and no hashing is done.
+- **The username from this address** may hold `LIVEENGINE_LOGIN_MAX_FAILURES` (default 5) unsuccessful or in-flight attempts. Wrong passwords sent from one address lock that username out for that address only: the owner signing in from an address that has not been failing is not held up by them.
+- **The address**, across every username, may hold ten times that, because many people sign in through one hub API or NAT.
+- **The username from every address together** may hold a hundred times that (500 by default). This backstop stops guessing spread over many addresses; reaching it locks the username for every address.
+- A successful sign-in gives one attempt back to each budget.
+- The attempt that fills a budget starts a lock on it: 2 seconds, then 3, 5, 9, 17 and so on (1 + 2<sup>n</sup> seconds) for each further attempt, up to 1025 seconds. That attempt is still checked, and a correct password lifts the lock. A lock is timed from the moment the failed attempt finishes, not from when it started hashing. While a lock runs, every attempt it covers answers `429 too many sign-in attempts` with `Retry-After`, even with the right password, and no hashing is done.
 - Counts are forgotten 15 minutes after the first attempt, once no lock is running.
+
+<Note>
+Behind a hub API or a reverse proxy, every sign-in reaches the service from the proxy's address, so the first two budgets are shared by everyone using it. `createHubApi` passes the service's `429` and `Retry-After` through to the page.
+</Note>
 
 `POST /v1/sessions` also uses an ordinary request slot from the service-wide rate limit (`LIVEENGINE_RATE_LIMIT_REQUESTS` per `LIVEENGINE_RATE_LIMIT_WINDOW_SECONDS`), which answers `429 rate limit exceeded`.
 
@@ -239,15 +245,17 @@ From a browser, use [`createHubApi`](/node/hub-api) with [`hubSession`](/node/li
 | Status | `error` | Where |
 | --- | --- | --- |
 | `400` | `invalid account` | Create, patch, change password |
+| `400`, `413`, `415`, `422` | `invalid account`, `invalid sign-in request` | A body that is not JSON, not `application/json`, too large, or with a missing or unknown field |
 | `401` | `invalid username or password` | Sign in; wrong `current` password |
 | `401` | `unauthorized` | Missing or ended session, or a `user` session on an administrator route |
 | `404` | `account not found` | Read, patch, delete |
 | `409` | `account already exists` | Create |
+| `429` | `too many sign-in attempts` | Sign in while a throttling lock runs; `Retry-After` gives the seconds left |
 | `429` | `rate limit exceeded` | Service-wide request budget |
 | `500` | `hashing failed` | The hashing worker failed |
 | `503` | `account limit reached` | Create |
 
-A body that is not JSON, or that has a missing or unknown field, is refused by the HTTP layer before these checks, with a `4xx` status and a plain-text body rather than `{ "error": ... }`.
+A body the JSON layer refuses keeps that layer's `4xx` status and answers with the same `{ "error": ... }` shape as every other refusal, so `HubClient` errors carry `status`.
 
 ## Security notes
 

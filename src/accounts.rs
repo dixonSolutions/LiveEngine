@@ -1,8 +1,8 @@
 //! Local accounts and bearer sessions for the hub service.
 use crate::hub::{error, Inner};
 use axum::{
-    extract::{ConnectInfo, Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{rejection::JsonRejection, ConnectInfo, Path, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -95,13 +95,21 @@ impl Accounts {
             max_failures: limits.login_max_failures,
         }
     }
-    /// Most attempts one key may hold, in flight or failed, within the window. A username gets
-    /// `max_failures`. An address gets ten times that, because many people share one (a hub API in
-    /// front of the service, a NAT) and sign in together; their attempts reserve budget while
-    /// they hash, so a tight address budget would refuse honest, concurrent logins.
+    /// Most attempts one key may hold, in flight or failed, within the window.
+    ///
+    /// * A username from one address (`a:`) gets `max_failures`, so wrong passwords sent from
+    ///   one address lock that username out for that address only.
+    /// * An address (`p:`) gets ten times that, across every username, because many people share
+    ///   one (a hub API in front of the service, a NAT) and sign in together; their attempts
+    ///   reserve budget while they hash, so a tight address budget would refuse honest,
+    ///   concurrent logins.
+    /// * A username from all addresses together (`u:`) gets a hundred times that: a backstop
+    ///   against guessing spread over many addresses, high enough that one address cannot reach it.
     fn failure_limit(&self, key: &str) -> u32 {
         if key.starts_with("p:") {
             self.max_failures.saturating_mul(10)
+        } else if key.starts_with("u:") {
+            self.max_failures.saturating_mul(100)
         } else {
             self.max_failures
         }
@@ -255,6 +263,24 @@ fn revoke(data: &mut Data, name: &str) {
 fn bad() -> Response {
     error(StatusCode::BAD_REQUEST, "invalid account")
 }
+/// A body the JSON layer refused (not JSON, a missing or unknown field, too large) answers with
+/// the same `{ "error": ... }` shape as every other refusal, keeping the layer's status.
+fn rejected(rejection: JsonRejection, message: &str) -> Response {
+    let status = rejection.status();
+    let status = if status.is_client_error() {
+        status
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    error(status, message)
+}
+fn locked(retry_after: u64) -> Response {
+    let mut response = error(StatusCode::TOO_MANY_REQUESTS, "too many sign-in attempts");
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(retry_after.max(1)));
+    response
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Create {
@@ -268,7 +294,14 @@ pub(crate) struct Create {
 fn yes() -> bool {
     true
 }
-pub(crate) async fn create(State(s): State<Arc<Inner>>, Json(v): Json<Create>) -> Response {
+pub(crate) async fn create(
+    State(s): State<Arc<Inner>>,
+    payload: Result<Json<Create>, JsonRejection>,
+) -> Response {
+    let v = match payload {
+        Ok(Json(v)) => v,
+        Err(e) => return rejected(e, "invalid account"),
+    };
     if !valid_name(&v.username)
         || !valid_password(&v.password)
         || !matches!(v.role.as_str(), "admin" | "user")
@@ -330,8 +363,12 @@ fn nullable_claims<'de, D: serde::Deserializer<'de>>(
 pub(crate) async fn patch(
     State(s): State<Arc<Inner>>,
     Path(name): Path<String>,
-    Json(v): Json<Patch>,
+    payload: Result<Json<Patch>, JsonRejection>,
 ) -> Response {
+    let v = match payload {
+        Ok(Json(v)) => v,
+        Err(e) => return rejected(e, "invalid account"),
+    };
     if v.role
         .as_ref()
         .is_some_and(|r| !matches!(r.as_str(), "admin" | "user"))
@@ -412,15 +449,26 @@ pub(crate) struct Login {
 pub(crate) async fn login(
     State(s): State<Arc<Inner>>,
     peer: Option<axum::Extension<ConnectInfo<std::net::SocketAddr>>>,
-    Json(v): Json<Login>,
+    payload: Result<Json<Login>, JsonRejection>,
 ) -> Response {
+    let v = match payload {
+        Ok(Json(v)) => v,
+        Err(e) => return rejected(e, "invalid sign-in request"),
+    };
     let key = v.username.to_ascii_lowercase();
     let peer = peer
         .map(|p| p.0 .0.ip().to_string())
         .unwrap_or_else(|| "unknown".into());
-    let keys = [format!("u:{}", hash_token(&key)), format!("p:{peer}")];
+    let user = hash_token(&key);
+    // The username from this address, this address for every username, and the username from
+    // every address: see `failure_limit`.
+    let keys = [
+        format!("a:{user}:{peer}"),
+        format!("p:{peer}"),
+        format!("u:{user}"),
+    ];
     let time = now();
-    // Reserve both budgets before starting expensive work, including work already in flight.
+    // Reserve every budget before starting expensive work, including work already in flight.
     {
         let mut failures = s
             .accounts
@@ -428,11 +476,13 @@ pub(crate) async fn login(
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         failures.retain(|_, v| time.saturating_sub(v.first) < 900 || v.until > time);
-        if keys
+        if let Some(until) = keys
             .iter()
-            .any(|k| failures.get(k).is_some_and(|v| v.until > time))
+            .filter_map(|k| failures.get(k).map(|v| v.until))
+            .filter(|until| *until > time)
+            .max()
         {
-            return error(StatusCode::UNAUTHORIZED, "invalid username or password");
+            return locked(until - time);
         }
         for key in &keys {
             if !failures.contains_key(key) && failures.len() >= 8192 {
@@ -486,6 +536,23 @@ pub(crate) async fn login(
     .await
         && saved.as_ref().is_some_and(|a| a.enabled);
     if !valid {
+        // A lock runs its full length from the failure that set it, not from when the attempt
+        // was reserved: the hashing in between would otherwise use part of it up.
+        let time = now();
+        let mut failures = s
+            .accounts
+            .failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for key in &keys {
+            let limit = s.accounts.failure_limit(key);
+            if let Some(entry) = failures.get_mut(key) {
+                if entry.count >= limit {
+                    let until = time.saturating_add(1 + (1u64 << (entry.count - limit).min(10)));
+                    entry.until = entry.until.max(until);
+                }
+            }
+        }
         return error(StatusCode::UNAUTHORIZED, "invalid username or password");
     }
     let replacement = if saved.as_ref().and_then(|a| hash_cost(&a.password_hash))
@@ -585,8 +652,12 @@ pub(crate) struct Password {
 pub(crate) async fn change_password(
     State(s): State<Arc<Inner>>,
     headers: HeaderMap,
-    Json(v): Json<Password>,
+    payload: Result<Json<Password>, JsonRejection>,
 ) -> Response {
+    let v = match payload {
+        Ok(Json(v)) => v,
+        Err(e) => return rejected(e, "invalid account"),
+    };
     if !valid_password(&v.next) {
         return bad();
     }
@@ -640,13 +711,13 @@ mod tests {
         let state = service.inner;
         let result = create(
             State(state.clone()),
-            Json(Create {
+            Ok(Json(Create {
                 username: "alice".into(),
                 password: "correct-password-123".into(),
                 role: "user".into(),
                 enabled: true,
                 claims: None,
-            }),
+            })),
         )
         .await;
         assert_eq!(result.status(), StatusCode::CREATED);
@@ -663,18 +734,22 @@ mod tests {
                 login(
                     State(state),
                     None,
-                    Json(Login {
+                    Ok(Json(Login {
                         username: "alice".into(),
                         password: "wrong-password-123".into(),
-                    }),
+                    })),
                 )
                 .await
                 .status()
             }));
         }
+        let mut statuses = Vec::new();
         for task in tasks {
-            assert_eq!(task.await.unwrap(), StatusCode::UNAUTHORIZED);
+            statuses.push(task.await.unwrap());
         }
+        let refused = |code| statuses.iter().filter(|s| **s == code).count();
+        assert_eq!(refused(StatusCode::UNAUTHORIZED), 5);
+        assert_eq!(refused(StatusCode::TOO_MANY_REQUESTS), 35);
         assert_eq!(
             state
                 .accounts
@@ -694,23 +769,23 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 let created = create(
                     State(state.clone()),
-                    Json(Create {
+                    Ok(Json(Create {
                         username: format!("player-{i}"),
                         password: "correct-password-123".into(),
                         role: "user".into(),
                         enabled: true,
                         claims: None,
-                    }),
+                    })),
                 )
                 .await;
                 assert_eq!(created.status(), StatusCode::CREATED);
                 login(
                     State(state),
                     Some(axum::Extension(ConnectInfo(peer))),
-                    Json(Login {
+                    Ok(Json(Login {
                         username: format!("player-{i}"),
                         password: "correct-password-123".into(),
-                    }),
+                    })),
                 )
                 .await
                 .status()
@@ -740,10 +815,10 @@ mod tests {
         let response = login(
             State(state.clone()),
             None,
-            Json(Login {
+            Ok(Json(Login {
                 username: "alice".into(),
                 password: "correct-password-123".into(),
-            }),
+            })),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -768,10 +843,10 @@ mod tests {
         let response = login(
             State(state.clone()),
             None,
-            Json(Login {
+            Ok(Json(Login {
                 username: "alice".into(),
                 password: "correct-password-123".into(),
-            }),
+            })),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -780,5 +855,78 @@ mod tests {
         assert_ne!(hash, &old);
         assert_eq!(hash_cost(hash), Some(state.accounts.iterations));
         assert!(verify("correct-password-123".into(), Some(hash.clone()), 100000).await);
+    }
+
+    async fn attempt(state: &Arc<Inner>, address: [u8; 4], name: &str, password: &str) -> Response {
+        login(
+            State(state.clone()),
+            Some(axum::Extension(ConnectInfo(std::net::SocketAddr::from((
+                address, 4000,
+            ))))),
+            Ok(Json(Login {
+                username: name.into(),
+                password: password.into(),
+            })),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn failures_from_one_address_do_not_lock_out_another() {
+        let state = setup().await;
+        let attacker = [10, 0, 0, 66];
+        for _ in 0..state.accounts.max_failures {
+            let response = attempt(&state, attacker, "alice", "wrong-password-123").await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        // The attacker's address is now locked out of this username, and told for how long.
+        let response = attempt(&state, attacker, "alice", "correct-password-123").await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry: u64 = response.headers()[header::RETRY_AFTER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=3).contains(&retry), "{retry}");
+        // The owner, from an address that has not been failing, signs in.
+        let response = attempt(&state, [10, 0, 0, 7], "alice", "correct-password-123").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // The attacker's lock covers only that username: another one from the same address is
+        // checked (and refused for its wrong password, not for the lock).
+        let response = attempt(&state, attacker, "bob", "wrong-password-123").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn failure_lock_is_held_in_state_and_global_ceiling_locks_every_address() {
+        let state = setup().await;
+        let user = hash_token("alice");
+        for _ in 0..state.accounts.max_failures {
+            attempt(&state, [10, 0, 0, 1], "alice", "wrong-password-123").await;
+        }
+        {
+            let failures = state.accounts.failures.lock().unwrap();
+            let own = &failures[&format!("a:{user}:10.0.0.1")];
+            assert_eq!(own.count, state.accounts.max_failures);
+            assert!(own.until > now());
+            // Neither wider budget is anywhere near its limit.
+            assert_eq!(failures[&format!("u:{user}")].until, 0);
+            assert_eq!(failures["p:10.0.0.1"].until, 0);
+        }
+        // Guessing spread over many addresses fills the per-username ceiling, which then holds
+        // every address, a clean one included.
+        let ceiling = state.accounts.failure_limit("u:");
+        assert_eq!(ceiling, state.accounts.max_failures * 100);
+        state.accounts.failures.lock().unwrap().insert(
+            format!("u:{user}"),
+            Failure {
+                count: ceiling,
+                first: now(),
+                until: now() + 2,
+            },
+        );
+        let response = attempt(&state, [10, 0, 0, 9], "alice", "correct-password-123").await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
     }
 }

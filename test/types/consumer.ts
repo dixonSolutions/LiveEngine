@@ -14,6 +14,14 @@ const request: PairRequest = { subject: { id: 'alice', kind: 'peer' }, target: {
 async function example() {
   await hub.register({ id: 'game', channels: { chat: { delivery: 'reliable' } } });
   await hub.request('/v1/links', { method: 'POST', body: { id: 'link' } });
+  const credential = await hub.issueLinkCredential('game');
+  const link = await hub.createLink({ id: 'link', address: 'https://far.example', remoteToken: credential.token, hubId: 'game', userId: 'bridge', serverId: 'room' });
+  const status: 'connecting' | 'connected' | 'unreachable' = link.status;
+  (await hub.listLinks()).links.forEach(entry => console.log(entry.id, status));
+  await hub.getLink('link');
+  await hub.deleteLink('link');
+  await hub.revokeLinkCredentials('game');
+  await hub.connections({ user: undefined });
   const descriptor = await hub.pair(request);
   const client = new LiveClient(descriptor, { renew: hub.renewal(request) });
   await client.connect();
@@ -39,3 +47,5 @@ new LiveClient({ ticket: 'x' });
 connectLive({});
 // @ts-expect-error hubId is required
 createHubApi({ client: hub });
+// @ts-expect-error a link needs its remote credential
+hub.createLink({ id: 'link', address: 'https://far.example', hubId: 'game', userId: 'bridge', serverId: 'room' });

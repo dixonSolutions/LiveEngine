@@ -24,6 +24,7 @@ test('HubClient rejects incompatible contracts, HTTP failures and oversized resp
   const options = { token: 'secret' };
   await assert.rejects(new HubClient('https://example.com', { ...options, fetch: async () => Response.json({ protocol: 'other' }) }).contract(), /Incompatible/);
   await assert.rejects(new HubClient('https://example.com', { ...options, fetch: async () => Response.json({ error: 'denied' }, { status: 401 }) }).list(), error => error.status === 401 && /denied/.test(error.message));
+  await assert.rejects(new HubClient('https://example.com', { ...options, fetch: async () => Response.json({ error: 'too many sign-in attempts' }, { status: 429, headers: { 'retry-after': '7' } }) }).login('a', 'b'), error => error.status === 429 && error.retryAfter === 7);
   await assert.rejects(new HubClient('https://example.com', { ...options, maxResponseBytes: 4, fetch: async () => Response.json({ large: 'payload' }) }).list(), /exceeds/);
   assert.throws(() => new HubClient('https://user:password@example.com', options), /without credentials/);
 });
@@ -113,4 +114,40 @@ test('account and connection methods use the corresponding authenticated routes'
   assert.deepEqual(requests.map(r => r.init.method), ['POST','GET','POST','GET','POST','GET','PATCH','DELETE','GET','DELETE','DELETE']);
   assert.match(requests[8].url, /user=alice&room=a\+b/);
   assert.match(requests[9].url, /connections\/socket-1$/);
+});
+
+test('connections leaves out filters that are undefined or null instead of sending "undefined"', async () => {
+  const requests = [];
+  const client = new HubClient('https://hub.example', { token: 'secret', fetch: async url => { requests.push(url); return Response.json([]); } });
+  await client.connections({ hub: undefined, room: null, user: 'alice' });
+  await client.connections({ hub: undefined });
+  await client.connections();
+  assert.match(requests[0], /\/v1\/connections\?user=alice$/);
+  assert.match(requests[1], /\/v1\/connections$/);
+  assert.match(requests[2], /\/v1\/connections$/);
+  assert.ok(requests.every(url => !url.includes('undefined') && !url.includes('null')));
+});
+
+test('link and link credential methods use the corresponding routes with encoded ids', async () => {
+  const requests = [];
+  const client = new HubClient('https://hub.example', { token: 'secret', fetch: async (url, init) => {
+    requests.push({ url, init });
+    return init.method === 'DELETE' ? new Response(null, { status: 204 }) : Response.json({});
+  } });
+  const link = { id: 'to far', address: 'https://far.example', remoteToken: 'remote-credential-at-least-24', hubId: 'far', userId: 'bridge', serverId: 'room' };
+  await client.listLinks();
+  await client.createLink(link);
+  await client.getLink('to far');
+  assert.equal(await client.deleteLink('to far'), null);
+  await client.issueLinkCredential('far/hub');
+  assert.equal(await client.revokeLinkCredentials('far/hub'), null);
+  assert.deepEqual(requests.map(r => [r.init.method, new URL(r.url).pathname]), [
+    ['GET', '/v1/links'],
+    ['POST', '/v1/links'],
+    ['GET', '/v1/links/to%20far'],
+    ['DELETE', '/v1/links/to%20far'],
+    ['POST', '/v1/hubs/far%2Fhub/link-credentials'],
+    ['DELETE', '/v1/hubs/far%2Fhub/link-credentials'],
+  ]);
+  assert.deepEqual(JSON.parse(requests[1].init.body), link);
 });
