@@ -12,7 +12,8 @@ These variables are read by `liveengine-hub` or `HubConfig::from_env()`.
 | `LIVEENGINE_TOKEN` | string | none (required) | Administrative bearer token; at least 24 bytes |
 | `LIVEENGINE_BIND` | socket address | `127.0.0.1:8787` | Listener address (`IP:port`), read by the binary |
 | `LIVEENGINE_ALLOWED_REMOTE_HOSTS` | comma-separated string | empty | Exact remote hosts (or `*.suffix` entries) allowed for external registration and imports |
-| `LIVEENGINE_MAX_HUBS` | positive integer | `256` | Maximum registrations |
+| `LIVEENGINE_MAX_HUBS` | positive integer | `256` | Maximum registrations; also the hubs one discovery scans (at most 1024) |
+| `LIVEENGINE_MAX_DISCOVERY_USERS` | positive integer | `10000` | Users one discovery or `pair` look scans, across every hub it visits (`max_discovery_users`) |
 | `LIVEENGINE_MAX_BODY_BYTES` | positive integer | `1048576` | Maximum request body bytes (`max_request_bytes`) |
 | `LIVEENGINE_MAX_RESPONSE_BYTES` | positive integer | `4194304` | Maximum response bytes |
 | `LIVEENGINE_MAX_ARGS` | positive integer | `256` | Maximum arguments per call |
@@ -58,6 +59,7 @@ export LIVEENGINE_TOKEN="$(openssl rand -hex 32)"
 export LIVEENGINE_BIND=0.0.0.0:8787
 export LIVEENGINE_ALLOWED_REMOTE_HOSTS=remote,hub.internal.example
 export LIVEENGINE_MAX_HUBS=256
+export LIVEENGINE_MAX_DISCOVERY_USERS=10000
 export LIVEENGINE_MAX_BODY_BYTES=1048576
 export LIVEENGINE_MAX_RESPONSE_BYTES=4194304
 export LIVEENGINE_MAX_ARGS=256

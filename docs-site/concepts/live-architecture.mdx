@@ -60,6 +60,8 @@ The client gives the descriptor to `LiveClient`. It opens `url`, sends the ticke
 
 Separately from pairing, a [hub link](/guides/hub-links) is a persistent service-to-service connection that bridges a local room and a remote room, so peers on both services see each other. The link requests its own service tickets with a link credential, and bridged frames travel as `link.frame` and `link.presence` messages.
 
+Links use a WebSocket, not WebRTC, by design. They run between servers that can reach each other, so a persistent WebSocket (TLS via your proxy) is the simple, reliable transport; WebRTC is for browsers and peers behind NAT. The extension point for any other carrier is the `LiveTransport` trait with `HubService::serve_live_transport`, which keeps the room logic unchanged.
+
 The [peer-to-peer guide](/guides/peer-to-peer) covers the direct channel; the hub relay in all three cases is the one described in [live rooms](/guides/live-rooms).
 
 ## Who holds what

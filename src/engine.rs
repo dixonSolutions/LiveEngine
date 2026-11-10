@@ -217,7 +217,7 @@ impl Engine {
             }
         }
     }
-    fn fits(&mut self, uid: &str, sid: &str) -> bool {
+    fn fits_inner(&mut self, uid: &str, sid: &str) -> bool {
         let (Some(u), Some(s)) = (self.users.get(uid).cloned(), self.servers.get(sid).cloned())
         else {
             return false;
@@ -360,7 +360,7 @@ impl Engine {
                     .unwrap_or(false)
             });
             for (_, sid) in ids {
-                if self.fits(id, &sid) {
+                if self.fits_inner(id, &sid) {
                     let s = &self.servers[&sid];
                     out.push(Match {
                         id: sid,
@@ -397,7 +397,7 @@ impl Engine {
                 .collect();
             ids.sort_by_key(|x| x.0);
             for (_, uid) in ids {
-                if self.fits(&uid, id) {
+                if self.fits_inner(&uid, id) {
                     let score = self.users[&uid].seq as f64;
                     out.push(Match {
                         id: uid,
@@ -486,7 +486,7 @@ impl Engine {
                 sid,
             );
         }
-        if !s.system && !self.fits(uid, sid) {
+        if !s.system && !self.fits_inner(uid, sid) {
             return Self::result(false, "no_fit", uid, sid);
         }
         let s = self.servers.get_mut(sid).unwrap();
@@ -829,7 +829,7 @@ impl Engine {
             "fits" => {
                 let u = Self::id_arg(a, 0, "userId")?;
                 let s = Self::id_arg(a, 1, "serverId")?;
-                json!(self.fits(&u, &s))
+                json!(self.fits_inner(&u, &s))
             }
             "advertise" => {
                 let id = Self::id_arg(a, 0, "userId")?;
@@ -1188,5 +1188,314 @@ impl Engine {
             }
         }
         len - 1
+    }
+}
+
+/// Every method name [`Engine::dispatch`] accepts, in the order the typed methods below list them.
+pub const DISPATCH_METHODS: &[&str] = &[
+    "pairPeers",
+    "upsertUser",
+    "upsertUsers",
+    "removeUser",
+    "getUser",
+    "listUsers",
+    "setUserStatus",
+    "upsertServer",
+    "upsertServers",
+    "removeServer",
+    "getServer",
+    "listServers",
+    "setServerStatus",
+    "findServersForUser",
+    "findUsersForServer",
+    "fits",
+    "advertise",
+    "advertiseAll",
+    "join",
+    "leave",
+    "autoJoin",
+    "matchAll",
+    "generateUsers",
+    "drainEvents",
+    "pendingEvents",
+    "stats",
+    "clear",
+    "reseed",
+];
+
+fn expect_bool(value: Value) -> Result<bool, String> {
+    value.as_bool().ok_or_else(|| "expected a boolean".into())
+}
+fn expect_count(value: Value) -> Result<usize, String> {
+    value
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| "expected a count".into())
+}
+fn expect_list(value: Value) -> Result<Vec<Value>, String> {
+    match value {
+        Value::Array(items) => Ok(items),
+        _ => Err("expected an array".into()),
+    }
+}
+fn optional(value: Value) -> Option<Value> {
+    (!value.is_null()).then_some(value)
+}
+fn opt_arg(value: Option<Value>) -> Value {
+    value.unwrap_or(Value::Null)
+}
+
+/// Typed methods, one per [`Engine::dispatch`] method and named like it in snake case. Each is a
+/// thin wrapper over `dispatch` with the same validation, errors and events. Users, servers,
+/// options and results keep their user-defined JSON shapes, so they are [`Value`]s, as in the
+/// Node SDK's `LiveEngine` methods.
+impl Engine {
+    fn call(&mut self, method: &str, args: Vec<Value>) -> Result<Value, String> {
+        self.dispatch(method, args)
+    }
+
+    /// Seat `spec.users` (`[{id, scopes}]`) together in room `spec.room` with `spec.capacity`,
+    /// all or nothing. Returns `{ok: true, serverId}`. Pairing in the hub uses this.
+    pub fn pair_peers(&mut self, spec: Value) -> Result<Value, String> {
+        self.call("pairPeers", vec![spec])
+    }
+    /// Add or replace a user (`{id, scopes?, requirements?, status?}`). True when it was added.
+    pub fn upsert_user(&mut self, user: Value) -> Result<bool, String> {
+        self.call("upsertUser", vec![user]).and_then(expect_bool)
+    }
+    /// Add or replace several users. Returns how many were added rather than replaced.
+    pub fn upsert_users(&mut self, users: Vec<Value>) -> Result<usize, String> {
+        self.call("upsertUsers", vec![Value::Array(users)])
+            .and_then(expect_count)
+    }
+    /// Remove a user, leaving its room first. False when there was no such user.
+    pub fn remove_user(&mut self, id: &str) -> Result<bool, String> {
+        self.call("removeUser", vec![json!(id)])
+            .and_then(expect_bool)
+    }
+    /// The user `id`, or `None`.
+    pub fn get_user(&mut self, id: &str) -> Result<Option<Value>, String> {
+        self.call("getUser", vec![json!(id)]).map(optional)
+    }
+    /// Users in insertion order, optionally only those with `status` (`waiting`, `paired`, `idle`).
+    pub fn list_users(&mut self, status: Option<&str>) -> Result<Vec<Value>, String> {
+        let args = status.map(|s| vec![json!(s)]).unwrap_or_default();
+        self.call("listUsers", args).and_then(expect_list)
+    }
+    /// Set a user's status. Setting `paired` only reports whether it already is.
+    pub fn set_user_status(&mut self, id: &str, status: &str) -> Result<bool, String> {
+        self.call("setUserStatus", vec![json!(id), json!(status)])
+            .and_then(expect_bool)
+    }
+    /// Add or replace a server (`{id, capacity?, minMembers?, scopes?, requirements?, status?}`).
+    /// True when it was added.
+    pub fn upsert_server(&mut self, server: Value) -> Result<bool, String> {
+        self.call("upsertServer", vec![server])
+            .and_then(expect_bool)
+    }
+    /// Add or replace several servers. Returns how many were added rather than replaced.
+    pub fn upsert_servers(&mut self, servers: Vec<Value>) -> Result<usize, String> {
+        self.call("upsertServers", vec![Value::Array(servers)])
+            .and_then(expect_count)
+    }
+    /// Remove a server and unseat its members. False when there was no such server.
+    pub fn remove_server(&mut self, id: &str) -> Result<bool, String> {
+        self.call("removeServer", vec![json!(id)])
+            .and_then(expect_bool)
+    }
+    /// The server `id`, or `None`.
+    pub fn get_server(&mut self, id: &str) -> Result<Option<Value>, String> {
+        self.call("getServer", vec![json!(id)]).map(optional)
+    }
+    /// Servers in insertion order, optionally only those with `status` (`open`, `full`, `closed`).
+    pub fn list_servers(&mut self, status: Option<&str>) -> Result<Vec<Value>, String> {
+        let args = status.map(|s| vec![json!(s)]).unwrap_or_default();
+        self.call("listServers", args).and_then(expect_list)
+    }
+    /// Set a server's status. `full` is refused (false) while it has free seats.
+    pub fn set_server_status(&mut self, id: &str, status: &str) -> Result<bool, String> {
+        self.call("setServerStatus", vec![json!(id), json!(status)])
+            .and_then(expect_bool)
+    }
+    /// Servers `user_id` fits, best first, as `{id, score}`. `options` is
+    /// `{limit?, strategy?, affinity?}` or `None` for the defaults.
+    pub fn find_servers_for_user(
+        &mut self,
+        user_id: &str,
+        options: Option<Value>,
+    ) -> Result<Vec<Value>, String> {
+        self.call("findServersForUser", vec![json!(user_id), opt_arg(options)])
+            .and_then(expect_list)
+    }
+    /// Users that fit `server_id`, best first, as `{id, score}`.
+    pub fn find_users_for_server(
+        &mut self,
+        server_id: &str,
+        options: Option<Value>,
+    ) -> Result<Vec<Value>, String> {
+        self.call(
+            "findUsersForServer",
+            vec![json!(server_id), opt_arg(options)],
+        )
+        .and_then(expect_list)
+    }
+    /// Whether `user_id` and `server_id` satisfy each other's requirements and the server has room.
+    pub fn fits(&mut self, user_id: &str, server_id: &str) -> Result<bool, String> {
+        self.call("fits", vec![json!(user_id), json!(server_id)])
+            .and_then(expect_bool)
+    }
+    /// Emit an `advertised` event with the servers `user_id` fits. Returns how many.
+    pub fn advertise(&mut self, user_id: &str, options: Option<Value>) -> Result<usize, String> {
+        self.call("advertise", vec![json!(user_id), opt_arg(options)])
+            .and_then(expect_count)
+    }
+    /// Advertise for every waiting user. Returns the total number of matches advertised.
+    pub fn advertise_all(&mut self, options: Option<Value>) -> Result<usize, String> {
+        self.call("advertiseAll", vec![opt_arg(options)])
+            .and_then(expect_count)
+    }
+    /// Seat `user_id` in `server_id`. Returns `{ok, reason?, userId, serverId}`.
+    pub fn join(&mut self, user_id: &str, server_id: &str) -> Result<Value, String> {
+        self.call("join", vec![json!(user_id), json!(server_id)])
+    }
+    /// Unseat `user_id`. Returns `{ok, reason?, userId, serverId}`.
+    pub fn leave(&mut self, user_id: &str) -> Result<Value, String> {
+        self.call("leave", vec![json!(user_id)])
+    }
+    /// Seat `user_id` in its best fitting server. Returns `{ok, reason?, userId, serverId}`.
+    pub fn auto_join(&mut self, user_id: &str, options: Option<Value>) -> Result<Value, String> {
+        self.call("autoJoin", vec![json!(user_id), opt_arg(options)])
+    }
+    /// Seat every waiting user that fits somewhere, oldest first. Returns one result per seat.
+    pub fn match_all(&mut self, options: Option<Value>) -> Result<Vec<Value>, String> {
+        self.call("matchAll", vec![opt_arg(options)])
+            .and_then(expect_list)
+    }
+    /// Create `count` users (at most 100000) from a generation `spec`, or `None` for plain users.
+    pub fn generate_users(
+        &mut self,
+        count: usize,
+        spec: Option<Value>,
+    ) -> Result<Vec<Value>, String> {
+        self.call("generateUsers", vec![json!(count), opt_arg(spec)])
+            .and_then(expect_list)
+    }
+    /// Take every queued event, oldest first.
+    pub fn drain_events(&mut self) -> Result<Vec<Value>, String> {
+        self.call("drainEvents", vec![]).and_then(expect_list)
+    }
+    /// How many events are queued.
+    pub fn pending_events(&mut self) -> Result<usize, String> {
+        self.call("pendingEvents", vec![]).and_then(expect_count)
+    }
+    /// Counts of users and servers by status, queued events and lifetime totals.
+    pub fn stats(&mut self) -> Result<Value, String> {
+        self.call("stats", vec![])
+    }
+    /// Remove every user, server and queued event, then emit `cleared`.
+    pub fn clear(&mut self) -> Result<(), String> {
+        self.call("clear", vec![]).map(|_| ())
+    }
+    /// Restart the random generator from `seed`.
+    pub fn reseed(&mut self, seed: u64) -> Result<(), String> {
+        self.call("reseed", vec![json!(seed)]).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod typed_tests {
+    use super::*;
+
+    /// The method names `dispatch` matches on, read from this file's source.
+    fn dispatched() -> Vec<String> {
+        let source = include_str!("engine.rs");
+        let start = source.find("pub fn dispatch(").unwrap();
+        let end = start + source[start..].find("unknown method").unwrap();
+        source[start..end]
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("            \"")?;
+                let (name, tail) = rest.split_once('"')?;
+                tail.trim_start().starts_with("=>").then(|| name.to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_dispatch_method_has_a_typed_wrapper() {
+        let names = dispatched();
+        assert_eq!(names.len(), 28, "{names:?}");
+        let listed: Vec<String> = DISPATCH_METHODS.iter().map(|m| m.to_string()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        let mut listed_sorted = listed.clone();
+        listed_sorted.sort();
+        assert_eq!(
+            sorted, listed_sorted,
+            "DISPATCH_METHODS drifted from dispatch"
+        );
+        let source = include_str!("engine.rs");
+        // Whitespace is dropped so a call that rustfmt splits over lines still matches.
+        let typed: String = source[source.find("fn call(&mut self, method").unwrap()..]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for name in &names {
+            assert!(
+                typed.contains(&format!("self.call(\"{name}\"")),
+                "no typed wrapper for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_methods_match_dispatch() {
+        let mut e = Engine::new(7);
+        assert!(e
+            .upsert_server(json!({"id":"s","capacity":2,"minMembers":2,"scopes":{"g":"x"}}))
+            .unwrap());
+        assert_eq!(e.upsert_servers(vec![json!({"id":"t"})]).unwrap(), 1);
+        assert!(e.upsert_user(json!({"id":"a","scopes":{"g":"x"}})).unwrap());
+        assert_eq!(
+            e.upsert_users(vec![json!({"id":"b"}), json!({"id":"a"})])
+                .unwrap(),
+            1
+        );
+        assert_eq!(e.get_user("a").unwrap().unwrap()["id"], "a");
+        assert!(e.get_user("nobody").unwrap().is_none());
+        assert_eq!(e.list_users(None).unwrap().len(), 2);
+        assert_eq!(e.list_users(Some("paired")).unwrap().len(), 0);
+        assert!(e.list_users(Some("bogus")).is_err());
+        assert!(e.fits("a", "s").unwrap());
+        assert!(!e.find_servers_for_user("a", None).unwrap().is_empty());
+        assert!(!e
+            .find_users_for_server("s", Some(json!({"limit":1})))
+            .unwrap()
+            .is_empty());
+        assert!(e.advertise("a", None).unwrap() >= 1);
+        assert!(e.advertise_all(None).unwrap() >= 1);
+        assert_eq!(e.join("a", "s").unwrap()["ok"], true);
+        assert_eq!(e.leave("a").unwrap()["ok"], true);
+        assert_eq!(e.auto_join("a", None).unwrap()["ok"], true);
+        assert!(!e.match_all(None).unwrap().is_empty());
+        assert!(e.set_user_status("b", "idle").unwrap());
+        assert!(e.set_server_status("t", "closed").unwrap());
+        assert_eq!(e.list_servers(Some("closed")).unwrap().len(), 1);
+        assert!(e.get_server("s").unwrap().is_some());
+        assert_eq!(e.generate_users(3, None).unwrap().len(), 3);
+        assert!(e.pending_events().unwrap() > 0);
+        assert!(!e.drain_events().unwrap().is_empty());
+        assert_eq!(e.pending_events().unwrap(), 0);
+        assert_eq!(e.stats().unwrap()["users"], 5);
+        assert!(e.remove_user("b").unwrap());
+        assert!(e.remove_server("t").unwrap());
+        assert_eq!(
+            e.pair_peers(json!({"room":"r","capacity":2,"users":[{"id":"p","scopes":{}},{"id":"q","scopes":{}}]}))
+                .unwrap()["serverId"],
+            "r"
+        );
+        e.reseed(1).unwrap();
+        e.clear().unwrap();
+        assert_eq!(e.stats().unwrap()["users"], 0);
     }
 }

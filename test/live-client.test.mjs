@@ -211,6 +211,41 @@ describe('LiveClient server event trust', () => {
     client.close();
   });
 
+  test('a welcome after a reconnect reports who came and went as presence events', () => {
+    const client = new LiveClient({ url: 'ws://example.test', ticket: 'ticket', userId: 'me' }, { direct: false, rttIntervalMs: 0 });
+    const events = [];
+    client.on('presence', event => events.push(event));
+    client.on('welcome', () => events.push('welcome'));
+    client._welcome({ type: 'welcome', peers: ['x', 'y'] });
+    assert.deepEqual(events, ['welcome'], 'the first welcome is the starting list, not a series of joins');
+    client._welcome({ type: 'welcome', peers: ['y', 'z', 'me'], peerIdentities: { z: { identity: 'zed' } } });
+    assert.deepEqual(events.slice(1), [
+      { event: 'leave', peer: 'x' },
+      { event: 'join', peer: 'z', identity: { identity: 'zed' } },
+      'welcome',
+    ]);
+    assert.deepEqual(client.peers(), ['y', 'z']);
+    client.close();
+  });
+
+  test('pong frames from peers or with a channel are not round-trip answers', () => {
+    const client = new LiveClient({ url: 'ws://example.test', ticket: 'ticket', userId: 'me' }, { direct: false });
+    const rtts = [];
+    const heard = [];
+    client.on('rtt', event => rtts.push(event));
+    client.on('message', frame => heard.push(frame.type));
+    client._probe = { id: 1, at: 0 };
+    client._frame({ type: 'pong', id: 1, from: 'attacker', channel: 'c', payload: null });
+    client._frame({ type: 'pong', id: 2 });
+    assert.deepEqual(rtts, []);
+    assert.deepEqual(heard, ['pong'], 'a peer frame of type pong is an ordinary message');
+    client._frame({ type: 'pong', id: 1 });
+    assert.equal(rtts.length, 1);
+    assert.equal(rtts[0].peer, null);
+    assert.equal(client.rtt, rtts[0].rtt);
+    client.close();
+  });
+
   test('peer-supplied server events cannot change presence', () => {
     const client = new LiveClient({ url: 'ws://example.test', ticket: 'ticket', userId: 'me' }, { direct: false });
     const events = [];
@@ -266,6 +301,57 @@ describe('LiveClient over a real hub (relay)', () => {
     await until(() => alice.peers().length === 0, { what: 'leave' });
     assert.equal(presence.at(-1).event, 'leave');
     assert.equal(bob.state, 'closed');
+  });
+
+  test('measures the round trip to the hub and lists peers with their transport', async () => {
+    const { a, b } = await pairPeers();
+    const alice = track(new LiveClient(a, { rttIntervalMs: 50 }));
+    const bob = track(new LiveClient(b, { rttIntervalMs: 0 }));
+    const rtts = [];
+    alice.on('rtt', event => rtts.push(event));
+    assert.equal(alice.rtt, null);
+    await alice.connect();
+    await bob.connect();
+    await until(() => rtts.length >= 2, { what: 'two round-trip answers' });
+    assert.ok(rtts.every(event => event.peer === null && event.via === 'relay' && event.rtt >= 0 && event.rtt < 5000));
+    assert.equal(alice.rtt, rtts.at(-1).rtt);
+    // Probes are answered by the hub alone and never reach another peer.
+    const heard = [];
+    bob.on('message', frame => heard.push(frame));
+    await quiet(bob, 200);
+    assert.deepEqual(heard, []);
+    assert.equal(bob.rtt, null, 'rttIntervalMs: 0 measures nothing');
+    await until(() => alice.peers().length === 1, { what: 'presence' });
+    assert.equal(alice.peerRtt(b.userId), null, 'no per-peer time on the relay');
+    assert.deepEqual(alice.peerList(), [{ id: b.userId, transport: 'relay', rtt: null, identity: null }]);
+  });
+
+  test('a reconnect reports a peer that left while the socket was down', async () => {
+    const { a, b, room } = await pairPeers();
+    const proxy = await startProxy(hub.port);
+    const through = descriptor => ({ ...descriptor, url: `ws://127.0.0.1:${proxy.port}/v1/live` });
+    const alice = track(new LiveClient(through(a), {
+      retryBaseMs: 40,
+      retryMaxMs: 150,
+      retries: 30,
+      renew: async () => through({ ...a, ...(await admin.ticket('game', { userId: a.userId, serverId: room })) }),
+    }));
+    const bob = track(new LiveClient(b));
+    const presence = [];
+    alice.on('presence', event => presence.push(event));
+    await alice.connect();
+    await bob.connect();
+    await until(() => alice.peers().length === 1, { what: 'bob joins' });
+    await proxy.pause();
+    await until(() => alice.state === 'reconnecting', { what: 'reconnecting state' });
+    bob.close();
+    // Past the hub's resume window, so the hub has forgotten bob.
+    await sleep(800);
+    await proxy.resume();
+    await until(() => alice.state === 'open', { what: 'reopen' });
+    assert.deepEqual(alice.peers(), []);
+    assert.deepEqual(presence.map(event => [event.event, event.peer]), [['join', b.userId], ['leave', b.userId]]);
+    await proxy.stop();
   });
 
   test('send validates and refuses reserved frame types', async () => {
@@ -501,6 +587,24 @@ describe('connectPeer negotiation and fallback (injected RTCPeerConnection)', ()
     assert.ok([...s.net.pcs.values()].every(pc => pc.candidates.length >= 1));
   });
 
+  test('an open data channel measures the round trip to the peer', async () => {
+    const s = setup();
+    const a = stubHost('a', s.router, s.rtc, { rttIntervalMs: 30 });
+    const b = stubHost('b', s.router, s.rtc, { rttIntervalMs: 30 });
+    const link = connectPeer(b, 'a', { directTimeoutMs: 600 });
+    assert.equal(await link.ready, 'direct');
+    assert.equal(link.rtt === null || link.rtt >= 0, true);
+    await until(() => link.rtt !== null && a.links.get('b')?.rtt !== null, { what: 'both sides measured' });
+    const event = b.events.find(([name]) => name === 'rtt')[1];
+    assert.equal(event.peer, 'a');
+    assert.equal(event.via, 'direct');
+    // Probes are not delivered as frames.
+    assert.deepEqual(a.delivered, []);
+    link.close();
+    assert.equal(link.rtt, null);
+    a.links.get('b')?.close();
+  });
+
   test('iceTransportPolicy reaches the RTCPeerConnection config from the client option or the link option, and only when set', async () => {
     const s = setup();
     stubHost('a', s.router, s.rtc);
@@ -647,7 +751,8 @@ describe('connectPeer negotiation and fallback (injected RTCPeerConnection)', ()
     assert.equal(a.delivered[0].frame.from, 'b');
     assert.equal(a.delivered[0].frame.payload, 'spoof');
     assert.equal(a.delivered[1].frame.payload, 'ok');
-    assert.ok(channel.sent.length === 0);
+    // Only round-trip probes went out on the channel; nothing injected was echoed.
+    assert.ok(channel.sent.every(text => JSON.parse(text).type === 'ping'));
   });
 
   test('connectPeer rejects bad arguments and reuses a live link', async () => {

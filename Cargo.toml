@@ -1,6 +1,6 @@
 [package]
 name = "liveengine"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Rust live matchmaking, embedded and standalone hub hosting, and authenticated remote hub registries"
@@ -59,6 +59,11 @@ required-features = ["host"]
 [[example]]
 name = "axum-service"
 path = "examples/axum-service.rs"
+required-features = ["host"]
+
+[[example]]
+name = "live-client"
+path = "examples/live-client.rs"
 required-features = ["host"]
 
 [dev-dependencies]

@@ -249,7 +249,8 @@ Never put the ticket in the URL.
 {
   "type": "welcome",
   "peers": ["user-b"],
-  "iceServers": [{ "urls": "stun:stun.example.org" }]
+  "iceServers": [{ "urls": "stun:stun.example.org" }],
+  "pong": true
 }
 ```
 
@@ -262,6 +263,20 @@ Never put the ticket in the URL.
 ```
 
 `event` is `join`, `leave`, or `unreachable` (a peer known only through a link that dropped). A `join` carries `identity` for hubs that set `auth`. A peer that reconnects within `LIVEENGINE_LIVE_RESUME_MILLIS` (500) produces no `leave` and `join`.
+
+### Round-trip probe
+
+`pong: true` in the welcome (0.5 and newer) means the hub answers a round-trip probe itself:
+
+```json
+{ "type": "ping", "id": 7 }
+```
+
+```json
+{ "type": "pong", "id": 7 }
+```
+
+A probe has no `channel`, only `type` and an optional `id` (a number, or a string of at most 64 bytes); anything else in it closes the connection with `frame`. It is never relayed, counts toward the per-connection message and byte rates, and its answer is dropped if the send queue is full. A frame of type `ping` that has a `channel` is an ordinary application frame. Before 0.5 a probe was a malformed frame, so check `pong` before sending one. `LiveClient` in JavaScript and Rust do this for you.
 
 ### Application frames
 

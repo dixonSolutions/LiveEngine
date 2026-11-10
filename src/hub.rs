@@ -80,6 +80,10 @@ pub struct HubConfig {
     /// Exact remote host names or IP addresses permitted for registration.
     pub allowed_remote_hosts: Vec<String>,
     pub max_hubs: usize,
+    /// Users discovery may scan in one request, across every hub it visits
+    /// (`LIVEENGINE_MAX_DISCOVERY_USERS`, 10000). Hubs scanned are bounded separately by
+    /// `max_hubs` (at most 1024 per request).
+    pub max_discovery_users: usize,
     pub max_depth: usize,
     pub live_tree_depth: usize,
     pub live_registry_max_subscribers: usize,
@@ -346,6 +350,7 @@ impl Default for HubConfig {
             token: String::new(),
             allowed_remote_hosts: Vec::new(),
             max_hubs: 256,
+            max_discovery_users: 10_000,
             max_depth: 8,
             live_tree_depth: 3,
             live_registry_max_subscribers: 256,
@@ -425,6 +430,8 @@ impl HubConfig {
             Some(instance_id_from_env()?)
         };
         config.max_hubs = env_limit("LIVEENGINE_MAX_HUBS", config.max_hubs)?;
+        config.max_discovery_users =
+            env_limit("LIVEENGINE_MAX_DISCOVERY_USERS", config.max_discovery_users)?;
         config.max_request_bytes =
             env_limit("LIVEENGINE_MAX_BODY_BYTES", config.max_request_bytes)?;
         config.max_response_bytes =
@@ -510,6 +517,7 @@ impl HubConfig {
         if self.live_registry_max_subscribers == 0
             || self.live_tree_depth == 0
             || self.max_hubs == 0
+            || self.max_discovery_users == 0
             || self.max_request_bytes == 0
             || self.max_response_bytes == 0
             || self.max_args == 0

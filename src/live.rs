@@ -1912,8 +1912,8 @@ async fn serve_connection<T: LiveTransport>(
         let Some(ice_servers) = ice_servers(&state.config, &user) else {
             return;
         };
-        let mut welcome =
-            serde_json::json!({"type":"welcome","peers":peers,"iceServers":ice_servers});
+        // `pong` tells a client this hub answers `{"type":"ping"}` round-trip probes.
+        let mut welcome = serde_json::json!({"type":"welcome","peers":peers,"iceServers":ice_servers,"pong":true});
         if let Some(own) = &identity {
             welcome["identity"] = own.fields();
         }
@@ -2062,6 +2062,30 @@ async fn serve_connection<T: LiveTransport>(
             violation = Some("frame");
             break;
         };
+        // `{"type":"ping","id":...}` without a `channel` is a round-trip probe the hub answers
+        // itself with `{"type":"pong","id":...}`. Before 0.5 such a frame was malformed and closed
+        // the socket, so no older client sends one; a `ping` frame with a channel is still an
+        // ordinary relayed frame.
+        if object.get("type").and_then(Value::as_str) == Some("ping")
+            && !object.contains_key("channel")
+        {
+            let id_ok = match object.get("id") {
+                None | Some(Value::Number(_)) => true,
+                Some(Value::String(id)) => id.len() <= 64,
+                _ => false,
+            };
+            if !id_ok || object.keys().any(|k| k != "type" && k != "id") {
+                violation = Some("frame");
+                break;
+            }
+            let mut pong = serde_json::json!({"type":"pong"});
+            if let Some(id) = object.get("id") {
+                pong["id"] = id.clone();
+            }
+            // Best effort, like any lossy frame: a full queue drops the answer.
+            let _ = error_tx.try_send(Message::Text(pong.to_string().into()));
+            continue;
+        }
         if object
             .get("type")
             .and_then(Value::as_str)

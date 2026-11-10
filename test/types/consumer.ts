@@ -28,6 +28,11 @@ async function example() {
   client.on('message', frame => console.log(frame.payload));
   client.send({ text: 'hello' }, { channel: 'chat' });
   client.connectPeer('bob', { iceTransportPolicy: 'relay' }).close();
+  client.on('rtt', ({ peer, rtt, via }) => console.log(peer ?? 'hub', rtt.toFixed(1), via));
+  const hubRtt: number | null = client.rtt;
+  const bobRtt: number | null = client.peerRtt('bob');
+  client.peerList().forEach(peer => console.log(peer.id, peer.transport, peer.rtt, hubRtt, bobRtt));
+  new LiveClient(descriptor, { rttIntervalMs: 0 }).close();
   new LiveClient(descriptor, { iceTransportPolicy: 'relay' }).close();
   await connectLive({ pairUrl: '/api/pair', body: { id: 'alice' } });
   await watchHubs({ watchUrl: '/api/watch' });

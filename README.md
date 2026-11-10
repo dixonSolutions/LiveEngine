@@ -12,7 +12,7 @@ Live infrastructure in one package, for Rust and Node.js. LiveEngine hosts hubs 
 - **Pluggable hub auth and accounts:** a hub can verify a player's credential (a local account session, tokens, HMAC, JWT, a webhook or a Rust verifier); administrators can kick connections and ban accounts.
 - **Provider-hosted hubs:** run a central hub for a customer and give them a credential for that subtree only.
 
-What works where: Rust hosts hubs, rooms and links and has an HTTP client, but no live-room client yet. Node has the in-process engine, the HTTP client, `LiveClient` and `createHubApi` for browser-facing routes, and runs the host as the `liveengine-hub` command. Browsers use `LiveClient`, `watchHubs` and `hubSession`. WebRTC is only used between JavaScript clients; hub-to-hub links are WebSocket.
+What works where: Rust hosts hubs, rooms and links, has an HTTP client, and joins live rooms over the hub relay with `live_client::LiveClient`. Node has the in-process engine, the HTTP client, `LiveClient` and `createHubApi` for browser-facing routes, and runs the host as the `liveengine-hub` command. Browsers use `LiveClient`, `watchHubs` and `hubSession`. WebRTC is only used between JavaScript clients; hub-to-hub links are WebSocket.
 
 - **Cargo:** `liveengine`, with an embeddable Rust library and `liveengine-hub` host.
 - **npm:** `@dixonsolutions/liveengine`, with a Rust N-API engine, TypeScript definitions, HTTP client, live client, browser-facing hub API and host command.
@@ -226,7 +226,7 @@ docker run --rm -p 8787:8787 -e LIVEENGINE_TOKEN="$LIVEENGINE_TOKEN" liveengine-
 
 Pass real peer connection information so rate limits apply to the socket peer. Proxy headers do not establish client identity. When nesting the router below a prefix, advertise that prefix as part of the external base address.
 
-For an engine-only Rust dependency, disable hosting dependencies with `liveengine = { version = "0.4", default-features = false }`. The core is `Engine::new(seed)` with `dispatch(method, Vec<serde_json::Value>)` and has no Node dependency.
+For an engine-only Rust dependency, disable hosting dependencies with `liveengine = { version = "0.5", default-features = false }`. The core is `Engine::new(seed)` with typed methods (`upsert_user`, `match_all`, `drain_events`, ...) over `dispatch(method, Vec<serde_json::Value>)` and has no Node dependency.
 
 ## Docker and Podman
 

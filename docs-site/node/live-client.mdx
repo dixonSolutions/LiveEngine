@@ -116,6 +116,7 @@ The constructor throws `TypeError` for a missing descriptor, `ticket` or `url`, 
 | `connectTimeoutMs` | `10000` | Wait for `welcome` per attempt |
 | `maxFrameBytes` | `65536` | Largest frame `send` accepts and a data channel delivers |
 | `queueLimit` | `64` | Frames held while reconnecting |
+| `rttIntervalMs` | `5000` | How often to measure round-trip times, to the hub and over each open data channel. `0` turns it off |
 | `direct` | `"auto"` | `"auto"`: direct links only for `peer-peer` descriptors. `true`: always try. `false`: never |
 | `directTimeoutMs` | `10000` | How long a data channel may take to open before the peer stays on the relay |
 | `directBroadcast` | `false` | Send broadcasts over open data channels and relay a copy only to peers without one |
@@ -132,6 +133,7 @@ The constructor throws `TypeError` for a missing descriptor, `ticket` or `url`, 
 | `state` | `idle`, `connecting`, `open`, `reconnecting` or `closed` |
 | `iceServers` | ICE servers from the hub's `welcome` |
 | `identity` | What the hub's `auth` verified for this client (`{ identity, claims }`), or `null` |
+| `rtt` | Round-trip time to the hub in milliseconds, or `null` before the first answer or with a hub older than 0.5 |
 | `links` | `Map` of peer id to open `PeerLink` |
 
 ### Methods
@@ -145,6 +147,8 @@ The constructor throws `TypeError` for a missing descriptor, `ticket` or `url`, 
 | `peers()` | `string[]` | Other peers in the room |
 | `identityOf(peerId)` | object or `null` | A peer's verified identity, on hubs with `auth` |
 | `transportOf(peerId)` | `"direct"`, `"relay"` or `null` | `null` when the peer is not in the room |
+| `peerRtt(peerId)` | number or `null` | Round-trip time in milliseconds over the peer's open data channel; `null` on the relay |
+| `peerList()` | `{ id, transport, rtt, identity }[]` | The other peers with their transport, data-channel round-trip time and identity |
 | `connectPeer(peerId, options)` | `PeerLink` | See [connectPeer](#connectpeer-and-peerlink) |
 | `on(event, listener)` | unsubscribe function | |
 | `once(event, listener)` | unsubscribe function | |
@@ -165,7 +169,8 @@ When the hub declares channels, always pass `channel`: a frame on an undeclared 
 | `open` | `{ reconnected }` |
 | `welcome` | `{ peers, iceServers, identity }` |
 | `message` | The frame `{ v, type, channel, from, to?, seq, payload }` plus `via`: `"relay"` or `"direct"` |
-| `presence` | `{ event: 'join', peer, identity }` or `{ event: 'leave', peer }` |
+| `presence` | `{ event: 'join', peer, identity }` or `{ event: 'leave', peer }`. After a reconnect, also one for each peer that came or went while the socket was down, just before `welcome` |
+| `rtt` | `{ peer, rtt, via }`: a new round-trip time in milliseconds, to the hub (`peer: null`, `via: 'relay'`) or over a data channel (`via: 'direct'`) |
 | `transport` | `{ peer, transport: 'direct' \| 'relay', reason? }` when a peer's link opens or falls back |
 | `direct-failed` | `{ peer, reason }` when a data channel never opened |
 | `reconnecting` | `{ attempt, delayMs, error }` before each retry |
@@ -175,6 +180,17 @@ When the hub declares channels, always pass `channel`: a frame on an undeclared 
 | `kicked`, `banned` | `Error`, just before the client closes |
 
 An exception thrown by a listener is emitted as `error`.
+
+### Round-trip time
+
+When the hub's `welcome` carries `pong: true` (LiveEngine 0.5 and newer), the client sends `{ "type": "ping", "id": n }` every `rttIntervalMs` and the hub answers `{ "type": "pong", "id": n }` itself; the probe never reaches another peer and counts toward the sender's message rate like any frame. Each answer updates `client.rtt` and emits `rtt`. An older hub is never probed.
+
+Over an open data channel the same probe goes to the peer, whose client answers it, and `peerRtt(id)` and `link.rtt` hold the result. An older peer ignores the probe, so its time stays `null`. A peer on the relay has no time of its own: its frames take about `client.rtt` plus that peer's own trip to the hub.
+
+```js
+client.on('rtt', ({ peer, rtt }) => console.log(peer ?? 'hub', `${rtt.toFixed(1)} ms`));
+const table = client.peerList(); // [{ id, transport: 'relay', rtt: null, identity: null }, ...]
+```
 
 ### Errors and refusals
 

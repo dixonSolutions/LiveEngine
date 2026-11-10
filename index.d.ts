@@ -383,8 +383,21 @@ export interface LiveClientOptions {
   directBroadcast?: boolean;
   maxFrameBytes?: number;
   queueLimit?: number;
+  /**
+   * How often to measure round-trip times, to the hub (when its welcome announces `pong`) and
+   * over each open data channel. Default 5000; 0 turns measuring off.
+   */
+  rttIntervalMs?: number;
   WebSocket?: typeof WebSocket;
   RTCPeerConnection?: typeof RTCPeerConnection;
+}
+/** One other peer in the room, from `LiveClient.peerList()`. */
+export interface LivePeer {
+  id: string;
+  transport: 'direct' | 'relay' | null;
+  /** Round-trip time over the open data channel in milliseconds; null on the relay. */
+  rtt: number | null;
+  identity: unknown;
 }
 export interface LiveFrame {
   v: number;
@@ -402,7 +415,10 @@ export interface LiveClientEvents {
   open: { reconnected: boolean };
   welcome: { peers: string[]; iceServers: unknown[]; identity: unknown };
   message: LiveFrame;
+  /** Also sent after a reconnect for each peer that came or went while the socket was down. */
   presence: { event: 'join' | 'leave'; peer: string; identity?: unknown };
+  /** A new round-trip time in milliseconds: to the hub (`peer` null) or over a data channel. */
+  rtt: { peer: string | null; rtt: number; via: 'relay' | 'direct' };
   transport: { peer: string; transport: 'direct' | 'relay'; reason?: string };
   'direct-failed': { peer: string; reason: string };
   reconnecting: { attempt: number; delayMs: number; error: Error };
@@ -418,6 +434,8 @@ export interface PeerLink {
   readonly transport: 'direct' | 'relay';
   readonly closed: boolean;
   readonly failure: string | null;
+  /** Round-trip time over the data channel in milliseconds, or null before the first answer. */
+  readonly rtt: number | null;
   /** Resolves with the first transport that settles: "direct" once the channel opens, else "relay". */
   readonly ready: Promise<'direct' | 'relay'>;
   send(frame: object): boolean;
@@ -430,12 +448,18 @@ export interface LiveClient {
   readonly state: 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed';
   readonly iceServers: unknown[];
   readonly identity: unknown;
+  /** Round-trip time to the hub in milliseconds, or null before the first answer or with a hub that does not answer probes. */
+  readonly rtt: number | null;
   on<E extends keyof LiveClientEvents>(event: E, listener: (data: LiveClientEvents[E]) => void): () => void;
   off<E extends keyof LiveClientEvents>(event: E, listener: (data: LiveClientEvents[E]) => void): this;
   once<E extends keyof LiveClientEvents>(event: E, listener: (data: LiveClientEvents[E]) => void): () => void;
   peers(): string[];
   identityOf(peerId: string): unknown;
   transportOf(peerId: string): 'direct' | 'relay' | null;
+  /** Round-trip time to `peerId` over its open data channel in milliseconds; null on the relay. */
+  peerRtt(peerId: string): number | null;
+  /** The other peers with transport, data-channel round-trip time and identity. */
+  peerList(): LivePeer[];
   connect(): Promise<this>;
   reconnect(): Promise<this>;
   connectPeer(peerId: string, options?: ConnectPeerOptions): PeerLink;

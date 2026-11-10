@@ -2,43 +2,73 @@
 
 ## Unreleased
 
-- Key the sign-in lockout by username and client address, so wrong passwords from one address no longer lock the account out for everyone. Each address keeps its total budget (ten times `LIVEENGINE_LOGIN_MAX_FAILURES`), and a username has a backstop of a hundred times it across all addresses. A lock is now timed from the end of the failed attempt, not from before its hashing.
+## 0.5.0 — 2026-11-10
 
-- **Behaviour change:** a sign-in refused by the lockout answers `429 too many sign-in attempts` with a `Retry-After` header instead of `401`. `HubClient` errors carry `.retryAfter`, and `createHubApi` passes the status and header through to the page.
+Behaviour changes to check before upgrading:
+
+- A sign-in refused by the lockout answers `429` with `Retry-After` instead of `401`.
+- The `createHubApi` admin console page (`/admin`) is served to signed-out visitors as a sign-in shell instead of a bare `401`.
+- `connectLive` with a bare-origin `pairUrl` throws `TypeError` unless `leaveUrl` and `heartbeatUrl` are given.
+- The `LIVEENGINE_LIVE_*` limits are read from the environment once, when `HubConfig`/`LiveLimits` is built, not on every connection or frame.
+- `createHubApi` refusals say `Too many peers` and `No other peer arrived in time`.
+
+### Added
+
+- A Rust live-room client, `liveengine::live_client::LiveClient` (default `host` feature): joins a room over the hub relay with a descriptor from `HubClient::pair` or `HubClient::ticket`, sends to the room or one peer, and reports the welcome, presence, messages, round-trip times, hub error frames (as typed `LiveError`s) and the close on an event receiver. It enforces the frame size on send and receive, answers keep-alive pings, and reconnects with a fresh ticket when given `with_renew`; without it a dropped socket ends with `Closed`. Rust uses the hub relay only, not WebRTC. New example `examples/live-client.rs`.
+
+- Typed Rust `Engine` methods, one per `dispatch` method (`upsert_user`, `list_users`, `find_servers_for_user`, `match_all`, `drain_events`, `pair_peers` and the rest), as thin wrappers over `dispatch`, plus `engine::DISPATCH_METHODS`. A test keeps the two in step.
+
+- Round-trip times: the hub answers `{"type":"ping","id"}` (a frame with no `channel`, which older hubs refused as malformed) with `{"type":"pong","id"}` and announces it with `pong: true` in the welcome. The JavaScript `LiveClient` measures the hub round trip (`client.rtt`) and each open data channel (`client.peerRtt(id)`, `link.rtt`, `client.peerList()`), emits `rtt` events and takes `rttIntervalMs` (default 5000, 0 turns it off). Clients only probe a hub that announced `pong`, and older peers ignore data-channel probes.
+
+- `HubConfig::max_discovery_users` (`LIVEENGINE_MAX_DISCOVERY_USERS`, default 10000): the users one discovery or `pair` look may scan, separate from the hub allowance.
+
+- Typed Rust `HubClient` methods: `contract`, `contract_schema`, `list_schemas`, `create_schema`, `get_schema`, `delete_schema`, `list_templates`, `create_template`, `get_template`, `delete_template`, `list_hubs`, `register_hub`, `get_hub`, `delete_hub`, `call_hub`, `import_registry`, `list_links`, `create_link`, `get_link`, `delete_link`, `issue_link_credential` and `revoke_link_credentials`.
+
+- Node `HubClient` link methods `listLinks`, `createLink`, `getLink`, `deleteLink`, `issueLinkCredential` and `revokeLinkCredentials`, with `LinkDefinition`, `LinkInfo`, `LinkList` and `HubRequestError` types.
+
+- `HubConfig::live_limits` (`LiveLimits`) and `HubConfig::account_limits` (`AccountLimits`) so embedders can set live connection, frame, rate, timing, link and account limits in code. Their defaults still come from the same `LIVEENGINE_*` variables, checked once by `HubService::new`.
+
+- A cap on unauthenticated `/v1/live` and `/v1/live/registry` sockets per client address (`LiveLimits::max_preauth_per_ip`, `LIVEENGINE_LIVE_MAX_PREAUTH_PER_IP`, default 16), counted by the same address as the HTTP rate limit; over the cap the upgrade is refused with `503`.
+
+- `HubService::serve_live_transport` serves a live peer over a caller-supplied `LiveTransport` with the same authentication and limits as `/v1/live`, and `LiveTransport::name` names the transport in the connection listing.
+
+- `createHubApi` gains `secureCookies` (`true`, `false` or `'auto'`, the default) and `trustProxy`, so the session cookie can be `Secure` behind a TLS-terminating proxy that sets `X-Forwarded-Proto`; and `peerScopeKey` (default `arena`) with `limits.maxPeers` (`limits.maxPlayers` still works as a deprecated alias).
+
+- `npm run check:docs` type-checks the TypeScript documentation samples against the package's own declarations and runs Cargo with `-j 4`.
+
+- Docs: the Rust live client, typed engine methods, the round-trip probe on the wire, why hub-to-hub links use a WebSocket rather than WebRTC (`LiveTransport` stays the extension point), live room `error` frames and their codes, the hub API `userId` pattern and account routes without `adminConsole`, Compose state files, and the changelog instructions for contributors.
+
+### Changed
+
+- **Behaviour change:** the sign-in lockout is keyed by username and client address, so wrong passwords from one address no longer lock the account out for everyone. Each address keeps its total budget (ten times `LIVEENGINE_LOGIN_MAX_FAILURES`), and a username has a backstop of a hundred times it across all addresses. A lock is timed from the end of the failed attempt. A refused sign-in answers `429 too many sign-in attempts` with a `Retry-After` header instead of `401`; `HubClient` errors carry `.retryAfter`, and `createHubApi` passes the status and header through to the page.
+
+- **Behaviour change:** the `createHubApi` admin console page (`/admin`, with `adminConsole: true`) is served to signed-out visitors as a static shell with its own sign-in form, instead of a bare `401`. Its data routes (`admin/accounts`, `admin/connections`) still need an administrator session.
+
+- **Behaviour change:** `connectLive` derives `leaveUrl` and `heartbeatUrl` from any `pairUrl` by replacing its last path segment (keeping the query), instead of posting seat requests to `pairUrl` itself when it does not end in `/pair`. A bare-origin `pairUrl` (no path segment) now throws `TypeError` unless `leaveUrl` and `heartbeatUrl` are given.
+
+- **Behaviour change:** the `LIVEENGINE_LIVE_*` limits are read from the environment once, when `LiveLimits` is built, and no longer on every connection or frame; set them before the service starts, or in code.
+
+- **Behaviour change:** `createHubApi` refusal and timeout messages are now `Too many peers` and `No other peer arrived in time`.
+
+- After a reconnect, the JavaScript `LiveClient` compares the new welcome with the peers it knew and emits `presence` `leave` and `join` events for the difference, before `welcome`, instead of replacing the list silently.
+
+- A change to the pairing queue wakes only the waiting peers it could concern instead of every waiter on the service, so a crowd of waiting peers no longer looks again after every arrival and pairing. Pairing results and order are unchanged.
+
+- Consumed ticket and receipt ids are kept in expiry order, so verifying a ticket no longer scans the whole replay cache and a cache full of expired ids accepts a fresh ticket. Replay protection is unchanged.
+
+- A source checkout's `npm install` / `npm ci` rebuilds the native addon when it is older than the Rust sources or was built from another version (the addon exports `nativeVersion()`); a published package never rebuilds a prebuilt addon.
+
+### Fixed
+
+- Discovery counted hubs and users against one allowance (`max_hubs`, default 256), so users past roughly the 256th in a hub were never found by discovery or pairing. Users now have their own allowance (`max_discovery_users`).
 
 - Account and sign-in routes answer a body that is not JSON, not `application/json`, too large, or with a missing or unknown field with the usual `{ "error": ... }` JSON (keeping its `4xx` status), so `HubClient` errors carry `.status` instead of failing with "invalid JSON".
 
-- A change to the pairing queue now wakes only the waiting peers it could concern (one that would accept a newcomer, or a peer just seated in a room that may have space) instead of every waiter on the service, so a crowd of waiting peers no longer looks again after every arrival and pairing. Pairing results and order are unchanged.
+- Node `HubClient.connections()` no longer sends `undefined` or `null` filters as the strings `"undefined"` and `"null"`.
 
-- Add typed Rust `HubClient` methods: `contract`, `contract_schema`, `list_schemas`, `create_schema`, `get_schema`, `delete_schema`, `list_templates`, `create_template`, `get_template`, `delete_template`, `list_hubs`, `register_hub`, `get_hub`, `delete_hub`, `call_hub`, `import_registry`, `list_links`, `create_link`, `get_link`, `delete_link`, `issue_link_credential` and `revoke_link_credentials`.
+- Immediate peer pairing requests no longer seat registered peers that have not requested a pair.
 
-- Add Node `HubClient` link methods `listLinks`, `createLink`, `getLink`, `deleteLink`, `issueLinkCredential` and `revokeLinkCredentials`, with `LinkDefinition`, `LinkInfo`, `LinkList` and `HubRequestError` types. `connections()` no longer sends `undefined` or `null` filters as the strings `"undefined"` and `"null"`.
-
-- `connectLive` derives `leaveUrl` and `heartbeatUrl` from any `pairUrl` by replacing its last path segment (keeping the query), instead of posting seat requests to `pairUrl` itself when it does not end in `/pair`. A `pairUrl` with no path segment now needs explicit `leaveUrl` and `heartbeatUrl` (`TypeError` otherwise).
-
-- `createHubApi` gains `secureCookies` (`true`, `false` or `'auto'`, the default) and `trustProxy`, so the session cookie can be `Secure` behind a TLS-terminating proxy that sets `X-Forwarded-Proto`.
-
-- **Behaviour change:** the `createHubApi` admin console page (`/admin`, with `adminConsole: true`) is now served to signed-out visitors as a static shell that shows its own sign-in form, instead of a bare `401`. Its data routes (`admin/accounts`, `admin/connections`) still need an administrator session.
-
-- `createHubApi` gains `peerScopeKey` (default `arena`) to name the scope that keeps peer pairings to the hub, and `limits.maxPeers`; `limits.maxPlayers` still works as a deprecated alias. The refusal and timeout messages are now `Too many peers` and `No other peer arrived in time`.
-
-- A source checkout's `npm install` / `npm ci` rebuilds the native addon when it is older than the Rust sources or was built from another version (the addon now exports `nativeVersion()`); a published package never rebuilds a prebuilt addon.
-
-- `npm run check:docs` type-checks the TypeScript documentation samples against the package's own declarations (wrong method names, exports or argument types now fail) and runs Cargo with `-j 4`.
-
-- Docs: the live room `error` frames and their codes, the hub API `userId` pattern and account routes without `adminConsole`, Compose state files, and the changelog instructions for contributors.
-
-- Make standalone Rust documentation samples compile against the current API and mark contextual excerpts.
-
-- Prevent immediate peer pairing requests from seating registered peers that have not requested a pair.
-
-- Add `HubConfig::live_limits` (`LiveLimits`) and `HubConfig::account_limits` (`AccountLimits`) so embedders can set live connection, frame, rate, timing, link and account limits in code. Their defaults still come from the same `LIVEENGINE_*` variables; values are checked once by `HubService::new` and no longer read from the environment on every connection or frame.
-
-- Cap unauthenticated `/v1/live` and `/v1/live/registry` sockets per client address (`LiveLimits::max_preauth_per_ip`, `LIVEENGINE_LIVE_MAX_PREAUTH_PER_IP`, default 16), counted by the same address as the HTTP rate limit, so one client cannot hold all pre-auth capacity; over the cap the upgrade is refused with `503`.
-
-- Keep consumed ticket and receipt ids in expiry order, so verifying a ticket no longer scans the whole replay cache and a cache full of expired ids accepts a fresh ticket. Replay protection is unchanged.
-
-- Add `HubService::serve_live_transport` to serve a live peer over a caller-supplied `LiveTransport` with the same authentication and limits as `/v1/live`, and `LiveTransport::name` for the transport shown in the connection listing.
+- Standalone Rust documentation samples compile against the current API, and contextual excerpts are marked.
 
 ## 0.4.0 — 2026-11-09
 

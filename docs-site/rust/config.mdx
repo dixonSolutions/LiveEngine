@@ -12,6 +12,7 @@ pub struct HubConfig {
     pub token: String,
     pub allowed_remote_hosts: Vec<String>,
     pub max_hubs: usize,
+    pub max_discovery_users: usize,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     pub max_args: usize,
@@ -52,6 +53,7 @@ pub struct HubConfig {
 | `token` | `String` | empty (invalid until set) |
 | `allowed_remote_hosts` | `Vec<String>` | empty |
 | `max_hubs` | `usize` | `256` |
+| `max_discovery_users` | `usize` | `10000`: users one discovery scans across every hub it visits; hubs are bounded by `max_hubs` (at most 1024) |
 | `max_request_bytes` | `usize` | `1048576` (1 MiB) |
 | `max_response_bytes` | `usize` | `4194304` (4 MiB) |
 | `max_args` | `usize` | `256` |
@@ -171,6 +173,7 @@ It reads:
 | `LIVEENGINE_TOKEN` | `token` | required string |
 | `LIVEENGINE_ALLOWED_REMOTE_HOSTS` | `allowed_remote_hosts` | comma-separated, trimmed, lowercased, empty entries dropped |
 | `LIVEENGINE_MAX_HUBS` | `max_hubs` | integer |
+| `LIVEENGINE_MAX_DISCOVERY_USERS` | `max_discovery_users` | integer |
 | `LIVEENGINE_MAX_BODY_BYTES` | `max_request_bytes` | integer |
 | `LIVEENGINE_MAX_RESPONSE_BYTES` | `max_response_bytes` | integer |
 | `LIVEENGINE_MAX_ARGS` | `max_args` | integer |
@@ -201,7 +204,7 @@ A missing optional variable keeps the default.
 `HubService::new` calls `config.validate()` before building the router. It fails when:
 
 - `token.len() < 24` (bytes, not characters)
-- any of `max_hubs`, `max_request_bytes`, `max_response_bytes`, `max_args`, `max_entities`, `max_events`, `max_generates_per_call`, `max_inflight_calls`, `rate_limit_requests`, or `rate_limit_peers` is zero
+- any of `max_hubs`, `max_discovery_users`, `max_request_bytes`, `max_response_bytes`, `max_args`, `max_entities`, `max_events`, `max_generates_per_call`, `max_inflight_calls`, `rate_limit_requests`, or `rate_limit_peers` is zero
 - `rate_limit_window` or `request_timeout` is zero
 - a `live_limits` field is outside 1 to 16777216, or an `account_limits` field is outside its bounds
 

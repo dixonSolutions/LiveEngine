@@ -1,13 +1,13 @@
 ---
 title: "Rust engine reference"
-description: "Use Engine::new and dispatch, call the same methods as the Node SDK, and choose feature flags."
+description: "Use Engine::new with typed methods or dispatch, call the same methods as the Node SDK, and choose feature flags."
 ---
 
 ## Dependency
 
 ```toml
 [dependencies]
-liveengine = "0.4"
+liveengine = "0.5"
 serde_json = "1"
 ```
 
@@ -32,7 +32,7 @@ Engine-only dependency:
 
 ```toml
 [dependencies]
-liveengine = { version = "0.4", default-features = false }
+liveengine = { version = "0.5", default-features = false }
 ```
 
 With `default-features = false`, only `Engine`, `rules`, and `VERSION` are available. There is no Node or hosting dependency.
@@ -46,8 +46,12 @@ impl Engine {
     pub fn new(seed: u64) -> Self;
     pub fn dispatch(&mut self, method: &str, args: Vec<serde_json::Value>)
         -> Result<serde_json::Value, String>;
+    // ...and one typed method per dispatch method, listed below.
 }
+pub const DISPATCH_METHODS: &[&str];
 ```
+
+Every `dispatch` method also has a typed method named like it in snake case (`upsertUser` is `upsert_user`). Each is a thin wrapper over `dispatch`, with the same validation, errors and events, so you can mix the two. Users, servers, options and results are your own JSON shapes and stay `serde_json::Value`; counts are `usize`, flags `bool`, lookups `Option<Value>` and lists `Vec<Value>`. `liveengine::engine::DISPATCH_METHODS` lists every method name, and a test keeps it, `dispatch` and the typed methods in step.
 
 ```rust
 use liveengine::Engine;
@@ -88,37 +92,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Methods
 
-The method names, argument order, and result shapes match the [Node engine reference](/node/engine). Every Node method maps directly to `dispatch`:
+The method names, argument order, and result shapes match the [Node engine reference](/node/engine). Every Node method maps directly to `dispatch` and to a typed method:
 
-| Method | Arguments |
-| --- | --- |
-| `upsertUser` | `user` |
-| `upsertUsers` | `[users]` |
-| `removeUser` | `id` |
-| `getUser` | `id` |
-| `listUsers` | optional `status` |
-| `setUserStatus` | `id`, `status` |
-| `upsertServer` | `server` |
-| `upsertServers` | `[servers]` |
-| `removeServer` | `id` |
-| `getServer` | `id` |
-| `listServers` | optional `status` |
-| `setServerStatus` | `id`, `status` |
-| `findServersForUser` | `userId`, optional options |
-| `findUsersForServer` | `serverId`, optional options |
-| `fits` | `userId`, `serverId` |
-| `advertise` | `userId`, optional options |
-| `advertiseAll` | optional options |
-| `join` | `userId`, `serverId` |
-| `leave` | `userId` |
-| `autoJoin` | `userId`, optional options |
-| `matchAll` | optional options |
-| `generateUsers` | `count`, optional spec |
-| `drainEvents` | none |
-| `pendingEvents` | none |
-| `stats` | none |
-| `clear` | none |
-| `reseed` | `seed` |
+| `dispatch` method | Arguments | Typed method |
+| --- | --- | --- |
+| `upsertUser` | `user` | `upsert_user(Value) -> Result<bool, String>` (true when added) |
+| `upsertUsers` | `[users]` | `upsert_users(Vec<Value>) -> Result<usize, String>` |
+| `removeUser` | `id` | `remove_user(&str) -> Result<bool, String>` |
+| `getUser` | `id` | `get_user(&str) -> Result<Option<Value>, String>` |
+| `listUsers` | optional `status` | `list_users(Option<&str>) -> Result<Vec<Value>, String>` |
+| `setUserStatus` | `id`, `status` | `set_user_status(&str, &str) -> Result<bool, String>` |
+| `upsertServer` | `server` | `upsert_server(Value) -> Result<bool, String>` |
+| `upsertServers` | `[servers]` | `upsert_servers(Vec<Value>) -> Result<usize, String>` |
+| `removeServer` | `id` | `remove_server(&str) -> Result<bool, String>` |
+| `getServer` | `id` | `get_server(&str) -> Result<Option<Value>, String>` |
+| `listServers` | optional `status` | `list_servers(Option<&str>) -> Result<Vec<Value>, String>` |
+| `setServerStatus` | `id`, `status` | `set_server_status(&str, &str) -> Result<bool, String>` |
+| `findServersForUser` | `userId`, optional options | `find_servers_for_user(&str, Option<Value>) -> Result<Vec<Value>, String>` |
+| `findUsersForServer` | `serverId`, optional options | `find_users_for_server(&str, Option<Value>) -> Result<Vec<Value>, String>` |
+| `fits` | `userId`, `serverId` | `fits(&str, &str) -> Result<bool, String>` |
+| `advertise` | `userId`, optional options | `advertise(&str, Option<Value>) -> Result<usize, String>` |
+| `advertiseAll` | optional options | `advertise_all(Option<Value>) -> Result<usize, String>` |
+| `join` | `userId`, `serverId` | `join(&str, &str) -> Result<Value, String>` |
+| `leave` | `userId` | `leave(&str) -> Result<Value, String>` |
+| `autoJoin` | `userId`, optional options | `auto_join(&str, Option<Value>) -> Result<Value, String>` |
+| `matchAll` | optional options | `match_all(Option<Value>) -> Result<Vec<Value>, String>` |
+| `generateUsers` | `count`, optional spec | `generate_users(usize, Option<Value>) -> Result<Vec<Value>, String>` |
+| `drainEvents` | none | `drain_events() -> Result<Vec<Value>, String>` |
+| `pendingEvents` | none | `pending_events() -> Result<usize, String>` |
+| `stats` | none | `stats() -> Result<Value, String>` |
+| `clear` | none | `clear() -> Result<(), String>` |
+| `reseed` | `seed` | `reseed(u64) -> Result<(), String>` |
+| `pairPeers` | `{room, capacity, users}` | `pair_peers(Value) -> Result<Value, String>`; hub pairing uses it |
+
+Every typed method takes `&mut self`, like `dispatch`.
+
+```rust
+use liveengine::Engine;
+use serde_json::json;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = Engine::new(42);
+    engine.upsert_server(json!({ "id": "room-au", "capacity": 2, "scopes": { "region": "au" } }))?;
+    engine.upsert_users(vec![
+        json!({ "id": "alice", "requirements": { "region": "au" } }),
+        json!({ "id": "bob", "requirements": { "region": "au" } }),
+    ])?;
+    assert!(engine.fits("alice", "room-au")?);
+    for seat in engine.match_all(None)? {
+        println!("{} -> {}", seat["userId"], seat["serverId"]);
+    }
+    let alice = engine.get_user("alice")?.expect("alice exists");
+    println!("{}", alice["status"]);
+    println!("{} events", engine.drain_events()?.len());
+    Ok(())
+}
+```
+
+The same calls through `dispatch`:
 
 ```rust
 use liveengine::Engine;

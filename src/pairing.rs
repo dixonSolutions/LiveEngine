@@ -322,7 +322,10 @@ pub(crate) async fn discover(state: Arc<Inner>, headers: HeaderMap, body: Value)
     let Ok(requirements) = rules::parse_requirements(request.requirements.as_ref()) else {
         return error(StatusCode::BAD_REQUEST, "invalid requirements");
     };
-    let mut budget = state.config.max_hubs.min(1024);
+    let mut budget = Budget {
+        hubs: state.config.max_hubs.min(1024),
+        users: state.config.max_discovery_users,
+    };
     let mut candidates = Vec::new();
     search(
         state.clone(),
@@ -351,6 +354,13 @@ pub(crate) async fn discover(state: Arc<Inner>, headers: HeaderMap, body: Value)
     Json(result).into_response()
 }
 
+/// What one discovery request may still scan. Hubs and users are counted apart, so a hub with
+/// many users cannot use up the hub allowance and hide the users past it.
+struct Budget {
+    hubs: usize,
+    users: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn search<'a>(
     state: Arc<Inner>,
@@ -359,12 +369,12 @@ fn search<'a>(
     base: usize,
     kind: &'a str,
     requirements: &'a Value,
-    budget: &'a mut usize,
+    budget: &'a mut Budget,
     out: &'a mut Vec<Value>,
     prefix: Vec<String>,
 ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        if depth == 0 || *budget == 0 {
+        if depth == 0 || budget.hubs == 0 {
             return;
         }
         let mut records: Vec<_> = {
@@ -374,10 +384,10 @@ fn search<'a>(
         };
         records.sort_by(|a, b| a.info.id.cmp(&b.info.id));
         for record in records {
-            if *budget == 0 {
+            if budget.hubs == 0 {
                 break;
             }
-            *budget -= 1;
+            budget.hubs -= 1;
             let mut path = prefix.clone();
             path.push(record.info.id.clone());
             if kind != "peer"
@@ -429,7 +439,7 @@ fn search<'a>(
                     None
                 };
                 if let Some(users) = users.as_ref().and_then(Value::as_array) {
-                    for user in users.iter().take(*budget) {
+                    for user in users.iter().take(budget.users) {
                         if let (Some(id), Some(scopes)) =
                             (user.get("id").and_then(Value::as_str), user.get("scopes"))
                         {
@@ -439,11 +449,11 @@ fn search<'a>(
                                 );
                             }
                         }
-                        *budget -= 1;
+                        budget.users -= 1;
                     }
                 }
             }
-            if record.info.mode == HubMode::Central && depth > 1 && *budget > 0 {
+            if record.info.mode == HubMode::Central && depth > 1 && budget.hubs > 0 {
                 if let Some(child) = record.child {
                     search(
                         child,
@@ -485,7 +495,18 @@ fn search<'a>(
                                 if let Some(candidates) =
                                     value.get("candidates").and_then(Value::as_array)
                                 {
-                                    for candidate in candidates.iter().take(*budget) {
+                                    for candidate in candidates {
+                                        // A remote's candidates count against the allowance of their kind.
+                                        let left = if candidate.get("kind")
+                                            == Some(&Value::from("peer"))
+                                        {
+                                            &mut budget.users
+                                        } else {
+                                            &mut budget.hubs
+                                        };
+                                        if *left == 0 {
+                                            continue;
+                                        }
                                         let mut candidate = candidate.clone();
                                         if let Some(obj) = candidate.as_object_mut() {
                                             let child_path = obj
@@ -499,7 +520,7 @@ fn search<'a>(
                                             // Only copy the documented public candidate fields from a remote.
                                             let clean = json!({"kind":obj.get("kind"),"id":obj.get("id"),"scopes":obj.get("scopes"),"path":full});
                                             out.push(clean);
-                                            *budget -= 1;
+                                            *left -= 1;
                                         }
                                     }
                                 }
@@ -1680,6 +1701,78 @@ mod tests {
         )
     }
 
+    /// Hubs and users have separate discovery allowances, so a user past the 256th in a hub
+    /// (the default `max_hubs`) is still found, by discovery and by pairing.
+    #[tokio::test]
+    async fn discovery_finds_users_beyond_the_hub_allowance() {
+        let state = HubService::new(HubConfig {
+            token: "discovery-budget-unit-test-token-1234".into(),
+            public_url: Some("ws://live.example.test/v1/live".into()),
+            ..HubConfig::default()
+        })
+        .unwrap()
+        .inner;
+        assert_eq!(state.config.max_hubs, 256);
+        let (status, body) = call(
+            &state,
+            vec![],
+            "register",
+            json!({"id":"crowd","mode":"internal"}),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        let users: Vec<Value> = (1..=300)
+            .map(|n| json!({"id":format!("u{n:03}"),"scopes":{"n":n}}))
+            .collect();
+        let (status, body) = call(
+            &state,
+            vec![],
+            "call",
+            json!({"id":"crowd","method":"upsertUsers","args":[users]}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let (status, found) = call(
+            &state,
+            vec![],
+            "discover",
+            json!({"kind":"peer","requirements":{"n":300}}),
+        )
+        .await;
+        assert_eq!(status, 200, "{found}");
+        assert_eq!(found["candidates"][0]["id"], "u300", "{found}");
+        let (status, found) = call(&state, vec![], "discover", json!({"kind":"peer"})).await;
+        assert_eq!(status, 200);
+        assert_eq!(found["candidates"].as_array().unwrap().len(), 300);
+        // The allowance is still a bound.
+        let small = HubService::new(HubConfig {
+            token: "discovery-budget-unit-test-token-1234".into(),
+            max_discovery_users: 10,
+            ..HubConfig::default()
+        })
+        .unwrap()
+        .inner;
+        call(
+            &small,
+            vec![],
+            "register",
+            json!({"id":"crowd","mode":"internal"}),
+        )
+        .await;
+        let users: Vec<Value> = (1..=30)
+            .map(|n| json!({"id":format!("u{n:03}"),"scopes":{"n":n}}))
+            .collect();
+        call(
+            &small,
+            vec![],
+            "call",
+            json!({"id":"crowd","method":"upsertUsers","args":[users]}),
+        )
+        .await;
+        let (_, found) = call(&small, vec![], "discover", json!({"kind":"peer"})).await;
+        assert_eq!(found["candidates"].as_array().unwrap().len(), 10);
+    }
+
     /// A crowd of waiting peers: pairs that accept only each other, and loners nobody accepts.
     /// Every pair is made exactly once, nobody is seated twice, every loner times out, and a
     /// queue change wakes only the waiters it could matter to, so the number of looks stays
@@ -1692,8 +1785,6 @@ mod tests {
             token: "pending-queue-unit-test-token-123".into(),
             public_url: Some("ws://live.example.test/v1/live".into()),
             max_pending_pairs: 4096,
-            // Discovery scans at most `max_hubs` (capped at 1024) hubs and users per look.
-            max_hubs: 4096,
             max_queued_calls: 1 << 20,
             max_inflight_calls: 64,
             call_queue: Duration::from_secs(60),

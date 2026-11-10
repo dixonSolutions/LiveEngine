@@ -133,6 +133,10 @@ A link without `localHubId` and `localRoom` is a plain connection: it authentica
 
 The hub addressed by `hubId` is a hub at the remote service root (the ticket route is `POST /v1/hubs/{hubId}/tickets`), and `localHubId` is a hub at the local root. Hubs inside a central namespace are not link endpoints.
 
+## Why links use a WebSocket, not WebRTC
+
+Links run between servers that can reach each other, so a persistent WebSocket, with TLS from your proxy (`wss://`), is the right transport: one ordered, reliable connection per link, authenticated with a service ticket, with nothing to negotiate. WebRTC exists for browsers and peers behind NAT that cannot accept a connection; between two services it would add ICE, STUN and TURN and a signalling path for no gain. Hub-to-hub links over WebRTC were considered and are deliberately not built. If you need another carrier between services, implement `LiveTransport` and hand each accepted connection to `HubService::serve_live_transport`: that trait is the extension point, and the room, ticket, channel and limit logic stays the same.
+
 ## Wire format
 
 Linked traffic uses two frame types on the link socket. Both are reserved: only a `service` socket may send them, and a `peer` socket that sends one is closed.

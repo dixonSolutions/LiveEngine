@@ -18,7 +18,7 @@ What it does:
 - **Provider-hosted hubs.** Run a central hub for a customer on your service and give them one credential for that subtree only. See [provider hosting](/guides/provider-hosting).
 - **A browser-facing API.** `createHubApi` gives a page pairing, renewal, seats, a hub list and sign-in, while the administrator token stays on your server. See [hub API for browsers](/guides/hub-api).
 
-Current release: **0.4.0**.
+Current release: **0.5.0**.
 
 ## What works where
 
@@ -28,8 +28,8 @@ Current release: **0.4.0**.
 | Host hubs, registry, nesting, links | `HubService` router, `liveengine-hub` binary | Runs the `liveengine-hub` command; no in-process host | No |
 | HTTP client: register, route, discover, pair, tickets, accounts, connections | `hub::HubClient` | `HubClient` | No: keep the token on a server |
 | Live registry watch | `HubClient::watch` | `HubClient.watchRegistry` | `watchHubs`, with a ticket from your server |
-| Join a live room through the hub relay | No client yet | `LiveClient` (Node 22+) | `LiveClient`, `connectLive` |
-| Direct WebRTC data channels | No | `LiveClient` with an `RTCPeerConnection` you supply | `LiveClient`, built in |
+| Join a live room through the hub relay | `live_client::LiveClient` | `LiveClient` (Node 22+) | `LiveClient`, `connectLive` |
+| Direct WebRTC data channels | No: Rust peers use the hub relay | `LiveClient` with an `RTCPeerConnection` you supply | `LiveClient`, built in |
 | Hub-to-hub room links | Run by the service | Defined over HTTP (`/v1/links`) | No |
 | Browser-facing pairing and sign-in routes | Write your own | `createHubApi` | `connectLive`, `watchHubs`, `hubSession` |
 
@@ -40,7 +40,7 @@ Hub-to-hub links are WebSocket connections between services. WebRTC is only used
 | Artifact | Name | What it provides |
 | --- | --- | --- |
 | npm package | `@dixonsolutions/liveengine` | Rust N-API engine, TypeScript definitions, `HubClient`, the `live-client` and `hub-api` modules, and the `liveengine-hub` command |
-| Cargo crate | `liveengine` | `Engine`, `rules`, and the optional Axum `HubService` and `HubClient` |
+| Cargo crate | `liveengine` | `Engine`, `rules`, and the optional Axum `HubService`, `HubClient` and live-room `LiveClient` |
 | Cargo binary | `liveengine-hub` | Standalone host, central registry and command-line client |
 | Container | same image | Central registry, ordinary internal hub host, or remote service |
 | Integration | Gogh Strike bridge | A browser game paired and connected through a hub, with direct and relay transports |
@@ -87,13 +87,13 @@ const { HubClient } = require('@dixonsolutions/liveengine/hubs');
 
 See [Installation](/node/installation) for the platform matrix and source fallback.
 
-## Honest scope for 0.4.0
+## Honest scope for 0.5.0
 
 LiveEngine is deliberately small and explicit about what it does not do:
 
 - **Live state is in memory.** A state file can persist registry definitions, accounts and sessions, but users, rooms, memberships, presence and events are lost on restart.
 - **Authentication is narrow.** The service verifies one administrator token, issues single-use tickets for live sockets, and can verify a player credential per hub ([custom auth](/guides/custom-auth)). Local [accounts](/guides/accounts-and-sessions) have two roles, `admin` and `user`, and no sign-up, recovery or multi-factor sign-in. There is no tenant isolation beyond [provider hosting](/guides/provider-hosting). Keep tokens in server code and expose application-specific routes to clients.
-- **No Rust live-room client.** Rust services host rooms and links, but joining a room as a client, and WebRTC, are JavaScript only.
+- **WebRTC is JavaScript only.** Rust services host rooms and links and join rooms with `live_client::LiveClient`, but over the hub relay; direct data channels are opened only by the JavaScript client.
 - **Request timeouts do not roll back work.** An internal handler that already started continues on a blocking worker. Capacity stays occupied until it finishes. Reconcile state before retrying a mutation.
 - **Schemas use JSON Schema 2020-12.** References must be local JSON pointers and are bounded.
 - **Remote imports can refresh.** Set `refreshSeconds` to discover changes and mark missing entries stale.

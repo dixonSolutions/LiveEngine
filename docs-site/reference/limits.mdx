@@ -12,6 +12,7 @@ Limits fall into four groups: host configuration, per-engine budgets, protocol/f
 | Administrative token | `token` | `LIVEENGINE_TOKEN` | required, >= 24 bytes |
 | Remote allowlist | `allowed_remote_hosts` | `LIVEENGINE_ALLOWED_REMOTE_HOSTS` | empty |
 | Registered hubs | `max_hubs` | `LIVEENGINE_MAX_HUBS` | `256` |
+| Users scanned by one discovery | `max_discovery_users` | `LIVEENGINE_MAX_DISCOVERY_USERS` | `10000` |
 | Request body | `max_request_bytes` | `LIVEENGINE_MAX_BODY_BYTES` | `1048576` |
 | Response body | `max_response_bytes` | `LIVEENGINE_MAX_RESPONSE_BYTES` | `4194304` |
 | Arguments | `max_args` | `LIVEENGINE_MAX_ARGS` | `256` |
@@ -126,7 +127,8 @@ Everything else is bounded only by process memory.
 
 ## Choosing limits
 
-- Size `max_hubs` for expected registrations, including imports.
+- Size `max_hubs` for expected registrations, including imports. One discovery (and so one `pair` look) scans at most `max_hubs` hubs, capped at 1024.
+- Size `max_discovery_users` above the largest number of users one discovery should consider, across every hub it visits. Users past it are not found; hubs have their own allowance, so a crowded hub no longer hides users past the 256th.
 - Size `max_entities` and `max_events` for the largest single engine, not the total across hubs.
 - Keep `max_inflight_calls` low enough that blocking handlers cannot exhaust worker threads.
 - Set `max_request_bytes` above your largest valid bulk upsert.

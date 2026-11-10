@@ -1,0 +1,169 @@
+---
+title: "Rust live client"
+description: "Join a live room from Rust with LiveClient: connect with a ticket, send to the room or one peer, and receive presence, messages, round-trip times and hub errors as events."
+---
+
+`liveengine::live_client::LiveClient` joins a live room over the hub relay WebSocket (`/v1/live`), the same socket the JavaScript `LiveClient` uses. A Rust bot, game server, load generator or native client can sit in a room with browser peers and exchange frames with them.
+
+It is part of the default `host` feature, next to `HubClient`. It uses the `tokio-tungstenite` WebSocket client the crate already depends on.
+
+<Note>
+Rust always uses the hub relay. WebRTC data channels, which the JavaScript client opens between browsers, are not implemented in Rust. A Rust peer and a browser peer still talk to each other: their frames go through the hub, and the hub's channel schemas and rate limits apply to every frame.
+</Note>
+
+## Connect
+
+Get a descriptor where the administrator token lives: `HubClient::pair` returns `{ticket, url, userId, room, ...}` and `HubClient::ticket` returns `{ticket, url}`. Pass it to `LiveDescriptor::from_value` and connect.
+
+```rust
+use liveengine::{
+    hub::HubClient,
+    live_client::{LiveClient, LiveClientOptions, LiveDescriptor, LiveEvent},
+};
+use serde_json::json;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let hub = HubClient::new("http://127.0.0.1:8787", std::env::var("LIVEENGINE_TOKEN")?)?;
+    let paired = hub
+        .pair(json!({
+            "subject": {"kind": "peer", "id": "bot-1", "scopes": {"mode": "duel"}},
+            "target": {"kind": "peer", "requirements": {"mode": "duel"}},
+            "waitMs": 10000
+        }))
+        .await?;
+
+    let (client, mut events) =
+        LiveClient::connect(LiveDescriptor::from_value(&paired)?, LiveClientOptions::default())
+            .await?;
+    client.send("chat", json!({"text": "hello"})).await?;
+
+    while let Some(event) = events.recv().await {
+        match event {
+            LiveEvent::Welcome { peers, .. } => println!("in the room with {peers:?}"),
+            LiveEvent::Join { peer, .. } => println!("{peer} joined"),
+            LiveEvent::Leave { peer } => println!("{peer} left"),
+            LiveEvent::Message(frame) => {
+                println!("{} on {}: {}", frame.from, frame.channel, frame.payload);
+                client.send_to(&frame.from, "chat", json!({"text": "got it"})).await?;
+            }
+            LiveEvent::Rtt(rtt) => println!("round trip to the hub: {rtt:?}"),
+            LiveEvent::Error(error) => eprintln!("hub refused: {error}"),
+            LiveEvent::Closed { error } => {
+                println!("closed: {error:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+```
+
+`connect` resolves once the hub has sent its welcome. The ticket is spent by that call, so a refused connection is returned as an error and not retried; a bad, spent or expired ticket is `LiveError::Hub { code: "auth" }`. The runnable `examples/live-client.rs` starts a hub, pairs two peers and has them trade frames:
+
+```bash
+cargo run --example live-client
+```
+
+## API
+
+```rust fragment
+impl LiveDescriptor {
+    pub fn new(url: impl Into<String>, ticket: impl Into<String>) -> Self;
+    pub fn from_value(value: &serde_json::Value) -> Result<Self, LiveError>;
+}
+
+impl LiveClient {
+    pub async fn connect(descriptor: LiveDescriptor, options: LiveClientOptions)
+        -> Result<(LiveClient, tokio::sync::mpsc::Receiver<LiveEvent>), LiveError>;
+    pub async fn send(&self, channel: &str, payload: Value) -> Result<(), LiveError>;
+    pub async fn send_to(&self, peer: &str, channel: &str, payload: Value) -> Result<(), LiveError>;
+    pub async fn send_frame(&self, frame: LiveSend) -> Result<(), LiveError>;
+    pub async fn close(&self);
+    pub fn id(&self) -> Option<&str>;
+    pub fn room(&self) -> Option<&str>;
+    pub fn peers(&self) -> Vec<String>;
+    pub fn identity(&self) -> Option<Value>;
+    pub fn rtt(&self) -> Option<std::time::Duration>;
+    pub fn is_closed(&self) -> bool;
+}
+```
+
+`LiveClient` is cheap to clone, and every clone sends on the same connection. The connection closes when `close` is called or the last clone is dropped.
+
+| Send | Frame |
+| --- | --- |
+| `send(channel, payload)` | `{"v":1,"type":"message","channel":...,"seq":n,"payload":...}` to everyone else in the room |
+| `send_to(peer, channel, payload)` | The same with `"to": peer` |
+| `send_frame(LiveSend::new(channel, payload).to(peer).frame_type("move"))` | Your own frame type |
+
+A send resolves once the frame is written to the socket. It is refused before anything is sent when the type is reserved (`presence`, `welcome`, `error`, `auth`, `link.*`, `signal.*`: `LiveError::ReservedType`) or the frame exceeds `max_frame_bytes` (`LiveError::FrameTooLarge`). `seq` counts up per client.
+
+### Events
+
+| Event | When |
+| --- | --- |
+| `Welcome { peers, identity, peer_identities, ice_servers, reconnected }` | First on the receiver, and again after every reconnect |
+| `Join { peer, identity }`, `Leave { peer }` | A peer joined or left. A peer that reconnects within the hub's resume window produces neither |
+| `Unreachable { peer }` | A peer known only through a [hub link](/guides/hub-links) that dropped |
+| `Message(LiveFrame)` | A frame from another peer: `from`, `to`, `frame_type`, `channel`, `seq`, `payload` |
+| `Rtt(Duration)` | A new round-trip time to the hub |
+| `Error(LiveError)` | The hub sent `{"type":"error","code":...}`, or a received frame was too large. The socket closes after it |
+| `Reconnecting { attempt, delay, error }` | The socket dropped and `renew` is set |
+| `Closed { error }` | The connection is over. `error` is `None` after `close` |
+
+The receiver holds `event_buffer` (256) events. Keep reading it: while it is full the client stops reading the socket, and the hub disconnects a peer whose reliable queue fills.
+
+### Options
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `max_frame_bytes` | `65536` | Largest frame sent or received. A larger incoming frame closes the connection with `FrameTooLarge` |
+| `connect_timeout` | 10 s | Longest wait for the welcome |
+| `rtt_interval` | `Some(5 s)` | How often to probe the hub's round trip; `None` never probes |
+| `retries`, `retry_base`, `retry_max` | 5, 250 ms, 8 s | Reconnect attempts and jittered, doubling backoff |
+| `event_buffer` | `256` | Events held for the caller |
+| `renew` | `None` | Where a reconnect gets a fresh ticket; set it with `with_renew` |
+
+## Errors
+
+`LiveError::Hub { code }` carries the hub's code: `auth`, `schema`, `channel`, `rate`, `frame`, `duplicate`, `kicked`, `banned`, `account-deleted` or `credentials-changed`. `LiveError::is_fatal` is true for the codes after which reconnecting cannot help (`auth`, `duplicate`, `kicked`, `banned`, `account-deleted`, `credentials-changed`). The other variants are `FrameTooLarge`, `ReservedType`, `InvalidDescriptor`, `Connect`, `Timeout`, `Renew`, `Protocol` and `Closed`. See [on the socket](/guides/live-rooms#on-the-socket) for what each hub code means.
+
+## Reconnecting
+
+A ticket works once. To reconnect after a dropped socket, give the client a function that gets a fresh one from your server:
+
+```rust
+use liveengine::{
+    hub::HubClient,
+    live_client::{LiveClient, LiveClientOptions, LiveDescriptor},
+};
+
+async fn join(hub: HubClient, descriptor: LiveDescriptor) -> Result<LiveClient, Box<dyn std::error::Error>> {
+    let renewing = hub.clone();
+    let options = LiveClientOptions::default().with_renew(move || {
+        let hub = renewing.clone();
+        async move { hub.ticket(&[], "game", "bot-1", "room-1", "peer", None).await }
+    });
+    let (client, _events) = LiveClient::connect(descriptor, options).await?;
+    Ok(client)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let hub = HubClient::new("http://127.0.0.1:8787", std::env::var("LIVEENGINE_TOKEN")?)?;
+    let first = hub.ticket(&[], "game", "bot-1", "room-1", "peer", None).await?;
+    let client = join(hub, LiveDescriptor::from_value(&first)?).await?;
+    client.close().await;
+    Ok(())
+}
+```
+
+After a drop the client emits `Reconnecting`, calls `renew`, connects again with backoff and emits `Welcome { reconnected: true, .. }`. The presence changes it missed arrive first as `Join` and `Leave` events, so `peers()` and your own view of the room stay right. Frames sent while it reconnects are written to the new socket first. A reconnect that lands within the hub's resume window (`LIVEENGINE_LIVE_RESUME_MILLIS`, 500 ms) is invisible to the other peers.
+
+Without `renew`, a dropped socket ends with `Closed`, and the caller pairs again. A fatal hub error ends the connection either way.
+
+## Round-trip time
+
+When the hub's welcome carries `"pong": true` (0.5 and newer), the client sends `{"type":"ping","id":n}` every `rtt_interval` and the hub answers `{"type":"pong","id":n}` itself; the probe never reaches another peer. Each answer updates `rtt()` and emits `LiveEvent::Rtt`. An older hub is never probed. Keep-alive needs nothing from you: the WebSocket layer answers the hub's own pings.

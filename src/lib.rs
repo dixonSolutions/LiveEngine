@@ -14,6 +14,8 @@ pub mod links;
 #[cfg(feature = "host")]
 pub mod live;
 #[cfg(feature = "host")]
+pub mod live_client;
+#[cfg(feature = "host")]
 pub mod live_registry;
 #[cfg(feature = "node")]
 mod node;

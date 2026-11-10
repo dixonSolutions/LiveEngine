@@ -131,6 +131,7 @@
             "pages": [
               "rust/engine",
               "rust/hub",
+              "rust/live-client",
               "rust/config"
             ]
           },
