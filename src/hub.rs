@@ -118,6 +118,224 @@ pub struct HubConfig {
     pub turn_secret: Option<String>,
     /// Seed for engines created by internal hub registrations.
     pub seed: u64,
+    /// Size, rate and timing limits for live connections.
+    pub live_limits: LiveLimits,
+    /// Password hashing, session and login-throttle settings for local accounts.
+    pub account_limits: AccountLimits,
+}
+
+/// Largest value accepted for any [`LiveLimits`] count or time unit.
+const MAX_LIVE_LIMIT: usize = 16_777_216;
+
+/// Limits for live room and link connections.
+///
+/// [`Default`] reads each field from its `LIVEENGINE_*` environment variable, falling back to
+/// the built-in value when the variable is unset or not a positive integer, and caps values at
+/// 16777216. [`HubConfig::from_env`] instead refuses an invalid variable. Values set in code
+/// are checked once by [`HubService::new`]: every field must be between 1 and 16777216 (for
+/// durations, in the unit named on the field).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveLimits {
+    /// Live connections open at once on the service (`LIVEENGINE_LIVE_MAX_CONNECTIONS`, 4096).
+    pub max_connections: usize,
+    /// Live connections in one room (`LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM`, 256).
+    pub max_connections_per_room: usize,
+    /// Live sockets from one client address that have not yet authenticated
+    /// (`LIVEENGINE_LIVE_MAX_PREAUTH_PER_IP`, 16). Applies to `/v1/live` and `/v1/live/registry`.
+    pub max_preauth_per_ip: usize,
+    /// Largest frame a peer may send (`LIVEENGINE_LIVE_MAX_FRAME_BYTES`, 65536).
+    pub max_frame_bytes: usize,
+    /// Frames queued for one peer before reliable delivery disconnects it
+    /// (`LIVEENGINE_LIVE_SEND_QUEUE`, 64).
+    pub send_queue: usize,
+    /// A peer silent this long is disconnected, in seconds (`LIVEENGINE_LIVE_IDLE_SECONDS`, 60).
+    pub idle: Duration,
+    /// Interval between server pings, in seconds (`LIVEENGINE_LIVE_PING_SECONDS`, 20).
+    pub ping: Duration,
+    /// Frames per second one peer may send (`LIVEENGINE_LIVE_MESSAGES_PER_SECOND`, 100).
+    pub messages_per_second: usize,
+    /// Bytes per second one peer may send (`LIVEENGINE_LIVE_BYTES_PER_SECOND`, 1048576).
+    pub bytes_per_second: usize,
+    /// How long a dropped peer may reconnect without a leave, in milliseconds
+    /// (`LIVEENGINE_LIVE_RESUME_MILLIS`, 500).
+    pub resume: Duration,
+    /// Largest signalling frame (`LIVEENGINE_SIGNAL_MAX_BYTES`, 16384).
+    pub signal_max_bytes: usize,
+    /// Frames per second one link may carry (`LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND`, 2000).
+    pub link_messages_per_second: usize,
+    /// Bytes per second one link may carry (`LIVEENGINE_LINK_MAX_BYTES_PER_SECOND`, 16777216).
+    pub link_bytes_per_second: usize,
+}
+
+impl LiveLimits {
+    /// The built-in values, ignoring the environment.
+    pub fn builtin() -> Self {
+        Self {
+            max_connections: 4096,
+            max_connections_per_room: 256,
+            max_preauth_per_ip: 16,
+            max_frame_bytes: 65536,
+            send_queue: 64,
+            idle: Duration::from_secs(60),
+            ping: Duration::from_secs(20),
+            messages_per_second: 100,
+            bytes_per_second: 1_048_576,
+            resume: Duration::from_millis(500),
+            signal_max_bytes: 16384,
+            link_messages_per_second: 2000,
+            link_bytes_per_second: 16_777_216,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let fields = [
+            ("max_connections", self.max_connections as u128),
+            (
+                "max_connections_per_room",
+                self.max_connections_per_room as u128,
+            ),
+            ("max_preauth_per_ip", self.max_preauth_per_ip as u128),
+            ("max_frame_bytes", self.max_frame_bytes as u128),
+            ("send_queue", self.send_queue as u128),
+            ("idle", self.idle.as_secs() as u128),
+            ("ping", self.ping.as_secs() as u128),
+            ("messages_per_second", self.messages_per_second as u128),
+            ("bytes_per_second", self.bytes_per_second as u128),
+            ("resume", self.resume.as_millis()),
+            ("signal_max_bytes", self.signal_max_bytes as u128),
+            (
+                "link_messages_per_second",
+                self.link_messages_per_second as u128,
+            ),
+            ("link_bytes_per_second", self.link_bytes_per_second as u128),
+        ];
+        for (name, value) in fields {
+            if value == 0 || value > MAX_LIVE_LIMIT as u128 {
+                return Err(format!(
+                    "live limit {name} must be between 1 and {MAX_LIVE_LIMIT}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for LiveLimits {
+    fn default() -> Self {
+        let builtin = Self::builtin();
+        let read = |name: &str, default: usize| crate::live::limit(name, default);
+        Self {
+            max_connections: read("LIVEENGINE_LIVE_MAX_CONNECTIONS", builtin.max_connections),
+            max_connections_per_room: read(
+                "LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM",
+                builtin.max_connections_per_room,
+            ),
+            max_preauth_per_ip: read(
+                "LIVEENGINE_LIVE_MAX_PREAUTH_PER_IP",
+                builtin.max_preauth_per_ip,
+            ),
+            max_frame_bytes: read("LIVEENGINE_LIVE_MAX_FRAME_BYTES", builtin.max_frame_bytes),
+            send_queue: read("LIVEENGINE_LIVE_SEND_QUEUE", builtin.send_queue),
+            idle: Duration::from_secs(read(
+                "LIVEENGINE_LIVE_IDLE_SECONDS",
+                builtin.idle.as_secs() as usize,
+            ) as u64),
+            ping: Duration::from_secs(read(
+                "LIVEENGINE_LIVE_PING_SECONDS",
+                builtin.ping.as_secs() as usize,
+            ) as u64),
+            messages_per_second: read(
+                "LIVEENGINE_LIVE_MESSAGES_PER_SECOND",
+                builtin.messages_per_second,
+            ),
+            bytes_per_second: read("LIVEENGINE_LIVE_BYTES_PER_SECOND", builtin.bytes_per_second),
+            resume: Duration::from_millis(read(
+                "LIVEENGINE_LIVE_RESUME_MILLIS",
+                builtin.resume.as_millis() as usize,
+            ) as u64),
+            signal_max_bytes: read("LIVEENGINE_SIGNAL_MAX_BYTES", builtin.signal_max_bytes),
+            link_messages_per_second: read(
+                "LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND",
+                builtin.link_messages_per_second,
+            ),
+            link_bytes_per_second: read(
+                "LIVEENGINE_LINK_MAX_BYTES_PER_SECOND",
+                builtin.link_bytes_per_second,
+            ),
+        }
+    }
+}
+
+/// Settings for local accounts and their sessions.
+///
+/// [`Default`] reads each field from its `LIVEENGINE_*` environment variable, using the
+/// built-in value when the variable is unset. [`HubService::new`] refuses a value outside the
+/// bounds named on each field, including an unparseable variable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountLimits {
+    /// PBKDF2 iterations for new password hashes, 100000 to 10000000
+    /// (`LIVEENGINE_PASSWORD_ITERATIONS`, 310000).
+    pub password_iterations: u32,
+    /// Lifetime of a login session, 1 second to 365 days
+    /// (`LIVEENGINE_SESSION_TTL_SECONDS`, 43200).
+    pub session_ttl: Duration,
+    /// Failed or in-flight logins one username may hold in the throttle window, 1 to 1000
+    /// (`LIVEENGINE_LOGIN_MAX_FAILURES`, 5). An address gets ten times this.
+    pub login_max_failures: u32,
+}
+
+impl AccountLimits {
+    /// The built-in values, ignoring the environment.
+    pub fn builtin() -> Self {
+        Self {
+            password_iterations: 310_000,
+            session_ttl: Duration::from_secs(43_200),
+            login_max_failures: 5,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if !(100_000..=10_000_000).contains(&self.password_iterations) {
+            return Err("invalid LIVEENGINE_PASSWORD_ITERATIONS".into());
+        }
+        if !(1..=31_536_000).contains(&self.session_ttl.as_secs())
+            || self.session_ttl.subsec_nanos() != 0
+        {
+            return Err("invalid LIVEENGINE_SESSION_TTL_SECONDS".into());
+        }
+        if !(1..=1000).contains(&self.login_max_failures) {
+            return Err("invalid LIVEENGINE_LOGIN_MAX_FAILURES".into());
+        }
+        Ok(())
+    }
+}
+
+impl Default for AccountLimits {
+    fn default() -> Self {
+        // An unparseable variable becomes 0, which validation refuses, as it always has.
+        let read = |name: &str, default: u64| match std::env::var(name) {
+            Ok(value) => value.parse::<u64>().unwrap_or(0),
+            Err(std::env::VarError::NotPresent) => default,
+            Err(_) => 0,
+        };
+        let builtin = Self::builtin();
+        Self {
+            password_iterations: u32::try_from(read(
+                "LIVEENGINE_PASSWORD_ITERATIONS",
+                builtin.password_iterations.into(),
+            ))
+            .unwrap_or(0),
+            session_ttl: Duration::from_secs(read(
+                "LIVEENGINE_SESSION_TTL_SECONDS",
+                builtin.session_ttl.as_secs(),
+            )),
+            login_max_failures: u32::try_from(read(
+                "LIVEENGINE_LOGIN_MAX_FAILURES",
+                builtin.login_max_failures.into(),
+            ))
+            .unwrap_or(0),
+        }
+    }
 }
 
 impl Default for HubConfig {
@@ -154,6 +372,8 @@ impl Default for HubConfig {
             ice_servers: Vec::new(),
             turn_secret: None,
             seed: 0,
+            live_limits: LiveLimits::default(),
+            account_limits: AccountLimits::default(),
         }
     }
 }
@@ -307,6 +527,8 @@ impl HubConfig {
         {
             return Err("hub limits and timeouts must be greater than zero".into());
         }
+        self.live_limits.validate()?;
+        self.account_limits.validate()?;
         Ok(())
     }
 }
@@ -771,7 +993,8 @@ impl HubService {
                         .as_ref()
                         .map(|s| s.accounts.clone())
                         .unwrap_or_default(),
-                )?),
+                    &config.account_limits,
+                )),
                 config,
                 hubs: RwLock::new(HashMap::new()),
                 schemas: Arc::new(RwLock::new(HashMap::from([(
@@ -850,6 +1073,27 @@ impl HubService {
         room: &str,
     ) -> Result<TicketClaims, &'static str> {
         self.inner.ticket_signer.verify(ticket, hub_path, room)
+    }
+
+    /// Serve one live peer over a caller-supplied [`LiveTransport`], for transports other
+    /// than the built-in WebSocket at `/v1/live`.
+    ///
+    /// The peer must send `{"type":"auth","ticket":...}` as its first frame within 5 seconds,
+    /// with a ticket issued by this service, and is then served exactly as a WebSocket peer:
+    /// the same ticket, pairing and credential checks, channel rules and every
+    /// [`LiveLimits`] apply, and the connection counts towards `max_connections`. When
+    /// `remote` is given, the connection also counts against that address's
+    /// `max_preauth_per_ip` until it authenticates; pass `None` when the transport has no
+    /// client address. A refused connection receives `{"type":"error","code":...}` and is
+    /// closed. The future completes when the connection ends; spawn it per connection.
+    ///
+    /// [`LiveTransport`]: crate::transport::LiveTransport
+    pub async fn serve_live_transport<T>(&self, transport: T, remote: Option<std::net::IpAddr>)
+    where
+        T: crate::transport::LiveTransport,
+    {
+        start_reaper(&self.inner);
+        crate::live::serve_transport(self.inner.clone(), transport, remote).await;
     }
 
     /// Create or verify the initial durable snapshot before accepting requests.
@@ -1684,6 +1928,13 @@ pub(crate) fn pair_wait(config: &HubConfig, body: &Value) -> Duration {
         .min(config.max_pair_wait)
 }
 
+/// The key a client is counted under by the rate limiter and the live pre-auth cap: the
+/// connecting socket's IP address, or one shared key when the server records none.
+pub(crate) fn client_key(peer: Option<SocketAddr>) -> String {
+    peer.map(|p| p.ip().to_string())
+        .unwrap_or_else(|| "unavailable-peer".to_string())
+}
+
 async fn secure_request(
     State(state): State<Arc<Inner>>,
     request: Request<Body>,
@@ -1693,11 +1944,12 @@ async fn secure_request(
     if matches!(request.uri().path(), "/health" | "/v1/ping") {
         return next.run(request).await;
     }
-    let peer = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|c| c.0.ip().to_string())
-        .unwrap_or_else(|| "unavailable-peer".to_string());
+    let peer = client_key(
+        request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0),
+    );
     if !take_rate_slot(&state, peer) {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded");
     }

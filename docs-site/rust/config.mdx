@@ -41,6 +41,9 @@ pub struct HubConfig {
     pub live_allowed_origins: Vec<String>,
     pub ice_servers: Vec<serde_json::Value>,
     pub turn_secret: Option<String>,
+    // Live connection and account limits
+    pub live_limits: LiveLimits,
+    pub account_limits: AccountLimits,
 }
 ```
 
@@ -75,8 +78,60 @@ pub struct HubConfig {
 | `live_allowed_origins` | `Vec<String>` | empty |
 | `ice_servers` | `Vec<Value>` | empty |
 | `turn_secret` | `Option<String>` | `None` |
+| `live_limits` | `LiveLimits` | from the environment, see below |
+| `account_limits` | `AccountLimits` | from the environment, see below |
 
 The last nine fields map to `LIVEENGINE_MAX_DEPTH`, `LIVEENGINE_LIVE_TREE_DEPTH`, `LIVEENGINE_INSTANCE_ID`, `LIVEENGINE_STATE_FILE`, `LIVEENGINE_TICKET_TTL_SECONDS`, `LIVEENGINE_PUBLIC_URL`, `LIVEENGINE_LIVE_ALLOWED_ORIGINS`, `LIVEENGINE_ICE_SERVERS` and `LIVEENGINE_TURN_SECRET`. See [live rooms](/guides/live-rooms), [nested hubs](/guides/nesting) and [peer-to-peer](/guides/peer-to-peer).
+
+## Live and account limits
+
+`live_limits` and `account_limits` hold the limits that were previously read only from the environment. `LiveLimits::default()` and `AccountLimits::default()` (and so `HubConfig::default()`) read each field from its variable, so existing deployments behave as before; set a field in code to override it. `LiveLimits::builtin()` and `AccountLimits::builtin()` return the built-in values without reading the environment. The hub reads these values from the config, checked once by `HubService::new`, and no longer reads the variables for each connection or frame.
+
+| `LiveLimits` field | Type | Variable | Default |
+| --- | --- | --- | --- |
+| `max_connections` | `usize` | `LIVEENGINE_LIVE_MAX_CONNECTIONS` | `4096` |
+| `max_connections_per_room` | `usize` | `LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM` | `256` |
+| `max_preauth_per_ip` | `usize` | `LIVEENGINE_LIVE_MAX_PREAUTH_PER_IP` | `16` |
+| `max_frame_bytes` | `usize` | `LIVEENGINE_LIVE_MAX_FRAME_BYTES` | `65536` |
+| `send_queue` | `usize` | `LIVEENGINE_LIVE_SEND_QUEUE` | `64` |
+| `idle` | `Duration` | `LIVEENGINE_LIVE_IDLE_SECONDS` | 60 seconds |
+| `ping` | `Duration` | `LIVEENGINE_LIVE_PING_SECONDS` | 20 seconds |
+| `messages_per_second` | `usize` | `LIVEENGINE_LIVE_MESSAGES_PER_SECOND` | `100` |
+| `bytes_per_second` | `usize` | `LIVEENGINE_LIVE_BYTES_PER_SECOND` | `1048576` |
+| `resume` | `Duration` | `LIVEENGINE_LIVE_RESUME_MILLIS` | 500 milliseconds |
+| `signal_max_bytes` | `usize` | `LIVEENGINE_SIGNAL_MAX_BYTES` | `16384` |
+| `link_messages_per_second` | `usize` | `LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND` | `2000` |
+| `link_bytes_per_second` | `usize` | `LIVEENGINE_LINK_MAX_BYTES_PER_SECOND` | `16777216` |
+
+Every live limit must be between 1 and 16777216; durations count in the unit their variable names (seconds, or milliseconds for `resume`). As before, the default falls back to the built-in value when a variable is unset or is not a positive integer and caps larger values at 16777216, while `from_env` refuses an invalid variable. `max_preauth_per_ip` bounds the `/v1/live` and `/v1/live/registry` sockets one client address may hold before they authenticate, counted by the same address as the HTTP rate limit; a socket over it is refused with `503` and `live pre-auth capacity reached for this address`.
+
+| `AccountLimits` field | Type | Variable | Default | Bounds |
+| --- | --- | --- | --- | --- |
+| `password_iterations` | `u32` | `LIVEENGINE_PASSWORD_ITERATIONS` | `310000` | 100000 to 10000000 |
+| `session_ttl` | `Duration` | `LIVEENGINE_SESSION_TTL_SECONDS` | 12 hours | 1 second to 365 days, whole seconds |
+| `login_max_failures` | `u32` | `LIVEENGINE_LOGIN_MAX_FAILURES` | `5` | 1 to 1000 |
+
+An account variable that is set but invalid makes `HubService::new` fail, as before.
+
+```rust
+use liveengine::hub::{HubConfig, HubService, LiveLimits};
+use std::time::Duration;
+
+fn main() -> Result<(), String> {
+    let service = HubService::new(HubConfig {
+        token: "replace-with-a-secret-of-24-bytes-or-more".into(),
+        live_limits: LiveLimits {
+            max_connections_per_room: 32,
+            max_preauth_per_ip: 8,
+            idle: Duration::from_secs(30),
+            ..LiveLimits::default()
+        },
+        ..HubConfig::default()
+    })?;
+    let _ = service;
+    Ok(())
+}
+```
 
 ## Build programmatically
 
@@ -148,6 +203,7 @@ A missing optional variable keeps the default.
 - `token.len() < 24` (bytes, not characters)
 - any of `max_hubs`, `max_request_bytes`, `max_response_bytes`, `max_args`, `max_entities`, `max_events`, `max_generates_per_call`, `max_inflight_calls`, `rate_limit_requests`, or `rate_limit_peers` is zero
 - `rate_limit_window` or `request_timeout` is zero
+- a `live_limits` field is outside 1 to 16777216, or an `account_limits` field is outside its bounds
 
 Failure returns a `String`:
 

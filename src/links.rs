@@ -424,6 +424,7 @@ async fn connect(state: Arc<Inner>, entry: &Arc<Entry>) -> bool {
     };
     entry.status.store(1, Ordering::Relaxed);
     let weak = Arc::downgrade(&state);
+    let link_budget = live::link_budget(&state.config.live_limits);
     drop(state);
     let name = format!("out:{}", d.id);
     let generation = attach.as_ref().map_or(0, |a| a.generation);
@@ -455,7 +456,7 @@ async fn connect(state: Arc<Inner>, entry: &Arc<Entry>) -> bool {
                 msg = socket.next() => { last_frame = tokio::time::Instant::now(); match msg { Some(Ok(Message::Text(s))) => {
                     if window.elapsed() >= Duration::from_secs(1) { window = tokio::time::Instant::now(); bytes = 0; count = 0; }
                     bytes += s.len(); count += 1;
-                    let (max_count, max_bytes) = if bridge.is_some() { live::link_budget() } else { (100, 1_048_576) };
+                    let (max_count, max_bytes) = if bridge.is_some() { link_budget } else { (100, 1_048_576) };
                     if bytes > max_bytes || (count > max_count && bridge.is_none()) { break; }
                     let over_budget = count > max_count;
                     if let (Some(key), Ok(value)) = (&bridge, serde_json::from_str::<serde_json::Value>(&s)) {

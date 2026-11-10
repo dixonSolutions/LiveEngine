@@ -1,6 +1,6 @@
 #![cfg(feature = "host")]
 use liveengine::{
-    hub::{HubConfig, HubService},
+    hub::{AccountLimits, HubConfig, HubService, LiveLimits},
     live::TicketSigner,
 };
 use serde_json::{json, Value};
@@ -262,16 +262,27 @@ mod sockets {
         ice_servers: Vec<Value>,
         turn_secret: Option<String>,
     ) -> Fixture {
-        let service = HubService::new(HubConfig {
+        setup_with(
+            HubConfig {
+                ice_servers,
+                turn_secret,
+                ..config(ttl)
+            },
+            channels,
+        )
+        .await
+    }
+    fn config(ttl: u64) -> HubConfig {
+        HubConfig {
             token: TOKEN.into(),
             public_url: Some("ws://localhost/v1/live".into()),
             ticket_ttl: Duration::from_secs(ttl),
             live_allowed_origins: vec!["https://allowed.test".into()],
-            ice_servers,
-            turn_secret,
             ..HubConfig::default()
-        })
-        .unwrap();
+        }
+    }
+    async fn setup_with(config: HubConfig, channels: Option<Value>) -> Fixture {
+        let service = HubService::new(config).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -838,5 +849,104 @@ mod sockets {
                 }
             }
         }
+    }
+    #[tokio::test]
+    async fn limits_set_in_code_are_enforced_without_env() {
+        for name in [
+            "LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM",
+            "LIVEENGINE_LIVE_MAX_PREAUTH_PER_IP",
+        ] {
+            assert!(std::env::var_os(name).is_none(), "{name} is set");
+        }
+        let f = setup_with(
+            HubConfig {
+                live_limits: LiveLimits {
+                    max_connections_per_room: 1,
+                    ..LiveLimits::builtin()
+                },
+                ..config(60)
+            },
+            None,
+        )
+        .await;
+        let mut a = auth(&f, &ticket(&f, "alice").await).await;
+        read(&mut a).await;
+        let mut b = auth(&f, &ticket(&f, "bob").await).await;
+        assert_eq!(read(&mut b).await, json!({"type":"error","code":"rate"}));
+        closed(&mut b).await;
+    }
+    #[tokio::test]
+    async fn invalid_limits_set_in_code_are_refused() {
+        for limits in [
+            LiveLimits {
+                max_preauth_per_ip: 0,
+                ..LiveLimits::builtin()
+            },
+            LiveLimits {
+                idle: Duration::ZERO,
+                ..LiveLimits::builtin()
+            },
+            LiveLimits {
+                max_frame_bytes: 16_777_217,
+                ..LiveLimits::builtin()
+            },
+        ] {
+            assert!(HubService::new(HubConfig {
+                live_limits: limits,
+                ..config(60)
+            })
+            .is_err());
+        }
+        assert!(HubService::new(HubConfig {
+            account_limits: AccountLimits {
+                password_iterations: 1,
+                ..AccountLimits::builtin()
+            },
+            ..config(60)
+        })
+        .is_err());
+    }
+    #[tokio::test]
+    async fn unauthenticated_sockets_are_capped_per_address() {
+        let f = setup_with(
+            HubConfig {
+                live_limits: LiveLimits {
+                    max_preauth_per_ip: 2,
+                    ..LiveLimits::builtin()
+                },
+                ..config(60)
+            },
+            None,
+        )
+        .await;
+        let (first, _) = connect_async(&f.ws).await.unwrap();
+        let (_second, _) = connect_async(&f.ws).await.unwrap();
+        let refused = connect_async(&f.ws).await.unwrap_err();
+        assert!(
+            matches!(&refused, tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 503),
+            "{refused:?}"
+        );
+        let registry = f.ws.replace("/v1/live", "/v1/live/registry");
+        assert!(connect_async(&registry).await.is_err());
+        // Closing a pending socket frees its slot, and so does authenticating.
+        drop(first);
+        let mut admitted = None;
+        for _ in 0..50 {
+            if let Ok((socket, _)) = connect_async(&f.ws).await {
+                admitted = Some(socket);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut a = admitted.expect("closing a pending socket did not free its slot");
+        a.send(Message::Text(
+            json!({"type":"auth","ticket":ticket(&f, "alice").await})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(read(&mut a).await["type"], "welcome");
+        let (_third, _) = connect_async(&f.ws).await.unwrap();
     }
 }

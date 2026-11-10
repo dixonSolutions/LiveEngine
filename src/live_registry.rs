@@ -252,6 +252,7 @@ pub(crate) async fn issue_watch(state: Arc<Inner>, body: Value) -> Response {
 
 pub(crate) async fn registry_socket(
     State(state): State<Arc<Inner>>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
@@ -270,6 +271,9 @@ pub(crate) async fn registry_socket(
             return error(StatusCode::FORBIDDEN, "origin not allowed");
         }
     }
+    let Some(preauth) = crate::live::pre_auth_slot(&state, peer.map(|p| p.0 .0)) else {
+        return crate::live::pre_auth_refusal();
+    };
     let slots = state.registry_subscribers.clone();
     let Ok(permit) = slots.try_acquire_owned() else {
         return error(
@@ -281,7 +285,7 @@ pub(crate) async fn registry_socket(
         .max_frame_size(state.config.max_request_bytes)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            serve(state, socket, forward_trace).await;
+            serve(state, socket, forward_trace, preauth).await;
         })
         .into_response()
 }
@@ -304,7 +308,13 @@ async fn send(socket: &mut WebSocket, value: Value) -> bool {
     .await
     .is_ok_and(|v| v.is_ok())
 }
-async fn serve(root: Arc<Inner>, mut socket: WebSocket, forward_trace: String) {
+/// `preauth` is released once the subscriber has authenticated.
+async fn serve(
+    root: Arc<Inner>,
+    mut socket: WebSocket,
+    forward_trace: String,
+    preauth: crate::live::PreAuthPermit,
+) {
     let Some(auth) = receive(&mut socket).await else {
         return;
     };
@@ -339,6 +349,7 @@ async fn serve(root: Arc<Inner>, mut socket: WebSocket, forward_trace: String) {
         }
         Some(claims)
     };
+    drop(preauth);
     let request_value = if auth.get("path").is_some() {
         auth
     } else {

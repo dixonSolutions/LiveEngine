@@ -6,6 +6,14 @@
 
 - Prevent immediate peer pairing requests from seating registered peers that have not requested a pair.
 
+- Add `HubConfig::live_limits` (`LiveLimits`) and `HubConfig::account_limits` (`AccountLimits`) so embedders can set live connection, frame, rate, timing, link and account limits in code. Their defaults still come from the same `LIVEENGINE_*` variables; values are checked once by `HubService::new` and no longer read from the environment on every connection or frame.
+
+- Cap unauthenticated `/v1/live` and `/v1/live/registry` sockets per client address (`LiveLimits::max_preauth_per_ip`, `LIVEENGINE_LIVE_MAX_PREAUTH_PER_IP`, default 16), counted by the same address as the HTTP rate limit, so one client cannot hold all pre-auth capacity; over the cap the upgrade is refused with `503`.
+
+- Keep consumed ticket and receipt ids in expiry order, so verifying a ticket no longer scans the whole replay cache and a cache full of expired ids accepts a fresh ticket. Replay protection is unchanged.
+
+- Add `HubService::serve_live_transport` to serve a live peer over a caller-supplied `LiveTransport` with the same authentication and limits as `/v1/live`, and `LiveTransport::name` for the transport shown in the connection listing.
+
 ## 0.4.0 — 2026-11-09
 
 - Gogh Strike: a sign-in area in the Play online panel (opt-in `GOGH_HUB_AUTH_PASSWORD`, `npm run dev:gogh -- --password`), `hubSession` and `explainHubError` in the live client, a `password` route in the hub API, and end-to-end scenarios 16 to 23. Fixes found on the way: the admin console's create form threw after creating an account, an external hub's accounts now live on the remote service, logging out a session the service already ended clears the cookie, honest parallel logins from one address are no longer refused, and password-hub pairings no longer leave a peer waiting while a room has space.

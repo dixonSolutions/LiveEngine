@@ -82,28 +82,18 @@ pub(crate) struct Accounts {
     #[cfg(test)]
     verifications: std::sync::atomic::AtomicUsize,
 }
-fn setting(name: &str, default: u64, min: u64, max: u64) -> Result<u64, String> {
-    match std::env::var(name) {
-        Ok(v) => v
-            .parse::<u64>()
-            .ok()
-            .filter(|n| *n >= min && *n <= max)
-            .ok_or_else(|| format!("invalid {name}")),
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(_) => Err(format!("invalid {name}")),
-    }
-}
 impl Accounts {
-    pub fn new(data: Data) -> Result<Self, String> {
-        Ok(Self {
+    /// `limits` were validated with the rest of the `HubConfig`.
+    pub fn new(data: Data, limits: &crate::hub::AccountLimits) -> Self {
+        Self {
             data: RwLock::new(data),
             failures: Default::default(),
             #[cfg(test)]
             verifications: Default::default(),
-            iterations: setting("LIVEENGINE_PASSWORD_ITERATIONS", 310000, 100000, 10000000)? as u32,
-            ttl: setting("LIVEENGINE_SESSION_TTL_SECONDS", 43200, 1, 31536000)?,
-            max_failures: setting("LIVEENGINE_LOGIN_MAX_FAILURES", 5, 1, 1000)? as u32,
-        })
+            iterations: limits.password_iterations,
+            ttl: limits.session_ttl.as_secs(),
+            max_failures: limits.login_max_failures,
+        }
     }
     /// Most attempts one key may hold, in flight or failed, within the window. A username gets
     /// `max_failures`. An address gets ten times that, because many people share one (a hub API in

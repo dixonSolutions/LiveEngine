@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::Arc;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -151,16 +152,54 @@ struct Receipt {
 }
 const RECEIPT_TTL_SECONDS: u64 = 30;
 
+/// Ids of consumed tickets and receipts, each kept until it expires.
+///
+/// Ids are ordered by expiry, so expired ones are dropped from the front as they are seen and
+/// a check costs amortised `O(log n)` however full the guard is.
+struct ReplayGuard {
+    expiries: BinaryHeap<Reverse<(u64, String)>>,
+    ids: HashSet<String>,
+    capacity: usize,
+}
+impl ReplayGuard {
+    fn new(capacity: usize) -> Self {
+        Self {
+            expiries: BinaryHeap::new(),
+            ids: HashSet::new(),
+            capacity,
+        }
+    }
+    /// Record `id` as used until `expiry`. Ids whose expiry is at or before `now` are dropped
+    /// first. Refused when `id` is still recorded or `capacity` unexpired ids are held.
+    fn consume(&mut self, id: String, expiry: u64, now: u64) -> bool {
+        while self
+            .expiries
+            .peek()
+            .is_some_and(|Reverse((at, _))| *at <= now)
+        {
+            if let Some(Reverse((_, expired))) = self.expiries.pop() {
+                self.ids.remove(&expired);
+            }
+        }
+        if self.ids.contains(&id) || self.ids.len() >= self.capacity {
+            return false;
+        }
+        self.ids.insert(id.clone());
+        self.expiries.push(Reverse((expiry, id)));
+        true
+    }
+}
+
 /// A service-local signer and replay guard. Its key must remain private.
 pub struct TicketSigner {
     key: [u8; 32],
-    used: Mutex<HashMap<String, u64>>,
+    used: Mutex<ReplayGuard>,
 }
 impl TicketSigner {
     pub fn new(key: [u8; 32]) -> Self {
         Self {
             key,
-            used: Mutex::new(HashMap::new()),
+            used: Mutex::new(ReplayGuard::new(MAX_USED)),
         }
     }
     pub fn random_key() -> [u8; 32] {
@@ -298,12 +337,9 @@ impl TicketSigner {
             return Err(REFUSED);
         }
         let mut used = self.used.lock().map_err(|_| "ticket guard unavailable")?;
-        used.retain(|_, expiry| *expiry > now);
-        let key = format!("receipt:{}", receipt.jti);
-        if used.contains_key(&key) || used.len() >= MAX_USED {
+        if !used.consume(format!("receipt:{}", receipt.jti), receipt.expiry, now) {
             return Err(REFUSED);
         }
-        used.insert(key, receipt.expiry);
         Ok((receipt.identity, receipt.credential_generation))
     }
     /// Verify signature, expiry and binding, consuming the ticket on success.
@@ -350,11 +386,9 @@ impl TicketSigner {
             return Err("invalid ticket");
         }
         let mut used = self.used.lock().map_err(|_| "ticket guard unavailable")?;
-        used.retain(|_, expiry| *expiry > now);
-        if used.contains_key(&claims.jti) || used.len() >= MAX_USED {
+        if !used.consume(claims.jti.clone(), claims.expiry, now) {
             return Err("ticket already used or capacity reached");
         }
-        used.insert(claims.jti.clone(), claims.expiry);
         Ok(claims)
     }
 }
@@ -849,6 +883,42 @@ pub(crate) struct LiveRooms {
     dropped: std::sync::atomic::AtomicU64,
     /// Linked frames or presence refused by wire, channel or schema rules.
     rejected: std::sync::atomic::AtomicU64,
+    /// Sockets not yet authenticated, by client key.
+    preauth: Mutex<HashMap<String, usize>>,
+}
+impl LiveRooms {
+    /// Reserve a pre-authentication slot for one client, or `None` when it holds `max` already.
+    pub(crate) fn pre_auth(self: &Arc<Self>, key: String, max: usize) -> Option<PreAuthPermit> {
+        let mut counts = self.preauth.lock().unwrap_or_else(|e| e.into_inner());
+        let count = counts.entry(key.clone()).or_default();
+        if *count >= max {
+            if *count == 0 {
+                counts.remove(&key);
+            }
+            return None;
+        }
+        *count += 1;
+        Some(PreAuthPermit {
+            live: self.clone(),
+            key,
+        })
+    }
+}
+/// A socket counted against its client's pre-authentication cap until dropped.
+pub(crate) struct PreAuthPermit {
+    live: Arc<LiveRooms>,
+    key: String,
+}
+impl Drop for PreAuthPermit {
+    fn drop(&mut self) {
+        let mut counts = self.live.preauth.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = counts.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.key);
+            }
+        }
+    }
 }
 type Validators = HashMap<String, Arc<jsonschema::Validator>>;
 
@@ -1034,7 +1104,7 @@ pub(crate) async fn attach_link(
     link_id: &str,
 ) -> Option<LinkAttach> {
     resolve(state, &key.0).await?;
-    let (sender, rx) = mpsc::channel::<Message>(limit("LIVEENGINE_LIVE_SEND_QUEUE", 64));
+    let (sender, rx) = mpsc::channel::<Message>(state.config.live_limits.send_queue);
     let (disconnect, disconnected) = tokio::sync::watch::channel(None);
     let queue = PeerQueue {
         sender,
@@ -1424,6 +1494,7 @@ async fn ingest_presence(state: &Arc<Inner>, key: &RoomKey, via: &str, wire: &Va
 
 pub(crate) async fn live_socket(
     State(state): State<Arc<Inner>>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
@@ -1443,39 +1514,99 @@ pub(crate) async fn live_socket(
             return error(StatusCode::FORBIDDEN, "origin not allowed");
         }
     }
-    let live = state.live_rooms.clone();
-    // `AtomicUsize::try_update` is the named replacement for `fetch_update` but needs a newer
-    // Rust than the crate's declared minimum, so reserve the slot with a compare-exchange loop.
-    let max_connections = limit("LIVEENGINE_LIVE_MAX_CONNECTIONS", 4096);
-    let mut current = live.connections.load(std::sync::atomic::Ordering::SeqCst);
-    loop {
-        if current >= max_connections {
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "live connection capacity reached",
-            );
-        }
-        match live.connections.compare_exchange_weak(
-            current,
-            current + 1,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        ) {
-            Ok(_) => break,
-            Err(seen) => current = seen,
-        }
-    }
-    let permit = ConnectionPermit(live);
-    let frame_limit = limit("LIVEENGINE_LIVE_MAX_FRAME_BYTES", 65536);
+    let Some(preauth) = pre_auth_slot(&state, peer.map(|p| p.0 .0)) else {
+        return pre_auth_refusal();
+    };
+    let Some(permit) = ConnectionPermit::reserve(&state) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "live connection capacity reached",
+        );
+    };
+    let frame_limit = state.config.live_limits.max_frame_bytes;
     ws.max_message_size(frame_limit)
         .max_frame_size(frame_limit)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            serve_connection(state, socket).await
+            serve_connection(state, socket, Some(preauth)).await
         })
 }
 
+/// Serve one peer over a caller-supplied transport with the WebSocket path's limits. `remote`,
+/// when known, counts the connection against that address's pre-authentication cap.
+pub(crate) async fn serve_transport<T: LiveTransport>(
+    state: Arc<Inner>,
+    transport: T,
+    remote: Option<std::net::IpAddr>,
+) {
+    let preauth = match remote {
+        Some(ip) => match pre_auth_slot(&state, Some(std::net::SocketAddr::new(ip, 0))) {
+            Some(permit) => Some(permit),
+            None => {
+                refuse(transport, "rate").await;
+                return;
+            }
+        },
+        None => None,
+    };
+    let Some(_permit) = ConnectionPermit::reserve(&state) else {
+        refuse(transport, "rate").await;
+        return;
+    };
+    serve_connection(state, transport, preauth).await;
+}
+
+/// Count a new socket against its client's pre-authentication cap. A server mounted without
+/// `ConnectInfo` cannot tell clients apart, so the per-address cap is not applied there: one
+/// shared bucket would let sixteen slow clients lock everyone else out. The global connection
+/// cap and the authentication window still bound those sockets.
+pub(crate) fn pre_auth_slot(
+    state: &Inner,
+    peer: Option<std::net::SocketAddr>,
+) -> Option<PreAuthPermit> {
+    let limit = if peer.is_some() {
+        state.config.live_limits.max_preauth_per_ip
+    } else {
+        usize::MAX
+    };
+    state
+        .live_rooms
+        .pre_auth(crate::hub::client_key(peer), limit)
+}
+
+/// The refusal for a client holding its whole pre-authentication allowance.
+pub(crate) fn pre_auth_refusal() -> Response {
+    error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "live pre-auth capacity reached for this address",
+    )
+}
+
 struct ConnectionPermit(Arc<LiveRooms>);
+impl ConnectionPermit {
+    /// Reserve one of the service's live connection slots.
+    fn reserve(state: &Inner) -> Option<Self> {
+        let live = state.live_rooms.clone();
+        let max_connections = state.config.live_limits.max_connections;
+        // `AtomicUsize::try_update` is the named replacement for `fetch_update` but needs a newer
+        // Rust than the crate's declared minimum, so reserve the slot with a compare-exchange loop.
+        let mut current = live.connections.load(std::sync::atomic::Ordering::SeqCst);
+        loop {
+            if current >= max_connections {
+                return None;
+            }
+            match live.connections.compare_exchange_weak(
+                current,
+                current + 1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => return Some(Self(live)),
+                Err(seen) => current = seen,
+            }
+        }
+    }
+}
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
         self.0
@@ -1485,10 +1616,10 @@ impl Drop for ConnectionPermit {
 }
 
 /// Messages and bytes per second a link socket may carry.
-pub(crate) fn link_budget() -> (usize, usize) {
+pub(crate) fn link_budget(limits: &crate::hub::LiveLimits) -> (usize, usize) {
     (
-        limit("LIVEENGINE_LINK_MAX_MESSAGES_PER_SECOND", 2000),
-        limit("LIVEENGINE_LINK_MAX_BYTES_PER_SECOND", 16_777_216),
+        limits.link_messages_per_second,
+        limits.link_bytes_per_second,
     )
 }
 
@@ -1496,6 +1627,7 @@ pub(crate) fn validate_live_limits() -> Result<(), String> {
     for name in [
         "LIVEENGINE_LIVE_MAX_CONNECTIONS",
         "LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM",
+        "LIVEENGINE_LIVE_MAX_PREAUTH_PER_IP",
         "LIVEENGINE_LIVE_MAX_FRAME_BYTES",
         "LIVEENGINE_LIVE_SEND_QUEUE",
         "LIVEENGINE_LIVE_IDLE_SECONDS",
@@ -1516,7 +1648,8 @@ pub(crate) fn validate_live_limits() -> Result<(), String> {
     Ok(())
 }
 
-fn limit(name: &str, default: usize) -> usize {
+/// An environment limit as `LiveLimits::default` reads it: unset or invalid falls back.
+pub(crate) fn limit(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -1640,12 +1773,25 @@ async fn refuse<T: LiveTransport>(socket: T, code: &str) {
 }
 
 /// Serve one peer over any [`LiveTransport`].
-async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
+///
+/// `preauth` counts the socket against its client's pre-authentication cap and is released
+/// once the ticket is verified.
+async fn serve_connection<T: LiveTransport>(
+    state: Arc<Inner>,
+    mut socket: T,
+    preauth: Option<PreAuthPermit>,
+) {
+    let limits = &state.config.live_limits;
+    let transport = socket.name();
     let first = tokio::time::timeout(Duration::from_secs(5), socket.recv()).await;
     let Some(Ok(Message::Text(text))) = first.ok().flatten() else {
         refuse(socket, "auth").await;
         return;
     };
+    if text.len() > limits.max_frame_bytes {
+        refuse(socket, "auth").await;
+        return;
+    }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Auth {
@@ -1668,6 +1814,7 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
         refuse(socket, "auth").await;
         return;
     }
+    drop(preauth);
     let credential_generation = claims.credential_generation;
     let inherited_channels = claims.inherited_channels;
     let identity = claims.identity.map(Arc::new);
@@ -1718,7 +1865,7 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
         refuse(socket, "auth").await;
         return;
     };
-    let (tx, mut rx) = mpsc::channel::<Message>(limit("LIVEENGINE_LIVE_SEND_QUEUE", 64));
+    let (tx, mut rx) = mpsc::channel::<Message>(state.config.live_limits.send_queue);
     let (disconnect, mut disconnected) = tokio::sync::watch::channel(None);
     let error_tx = tx.clone();
     let info = ConnectionInfo {
@@ -1727,15 +1874,13 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
         room: key.1.clone(),
         user: user.clone(),
         role: claims.role.clone(),
-        transport: "websocket".into(),
+        transport: transport.into(),
         connected_at: now().unwrap_or_default(),
         remote: false,
     };
     {
         let mut rooms = state.live_rooms.rooms.lock().await;
-        if rooms.values().map(HashMap::len).sum::<usize>()
-            >= limit("LIVEENGINE_LIVE_MAX_CONNECTIONS", 4096)
-        {
+        if rooms.values().map(HashMap::len).sum::<usize>() >= limits.max_connections {
             refuse(socket, "rate").await;
             return;
         }
@@ -1744,7 +1889,7 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
             refuse(socket, "duplicate").await;
             return;
         }
-        if room.len() >= limit("LIVEENGINE_LIVE_MAX_CONNECTIONS_PER_ROOM", 256) {
+        if room.len() >= limits.max_connections_per_room {
             refuse(socket, "rate").await;
             return;
         }
@@ -1866,9 +2011,9 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
             _ = disconnected.changed() => { violation = *disconnected.borrow(); break },
             _ = &mut writer => break,
             _ = tick.tick() => {
-                if last_activity.elapsed() >= Duration::from_secs(limit("LIVEENGINE_LIVE_IDLE_SECONDS", 60) as u64) { break }
+                if last_activity.elapsed() >= limits.idle { break }
                 if !resolve(&state, &key.0).await.is_some_and(|(current, _)| match (&current.handler, &record.handler) { (Some(a), Some(b)) => Arc::ptr_eq(a, b), _ => false }) || !paired(&state, &record, &user, &key.1).await.unwrap_or(true) { break }
-                if last_ping.elapsed() >= Duration::from_secs(limit("LIVEENGINE_LIVE_PING_SECONDS", 20) as u64) {
+                if last_ping.elapsed() >= limits.ping {
                     let rooms = state.live_rooms.rooms.lock().await;
                     if let Some(queue) = rooms.get(&key).and_then(|r| r.get(&user)) { queue.send(Message::Ping(Default::default()), false); }
                     last_ping = tokio::time::Instant::now();
@@ -1884,6 +2029,11 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
             violation = Some("frame");
             break;
         };
+        // A WebSocket already enforces this; another transport may not.
+        if text.len() > limits.max_frame_bytes {
+            violation = Some("frame");
+            break;
+        }
         if window.elapsed() >= Duration::from_secs(1) {
             window = tokio::time::Instant::now();
             messages = 0;
@@ -1895,12 +2045,9 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
         // A link has its own, higher budget; over it, lossy frames are dropped, not the link.
         let linked = attached.is_some();
         let (max_messages, max_bytes) = if linked {
-            link_budget()
+            link_budget(limits)
         } else {
-            (
-                limit("LIVEENGINE_LIVE_MESSAGES_PER_SECOND", 100),
-                limit("LIVEENGINE_LIVE_BYTES_PER_SECOND", 1_048_576),
-            )
+            (limits.messages_per_second, limits.bytes_per_second)
         };
         let over_budget = messages > max_messages;
         if bytes > max_bytes || (over_budget && !linked) {
@@ -1991,7 +2138,7 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
                 break;
             };
             let target = target.as_str();
-            if target == user || text.len() > limit("LIVEENGINE_SIGNAL_MAX_BYTES", 16384) {
+            if target == user || text.len() > limits.signal_max_bytes {
                 violation = Some("frame");
                 break;
             }
@@ -2108,11 +2255,9 @@ async fn serve_connection<T: LiveTransport>(state: Arc<Inner>, mut socket: T) {
     }
     let live = state.live_rooms.clone();
     let instance = state.instance_id.clone();
+    let resume = limits.resume;
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(
-            limit("LIVEENGINE_LIVE_RESUME_MILLIS", 500) as u64,
-        ))
-        .await;
+        tokio::time::sleep(resume).await;
         let mut rooms = live.rooms.lock().await;
         let mut pending = live.pending.lock().await;
         let bridges = live.bridges.lock().await;
@@ -2168,5 +2313,91 @@ mod queue_tests {
         queue.send(Message::Text("first".into()), false);
         queue.send(Message::Text("reliable".into()), false);
         assert_eq!(*disconnected.borrow(), Some("rate"));
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    #[test]
+    fn an_id_is_refused_until_it_expires() {
+        let mut guard = ReplayGuard::new(4);
+        assert!(guard.consume("a".into(), 10, 0));
+        assert!(!guard.consume("a".into(), 10, 0));
+        assert!(!guard.consume("a".into(), 10, 9));
+        // Expired at 10, as the old `retain(expiry > now)` dropped it.
+        assert!(guard.consume("a".into(), 20, 10));
+        assert!(!guard.consume("a".into(), 20, 19));
+    }
+
+    #[test]
+    fn a_full_guard_of_live_ids_refuses_new_ones() {
+        let mut guard = ReplayGuard::new(2);
+        assert!(guard.consume("a".into(), 100, 0));
+        assert!(guard.consume("b".into(), 100, 0));
+        assert!(!guard.consume("c".into(), 100, 0));
+        assert!(!guard.consume("a".into(), 100, 0));
+    }
+
+    #[test]
+    fn a_guard_full_of_expired_ids_accepts_a_fresh_one() {
+        let mut guard = ReplayGuard::new(3);
+        for (id, expiry) in [("a", 5), ("b", 3), ("c", 4)] {
+            assert!(guard.consume(id.into(), expiry, 0));
+        }
+        assert!(!guard.consume("d".into(), 50, 2));
+        assert!(guard.consume("d".into(), 50, 5));
+        assert_eq!(guard.ids.len(), 1);
+        assert_eq!(guard.expiries.len(), 1);
+    }
+
+    #[test]
+    fn out_of_order_expiries_are_dropped_only_when_due() {
+        let mut guard = ReplayGuard::new(8);
+        assert!(guard.consume("long".into(), 100, 0));
+        assert!(guard.consume("short".into(), 10, 0));
+        // `short` expired behind a longer-lived id inserted before it.
+        assert!(guard.consume("short".into(), 30, 10));
+        assert!(!guard.consume("long".into(), 100, 50));
+        assert!(guard.consume("long".into(), 200, 100));
+    }
+
+    #[test]
+    fn signer_refuses_a_replayed_ticket_and_receipt() {
+        let signer = TicketSigner::new(TicketSigner::random_key());
+        let path = vec!["game".to_string()];
+        let (ticket, _) = signer
+            .issue(
+                path.clone(),
+                "room".into(),
+                "alice".into(),
+                "peer".into(),
+                60,
+            )
+            .unwrap();
+        assert!(signer.verify(&ticket, &path, "room").is_ok());
+        assert!(signer.verify(&ticket, &path, "room").is_err());
+        let identity = PeerIdentity {
+            identity: "alice".into(),
+            claims: Map::new(),
+        };
+        let receipt = signer
+            .issue_receipt(
+                path.clone(),
+                "game",
+                "room",
+                "alice",
+                "peer",
+                identity,
+                None,
+            )
+            .unwrap();
+        assert!(signer
+            .consume_receipt(&receipt, &path, "game", "room", "alice", "peer")
+            .is_ok());
+        assert!(signer
+            .consume_receipt(&receipt, &path, "game", "room", "alice", "peer")
+            .is_err());
     }
 }
